@@ -1,0 +1,14 @@
+[package]
+name = "clifford-check"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Mutability, sigil-boundary, trait-list, and reference-provenance checks. Implements §5.4–§5.8 of CLIFFORD_SPEC.md."
+
+[dependencies]
+clifford-ast.workspace = true
+clifford-types.workspace = true
+thiserror.workspace = true

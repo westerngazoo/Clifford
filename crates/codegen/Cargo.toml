@@ -1,0 +1,20 @@
+[package]
+name = "clifford-codegen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "LLVM IR code generation for the Clifford compiler. Implements §8 of CLIFFORD_SPEC.md."
+
+# This crate may use `unsafe` per CLAUDE.md §3.1 (codegen + stdlib are the
+# only allowed sites). Every `unsafe` block requires a `// SAFETY:` comment.
+
+[dependencies]
+clifford-effect.workspace = true
+clifford-ortho.workspace = true
+thiserror.workspace = true
+
+# LLVM binding choice (inkwell vs llvm-sys) deferred to actual implementation.
+# Add the dep here when chosen.

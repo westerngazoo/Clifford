@@ -1,0 +1,18 @@
+[package]
+name = "clifford-parser"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Parser for the Clifford language. Implements §2 (Grammar) and §3 (Parser Behavior) of CLIFFORD_SPEC.md."
+
+[dependencies]
+clifford-lexer.workspace = true
+clifford-ast.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+insta.workspace = true

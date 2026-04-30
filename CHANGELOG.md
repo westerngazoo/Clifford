@@ -1,0 +1,65 @@
+# Changelog
+
+All notable changes to Clifford and `cliffordc` are recorded here. The format
+follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
+adheres to [Semantic Versioning](https://semver.org/) — pre-1.0 minor versions
+may include breaking changes.
+
+## [Unreleased]
+
+### Added — Phase 0 bootstrap (2026-04-30)
+
+- Cargo workspace skeleton at the project root; rust-toolchain pinned to 1.76.0.
+- Empty crates for the full pipeline: `lexer`, `parser`, `ast`, `resolve`,
+  `types`, `check`, `effect`, `ortho`, `codegen`, `stdlib`, `cli`.
+- Project meta: `README.md`, `CHANGELOG.md`, `LICENSE-MIT`, `LICENSE-APACHE`,
+  `.gitignore`, basic `.github/` workflows and templates.
+- Documentation supplementary files: `docs/architecture.md`,
+  `docs/adr/0001-rust-as-implementation-language.md`.
+
+## Spec Changes
+
+### v0.5.0-draft (2026-04-30) — Decision #19: nominal access types
+
+- `*const T` / `*mut T` retired in favor of `access<T>` / `access const<T>`.
+- Each `@type` declaration of an access type produces a distinct nominal type.
+- Cross-type pointer use requires explicit `#unchecked_cast<S, T>`.
+- New narrow primitive `#unchecked_offset<T>(p, n)` for pointer arithmetic.
+
+### v0.4.0-draft (2026-04-30) — Decisions #6–#18
+
+- **#6**: register blocks as `#automaton` with `#address`/`#offset`/`#access`;
+  `#hardware` retired.
+- **#7**: `#test "name" { … }` testing primitive.
+- **#8**: `:=` short binding for type-inferred immutable locals.
+- **#9**: dropped `#visible` / `#hidden` (subsumed into `#mutates`/`#cannot_mutate`).
+- **#10**: `#interrupt` resolves by linker symbol.
+- **#11**: `@sequential(A, B)` non-concurrency assertion attribute.
+- **#12 (deferred to v0.2)**: `#staged` automata for deferred mutation.
+- **#13**: body-scoped references with provenance tracking + Rule 0
+  (no `&mut` to automaton fields). Catches UAF cases 1–5 without lifetime
+  annotations.
+- **#14**: sigma loops with bounds tracking as primary iteration construct.
+- **#15**: `Auto.field <op>= expr` sugar for single-field `#mutate`.
+- **#16**: `#interface` + `#impl` + monomorphization for plugin mutators.
+- **#17**: Ada-style narrow unsafe primitives; `#unsafe { … }` block retired.
+- **#18 (deferred to v0.2)**: `#audit` runtime auditing of unsafe primitives.
+
+### v0.3.0-draft (2026-04-30) — Decision #5: automaton-as-category
+
+- Every `#automaton` is a small category; state changes happen exclusively
+  inside named `#transition` blocks; effects are top-level (Refinement #5a).
+- New §5.7 reference provenance, §5.8 sigma bounds tracking, Appendix B
+  categorical semantics.
+
+### v0.2.0-draft (2026-04-30) — Decisions #1–#4 reconciliation
+
+- Reconciliation between earlier drafts and `DECISIONS.md` Decisions #1–#4.
+- Sigil layering (`#`, `@`, `$`, `#>`) becomes structural.
+- Hybrid `$ [TraitList]` markers; named effect procedures with `#>`;
+  auto-assigned GA basis vectors.
+
+### v0.1.0-draft (2026-04-29)
+
+- Initial draft of the spec under the former name (Ferrum); renamed to Clifford
+  alongside the move to GA orthogonality.

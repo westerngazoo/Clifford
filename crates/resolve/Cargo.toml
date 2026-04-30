@@ -1,0 +1,14 @@
+[package]
+name = "clifford-resolve"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Name resolution for the Clifford compiler. Implements §5.1 step 1 of CLIFFORD_SPEC.md."
+
+[dependencies]
+clifford-ast.workspace = true
+clifford-lexer.workspace = true
+thiserror.workspace = true

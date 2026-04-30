@@ -1,0 +1,21 @@
+[package]
+name = "clifford-stdlib"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Standard library bootstrap for Clifford. Implements §9 of CLIFFORD_SPEC.md. Phase 5."
+
+# This crate primarily catalogues which .cl modules ship with the language.
+# The stdlib is written in CLIFFORD, not Rust — see the .cl source files
+# under stdlib/src/ once Phase 5 begins. This Rust-side crate exists for
+# build orchestration (compiling stdlib .cl modules during a release build)
+# and version-pinning per host toolchain.
+
+[dependencies]
+clifford-codegen.workspace = true
+
+# Phase 5 will add a build.rs that drives cliffordc against the .cl source
+# tree to produce shipped artifacts. Empty for v0.1 scaffolding.

@@ -1,0 +1,16 @@
+[package]
+name = "clifford-ast"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared AST types for the Clifford compiler. Implements §3 of CLIFFORD_SPEC.md (parser-produced AST node kinds)."
+
+[dependencies]
+clifford-lexer.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+insta.workspace = true

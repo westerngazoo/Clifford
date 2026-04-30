@@ -1,0 +1,23 @@
+[package]
+name = "clifford-ortho"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "GA Orthogonality Engine — the heart of Clifford. Implements §7 of CLIFFORD_SPEC.md and the product-existence theorem in Appendix B."
+
+# This crate is the highest-risk component (per CLAUDE.md §4):
+# - 100% line + branch coverage required.
+# - Property tests required for every public function.
+# - Two reviewers required for every PR.
+# - Error messages must name original source identifiers, never `e_n` indices.
+
+[dependencies]
+clifford-effect.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+insta.workspace = true

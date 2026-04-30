@@ -1,0 +1,71 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/lexer",
+    "crates/parser",
+    "crates/ast",
+    "crates/resolve",
+    "crates/types",
+    "crates/check",
+    "crates/effect",
+    "crates/ortho",
+    "crates/codegen",
+    "crates/stdlib",
+    "crates/cli",
+]
+
+# All crates inherit these unless they override.
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.76"
+authors = ["Goose <gustavo.delgadillo@gmail.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/westerngazoo/Clifford"
+homepage = "https://the-goose-factor.netlify.app"
+description = "The Clifford language compiler — a systems language with statically-proven concurrency safety via Geometric Algebra."
+readme = "README.md"
+keywords = ["compiler", "language", "embedded", "geometric-algebra", "concurrency"]
+categories = ["compilers", "embedded"]
+
+[workspace.dependencies]
+# Library-side
+thiserror = "1.0"
+proptest = "1.4"
+insta = { version = "1.34", features = ["yaml"] }
+
+# Driver-side
+anyhow = "1.0"
+
+# Diagnostics
+codespan-reporting = "0.11"
+
+# Internal crate cross-references — always use workspace-relative paths so the
+# pipeline order is enforced at the toml level (per CLAUDE.md §2: no backward edges).
+clifford-lexer  = { path = "crates/lexer" }
+clifford-parser = { path = "crates/parser" }
+clifford-ast    = { path = "crates/ast" }
+clifford-resolve = { path = "crates/resolve" }
+clifford-types  = { path = "crates/types" }
+clifford-check  = { path = "crates/check" }
+clifford-effect = { path = "crates/effect" }
+clifford-ortho  = { path = "crates/ortho" }
+clifford-codegen = { path = "crates/codegen" }
+clifford-stdlib = { path = "crates/stdlib" }
+
+[profile.release]
+# Per CLAUDE.md §7: compile a 10kLoC Clifford program in <5s.
+# Release profile defaults are fine for now; revisit if compile-time benches drift.
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.dev]
+# Fast incremental builds during Phase 0–5 development.
+opt-level = 0
+debug = true
+incremental = true
+
+[profile.test]
+# Tests run release-fast for property tests (proptest can be slow at -O0).
+opt-level = 1

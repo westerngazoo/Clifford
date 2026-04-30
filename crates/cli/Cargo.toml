@@ -1,0 +1,28 @@
+[package]
+name = "clifford-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The cliffordc command-line driver. Phase 5 of the implementation roadmap."
+
+[[bin]]
+name = "cliffordc"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+codespan-reporting.workspace = true
+
+clifford-lexer.workspace = true
+clifford-parser.workspace = true
+clifford-ast.workspace = true
+clifford-resolve.workspace = true
+clifford-types.workspace = true
+clifford-check.workspace = true
+clifford-effect.workspace = true
+clifford-ortho.workspace = true
+clifford-codegen.workspace = true
+clifford-stdlib.workspace = true

@@ -1,0 +1,14 @@
+[package]
+name = "clifford-effect"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Effect & FSM extraction. Implements §6 of CLIFFORD_SPEC.md and the categorical foundation in Appendix B."
+
+[dependencies]
+clifford-ast.workspace = true
+clifford-check.workspace = true
+thiserror.workspace = true

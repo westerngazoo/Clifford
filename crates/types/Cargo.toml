@@ -1,0 +1,18 @@
+[package]
+name = "clifford-types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Type checker for the Clifford compiler. Implements §4 (Type System) and §5.2–§5.3 of CLIFFORD_SPEC.md."
+
+[dependencies]
+clifford-ast.workspace = true
+clifford-resolve.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+insta.workspace = true

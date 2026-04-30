@@ -1,0 +1,16 @@
+[package]
+name = "clifford-lexer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Lexer for the Clifford language. Implements §1 of CLIFFORD_SPEC.md."
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+insta.workspace = true

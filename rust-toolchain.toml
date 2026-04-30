@@ -1,0 +1,7 @@
+# Pinned per CLAUDE.md §3.1.
+# Bump only via PR with CHANGELOG entry. Never `rustup update` on CI without
+# also bumping this file.
+[toolchain]
+channel = "1.76.0"
+components = ["rustfmt", "clippy", "rust-src"]
+profile = "minimal"
