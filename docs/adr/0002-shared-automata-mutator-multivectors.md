@@ -26,8 +26,20 @@ extends from "wedge must be non-zero" to "wedge's null-subspace projection
 must be non-zero, AND any non-null subspace overlap discharges a separate
 lock-coverage proof obligation."
 
-This unifies disjoint-mutation safety (current engine) and lock-coupled
-shared-state safety (new) under one algebraic framework.
+The locking discipline is itself algebraic, not procedural: each lock is a
+mixed-grade multivector `lock(L) = pri(L) + e_L` (scalar priority + identity
+basis vector), and lock ordering falls out of the wedge product's behavior
+under priority-ordered basis vectors (§5.5 below). Same-priority ties resolve
+deterministically through GA *rotors* parameterised by the lock's structural
+attributes (MMIO address for register blocks; declaration-site ordinal for
+software locks). **The rotor formulation is the canonical formulation —
+not a future research direction — and is locked here.**
+
+This unifies four safety properties under one algebraic framework:
+1. Disjoint mutation safety (current engine — null-subspace wedge non-zero)
+2. Lock-coupled shared-state safety (Decision #21 core — non-null subspace overlap discharges lock coverage)
+3. Lock-ordering safety / deadlock-freedom (priority-as-scalar formulation — §5.5)
+4. Interrupt/lock unification (interrupts and locks are the same abstraction at different priority levels — §5.5)
 
 **Recommendation:** Lock the design direction in DECISIONS.md as Decision #21,
 update §7 of the spec to declare the current algebra as the *restricted form*
@@ -332,16 +344,237 @@ change beyond locking the direction.** The total diff is < 200 lines.
 ### Phase 2 (v0.7.0-draft, after Phase 0–4 close): implement the extension.
 
 1. Surface syntax in the lexer + parser: `#shared` field qualifier, `#lock:`
-   automaton clause, `#with_lock(name) { … }` statement, `#reads:` clause
-   on effects, optional `@lock_order(…)` attribute.
+   automaton clause with mandatory `#priority:` (per §5.5), `#with_lock(name)
+   { … }` statement, `#reads:` clause on effects.
 2. AST extension: add `FieldKind::Shared { lock: Ident }`, `LockClause` on
-   `AutomatonDecl`, `WithLock` statement, `reads` field on `EffectDecl`.
-3. `crates/ortho` mixed-metric algebra implementation. The bitmask needs to
-   become two parallel bitmasks (null subspace, non-null subspace) or a
-   single 128-bit representation with the metric tag in the high bits.
+   `AutomatonDecl` (carrying name + priority + optional rotor parameter),
+   `WithLock` statement, `reads` field on `EffectDecl`.
+3. `crates/ortho` mixed-metric algebra implementation including the rotor
+   tiebreak machinery. The bitmask becomes a structured representation:
+   null-subspace bits, non-null-subspace bits, priority bits, rotor-parameter
+   bits — packed into a 128-bit or 256-bit per-blade value.
 4. `crates/check` lock-coverage analysis: for every effect that touches a
-   shared field, verify the enclosing `#with_lock` covers it.
-5. (Stretch, possibly v0.8) Lock-ordering check (Option B addition).
+   shared field, verify the enclosing `#with_lock` covers it. Lock-ordering
+   safety is *automatic* under the §5.5 rotor formulation — it falls out of
+   the mixed-metric wedge product, not a separate check.
+
+Note: the original ADR draft listed lock-ordering as a "Phase-2 stretch"
+or v0.8 addition. The §5.5 rotor formulation absorbs it into the core
+v0.7 work — there is no separate lock-ordering pass to implement, because
+the algebra does it.
+
+---
+
+## §5.5 Priority-as-scalar with rotor tiebreaks (canonical formulation, LOCKED)
+
+This section describes the algebraic core of Decision #21. It is the
+canonical formulation; alternative procedural formulations (Option B from
+the design space) are superseded by what follows.
+
+### 5.5.1 Lock as multivector
+
+Every lock `L` is represented as a mixed-grade multivector:
+
+```
+lock(L) = pri(L) + e_L
+```
+
+where:
+- `pri(L)` is the lock's priority — a non-negative integer drawn from the
+  same priority space as `#interrupt #priority:` declarations (§2.5).
+- `e_L` is the lock's identity basis vector, distinct from every other lock
+  and every field basis vector.
+
+Priority is an intrinsic algebraic component of the lock, not metadata
+attached to it. The scalar travels with `e_L` through every wedge operation,
+which means downstream computations (and especially diagnostics) can recover
+the priority from any computed multivector without consulting a side table.
+
+### 5.5.2 Lock context
+
+The *lock context* of an executing automaton is the wedge of every lock
+currently held:
+
+```
+ctx(state) = lock(L₁) ∧ lock(L₂) ∧ … ∧ lock(Lₙ)
+           = (pri₁ + e₁) ∧ (pri₂ + e₂) ∧ … ∧ (priₙ + eₙ)
+```
+
+Acquiring a new lock right-wedges its multivector in:
+
+```
+ctx_after = ctx_before ∧ lock(L_new)
+```
+
+Releasing a lock is the formal inverse — left-divides by `lock(L_released)` —
+and is well-defined because the lock-context multivector forms a free
+exterior algebra over the held basis vectors.
+
+### 5.5.3 Acquisition validity (the core algebraic rule)
+
+Acquiring a new lock at priority `p_new` while holding a context whose
+maximum priority is `p_max` is **valid iff `p_new > p_max`**. This is the
+classical priority-ordered acquisition discipline, expressed algebraically
+as the wedge-collapse rule:
+
+For any two locks `L`, `M`:
+
+```
+e_L ∧ e_M = + e_L ∧ e_M       if pri(L) < pri(M)        (canonical: ascending)
+          = − e_M ∧ e_L       if pri(L) > pri(M)        (anti-canonical: Koszul-flip)
+          = ROTOR(L,M)        if pri(L) = pri(M)        (tiebreak — see §5.5.5)
+```
+
+The Koszul sign-flip is the standard exterior-algebra orientation rule —
+non-canonical orderings are not zero, they are *normalisable* to canonical
+form with a sign change. The system distinguishes "user wrote things in
+descending priority" (legal, normalised) from "system actually executed in
+descending priority" (illegal — caught by tracking acquisition order in
+the context history, see §5.5.6).
+
+### 5.5.4 Lock context never collapses iff acquisition is deadlock-free
+
+**Theorem (priority-monotone deadlock-freedom):** Let `ctx(t)` be the
+lock-context multivector at time `t` for some hart `h`. The execution is
+deadlock-free iff `ctx(t) ≠ 0` for all `t`.
+
+**Sketch:** The wedge product collapses to zero precisely when (a) two
+basis vectors at the same priority appear without rotor disambiguation
+(handled in §5.5.5) or (b) a lock is acquired while a higher-priority lock
+is held (`pri_new ≤ pri_max`). Case (b) is the textbook deadlock cycle:
+inverting the priority order across two harts produces a wait-for cycle.
+The wedge-collapse rule rejects exactly this pattern at compile time.
+
+The full proof — that all deadlock cycles are detectable by the wedge-zero
+check on lock contexts — extends to mutual exclusion via the locking
+discipline of `#with_lock`. To be written up in §7.9 of the spec when
+v0.7 work begins.
+
+### 5.5.5 Rotor tiebreaks for same-priority locks
+
+Two locks at equal priority cannot be ordered by `pri` alone. The §5.5.3
+rule completes via a *rotor* — a unit GA element of the form
+`R = cos(θ/2) + sin(θ/2)·B`, where `B` is a bivector — parameterised by a
+canonical structural attribute of each lock:
+
+- **Register-block locks:** `R(L) = R(addr(L))` where `addr(L)` is the
+  lock's `#address` declaration (the MMIO base of the protected resource).
+  Different MMIO addresses produce different rotor angles; the wedge picks
+  up a `R(addr(L)) · R(addr(M))⁻¹` factor — non-zero whenever `addr(L) ≠
+  addr(M)`, which is always (different resources have different addresses).
+- **Software locks:** `R(L) = R(rotor_param(L))` where `rotor_param(L)` is
+  one of (resolved at v0.7 implementation time, listed in priority order):
+  1. An explicit `#rotor: SECTION_OFFSET` clause on the `#lock` declaration.
+  2. The link-section position of the lock's storage in `.bss` / `.data`.
+  3. A deterministic hash of the source location of the `#lock`
+     declaration (file + line + column).
+  Option (a) gives the user explicit control; (b) and (c) are zero-burden
+  defaults. The choice is a §7.9 implementation detail; the *algebra* is
+  unchanged regardless.
+
+The cyclic structure of the rotor space — a finite group (e.g., RISC-V PLIC's
+8 priority levels each carrying a rotor circle) — maps to the user's "ring
+like a roulette without randomness" intuition. The wheel always spins to
+the same position given the same input.
+
+### 5.5.6 Acquisition-order tracking
+
+The static algebra above proves *if you acquired locks in canonical order,
+no two threads can deadlock*. To prove *every execution does acquire in
+canonical order*, the resolver/check pass annotates each `#with_lock(L)` site
+with the lock's basis vector and walks the call graph, building each
+effect's lock-context multivector at every program point. A wedge collapse
+during construction is the static counterpart of "this code path acquired
+locks out of order" — caught and reported with `E0521`.
+
+This walking is structurally identical to the existing `behavior(E)`
+construction in §7.2; it reuses the same machinery.
+
+### 5.5.7 Interrupts and locks unify
+
+A `#interrupt H #priority: 5 { … }` is *already* a priority-ordered
+acquisition: when `H` fires, the hart's effective priority rises to 5;
+lower-priority interrupts get masked. That is the same semantics as
+`#with_lock(L) { … }` where `pri(L) = 5`.
+
+Under the §5.5 algebra:
+
+- Both produce a basis vector contribution to the executing hart's lock
+  context.
+- Both must be wedge-compatible with the existing context (no priority
+  inversion).
+- The orthogonality engine checks them with the same machinery — there is
+  no separate "interrupt concurrency" pass and no separate "lock concurrency"
+  pass. They are one pass over a single mixed-metric algebra.
+
+This is the operational answer to "does §7's concurrency-inference need to
+treat interrupts specially?" (§7.3 currently says yes). Under the §5.5
+formulation: no. The priority is the discriminator, the rotor is the
+tiebreak, and the wedge does the work.
+
+**Concrete consequence for Wari:** the `IRQ_NOTIFICATION_BINDINGS` shared
+table that Wari documents as `INV-23` (IRQ Routing Determinism) becomes a
+`#shared` field guarded by an implicit `#lock` whose priority equals the
+PLIC priority of the IRQ source. Any handler at a different priority
+trying to write the table fails the wedge-non-zero check; the property
+moves from an English `INV-N` comment to a typecheck.
+
+### 5.5.8 Worked example: PLIC + UART driver pair
+
+```clifford
+#lock plic_lock #priority: 7 #address: 0x0c00_0000;
+#lock uart_lock #priority: 7 #address: 0x1000_0000;
+
+#shared #automaton Plic { #lock: plic_lock; … }
+#shared #automaton Uart { #lock: uart_lock; … }
+
+// A handler that needs both locks:
+#effect dispatch_uart_irq() #mutates: [Plic, Uart] {
+  #with_lock(plic_lock) {
+    #with_lock(uart_lock) {              // wedge-valid: rotor disambiguates
+      // … process IRQ …
+    }
+  }
+}
+```
+
+Both locks have `pri = 7`, so §5.5.3's first two rules don't apply; §5.5.5's
+rotor tiebreak kicks in. PLIC at `0x0c00_0000` has a different rotor angle
+than UART at `0x1000_0000`. The wedge `e_plic ∧ e_uart` includes a non-zero
+`R(0x0c00_0000) · R(0x1000_0000)⁻¹` factor; the context is well-defined.
+
+The opposite-order handler:
+
+```clifford
+#effect bad_dispatch() #mutates: [Plic, Uart] {
+  #with_lock(uart_lock) {
+    #with_lock(plic_lock) {              // wedge picks up Koszul-flip sign
+      // …
+    }
+  }
+}
+```
+
+The `dispatch_uart_irq` and `bad_dispatch` lock contexts have *opposite
+orientations* (one is `R(plic) ∧ R(uart)`, the other `R(uart) ∧ R(plic)
+= − R(plic) ∧ R(uart)`). Concurrent execution would attempt to compose
+contexts of opposite orientation, which the §5.5.4 theorem catches as a
+deadlock-cycle witness. Compile-time `E0521`, no runtime failure.
+
+### 5.5.9 What this DOES NOT do (clarifications)
+
+- **It does not prevent priority inversion at runtime** — that's a scheduler
+  property, not a lock-discipline property. Priority inversion is fine
+  under §5.5 as long as no priority cycle exists; standard PI mitigation
+  (priority inheritance, priority ceilings) is orthogonal.
+- **It does not eliminate the need for a `#with_lock` block.** The lock
+  still has a runtime acquisition. §5.5 proves *if you acquired in this
+  order at runtime, the order was deadlock-free*; the runtime acquisition
+  itself is the spinlock / mutex / disable-interrupts that the platform
+  primitive provides.
+- **It does not handle reentrancy** — recursive lock acquisition (`e_L ∧
+  e_L`). That extension lives in a future minor decision, sketched in the
+  ADR's Risks section and deliberately deferred to v0.8+.
 
 ---
 
@@ -444,6 +677,10 @@ This decision is consistent with:
   small categories; the metric extension is an enrichment, not a replacement).
 - Decision #13 body-scoped references (orthogonal — references and shared
   fields are separate axes).
+- Decision #10's `#interrupt` linker-symbol naming and `#priority:` clause
+  (§5.5 *unifies* interrupts and locks under the same priority-ordered
+  acquisition discipline; existing interrupt declarations gain the §5.5
+  algebraic interpretation without surface-syntax change).
 
 ---
 
@@ -452,19 +689,30 @@ This decision is consistent with:
 **RECOMMENDED — pending Goose's review and any reviewer pushback:**
 
 1. Add Decision #21 to `docs/DECISIONS.md` with the "lock direction, defer
-   implementation" framing in this ADR's Recommendation section.
+   implementation" framing in this ADR's Recommendation section. **Lock the
+   §5.5 priority-as-scalar-with-rotor-tiebreaks formulation as the canonical
+   formulation**, not as a "preferred future direction." There is no
+   simpler-fallback formulation in v0.7; §5.5 IS the v0.7 spec extension.
 2. Update `CLIFFORD_SPEC.md` §7.0 prologue declaring Cl(0,0,n) as the v0.1–v0.6
-   restricted algebra; add §7.9 sketching the v0.7 mixed-metric extension.
+   restricted algebra; add §7.9 stating the v0.7 mixed-metric extension
+   *with the §5.5 lock formulation as the lock-discipline component*.
 3. Add `FieldKind` enum to `crates/ast`, defaulting all fields to
    `FieldKind::Private`, marked `#[non_exhaustive]`.
-4. Reserve `#shared`, `#lock`, `#with_lock`, `#reads`, `@lock_order` in
-   the lexer's `#`-form catalog (no parser support, just the tokens).
+4. Reserve `#shared`, `#lock`, `#with_lock`, `#reads`, `#rotor` in the
+   lexer's `#`-form catalog (no parser support, just the tokens). Note:
+   `@lock_order` is *not* reserved — it is superseded by §5.5 and not
+   needed under the rotor formulation.
 5. **Do not** implement the engine extension; that is v0.7 work tracked by
    this ADR and Decision #21.
 
 If reviewers reject the design direction, no rollback is required —
 the Phase-1 scaffolding is small, the spec sections are non-normative
 prologue text, and Decision #21 can be marked DEFERRED rather than LOCKED.
+The §5.5 rotor formulation is internally cohesive and reviewers must reject
+or accept it as a unit; partial acceptance ("we'll take Decision #21 but
+with a procedural lock-ordering checker instead of §5.5") is not in scope —
+the algebra unifies them, and splitting them would re-introduce the bolted-on
+proof system §5.5 was written to replace.
 
 ---
 
