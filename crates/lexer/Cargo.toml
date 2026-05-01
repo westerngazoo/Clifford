@@ -11,6 +11,6 @@ description = "Lexer for the Clifford language. Implements §1 of CLIFFORD_SPEC.
 [dependencies]
 thiserror.workspace = true
 
-[dev-dependencies]
-proptest.workspace = true
-insta.workspace = true
+# dev-deps (proptest, insta) added back when first property / snapshot
+# test arrives. Both currently pull in transitive crates that need newer
+# rustc than the pinned 1.76; toolchain bump tracked separately.

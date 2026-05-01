@@ -13,6 +13,5 @@ clifford-lexer.workspace = true
 clifford-ast.workspace = true
 thiserror.workspace = true
 
-[dev-dependencies]
-proptest.workspace = true
-insta.workspace = true
+# dev-deps (proptest, insta) added back when first property / snapshot test
+# arrives.

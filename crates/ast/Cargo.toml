@@ -12,5 +12,4 @@ description = "Shared AST types for the Clifford compiler. Implements §3 of CLI
 clifford-lexer.workspace = true
 thiserror.workspace = true
 
-[dev-dependencies]
-insta.workspace = true
+# dev-deps (insta) added back when first snapshot test arrives.

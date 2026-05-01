@@ -18,6 +18,6 @@ description = "GA Orthogonality Engine — the heart of Clifford. Implements §7
 clifford-effect.workspace = true
 thiserror.workspace = true
 
-[dev-dependencies]
-proptest.workspace = true
-insta.workspace = true
+# dev-deps (proptest required for ortho per CLAUDE.md §4) added when first
+# property test arrives. Both currently pull transitive crates needing newer
+# rustc than the pinned 1.76.

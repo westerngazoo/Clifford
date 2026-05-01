@@ -13,6 +13,4 @@ clifford-ast.workspace = true
 clifford-resolve.workspace = true
 thiserror.workspace = true
 
-[dev-dependencies]
-proptest.workspace = true
-insta.workspace = true
+# dev-deps added back per-PR as needed.
