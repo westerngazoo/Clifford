@@ -7,6 +7,28 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Phase 1 resolver slice 1: top-level SymbolTable (2026-05-01)
+
+- `clifford-resolve`: first real implementation. `SymbolTable::build(&Program)`
+  walks every top-level item and produces a global namespace mapping
+  identifier → `Symbol { kind, item_index, layer, span }`. Detects duplicate
+  declarations (E0401), collecting all errors rather than failing at the
+  first.
+- New types: `SymbolKind` (`Fn` / `Type` / `Trait` / `Automaton` / `Effect` /
+  `Interrupt` / `Interface`), `Symbol`, `SymbolTable`, `ResolveError`.
+- `SymbolTable::build_partial` returns a (possibly partial) table alongside
+  any errors so IDE-style consumers can keep resolving past a duplicate-name
+  conflict. First-declaration wins for resolution purposes.
+- `@sequential`, `#impl`, and `#test` declarations do not populate the table
+  (no resolvable name; impl coherence and test discovery happen in later
+  slices).
+- 21 unit tests + 1 doctest covering: empty programs, every named item kind,
+  item-index correspondence to source order, layer derivation, exclusion of
+  nameless items, single duplicates, cross-kind duplicates (single global
+  namespace per Decision #1), three-way duplicates (N-1 errors), partial
+  table reconstruction past errors, multi-impl / multi-test / multi-sequential
+  coexistence, and a realistic 10-item program end-to-end.
+
 ### Added — Phase 0 parser slice 8: automaton members (2026-05-01)
 
 - `clifford-ast`: `AutomatonDecl` extended with `address: Option<AddressClause>`

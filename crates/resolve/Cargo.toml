@@ -12,3 +12,7 @@ description = "Name resolution for the Clifford compiler. Implements §5.1 step 
 clifford-ast.workspace = true
 clifford-lexer.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+# Tests parse Clifford source via the parser to exercise resolution end-to-end.
+clifford-parser.workspace = true
