@@ -7,6 +7,42 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Phase 1 type checker slice 2: function calls, automaton fields, references (2026-05-01)
+
+- `clifford-types`: extends `Type` with `Ref { mutable, inner }` for borrow
+  expressions and parameter types like `&[u8]` / `&mut T`. `Type::display`
+  renders these as `&u32` / `&mut u32`.
+- New `SignatureRegistry` (built once at the start of `infer`) maps every
+  top-level `@fn` / `#effect` / `#interrupt` name to its `(params, return_type)`.
+  Per-call-site lookup is O(1).
+- `Expr::Call` typing: when the callee resolves to a top-level callable,
+  arguments are checked against the registry's signature. Arity mismatches
+  emit `E0514 CallArityMismatch`; per-position type mismatches emit
+  `E0513 CallArgMismatch`. The call expression's own type is the callee's
+  declared return type (or `Type::Unit` if absent).
+- `Expr::FieldAccess` typing: when the resolver tagged the access as an
+  `AutomatonField`, the typer fetches the field's declared type from a
+  per-automaton field-type registry. Supports both `Auto.field` reads in
+  effects and `Self.field` reads in transition bodies.
+- `Expr::Ref` typing: yields `Type::Ref { mutable, inner }` where `inner`
+  is the operand's type.
+- `*r` deref typing: unwraps `Type::Ref` to the referenced type. Applying
+  `*` to a non-reference (e.g. `*42i32`) emits `E0515 DerefNonReference`.
+- `type_from_type_expr` recursively translates `TypeKind::Ref` so parameters
+  declared as `&T` carry their reference structure into the body's typing.
+- 17 new tests + every prior slice-1 test still green: borrow / mut-borrow
+  yield correct ref types; ref param + deref returns inner type; deref of
+  non-reference is E0515; call returns callee's return type; arity mismatch
+  is E0514; arg type mismatch is E0513; call to local (shadowed top-level)
+  silently returns Unknown; auto-field reads yield the declared field type;
+  Self.field reads in transitions work; field type drives let-annotation
+  matching (mismatch is E0512); realistic 3-item program with calls and
+  fields. **Total clifford-types: 62 unit tests + 1 doctest.**
+- What's still deferred (slice T3): index typing (needs Array/Slice
+  full modeling), tuple/range/method-call typing, `Path([X, Y])` typing
+  for nominal types and ADT constructors, generic instantiation with HM
+  unification, trait satisfaction (§5.3).
+
 ### Added — Phase 1 type checker slice 1: literal-type inference + primitive expression typing (2026-05-01)
 
 - `clifford-types`: first real implementation. Public entry point

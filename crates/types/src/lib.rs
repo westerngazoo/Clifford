@@ -24,16 +24,20 @@
 //!
 //! ## Implementation status
 //!
-//! **Slice 1 (this PR):** literal-type inference + simple primitive expression
-//! typing. The public entry point [`infer`] walks every `@fn` / `#effect` /
-//! `#interrupt` / `#transition` body and assigns a [`Type`] to each
-//! expression node. Integer literal suffix recognition (`0u32` → `u32`),
-//! Path → local-type resolution via the `Resolution` from `clifford-resolve`,
-//! unary and binary operations on primitives with operand-type compatibility
-//! checking, and `let`-annotation-vs-initializer compatibility checking are
-//! all in scope. Function-call typing, field-access typing, generic
-//! instantiation, trait satisfaction, and full HM unification are deferred
-//! to subsequent slices.
+//! **Slice 1:** literal-type inference + primitive expression typing.
+//! Integer suffix recognition, Path → local-type resolution, unary/binary
+//! operator typing, `let`-annotation matching, narrow unsafe primitives.
+//!
+//! **Slice 2 (this PR):** function-call typing, automaton-field typing,
+//! reference types. A `SignatureRegistry` precomputes every top-level
+//! `@fn` / `#effect` / `#interrupt` signature; `Expr::Call` arguments
+//! are checked against the callee's parameter types (E0513) and the call
+//! result is the declared return type. Field-access on automaton symbols
+//! consumes the resolver's `AutomatonField` bindings to look up the
+//! declared field type. New `Type::Ref { mutable, inner }` variant for
+//! `&x` / `&mut x` borrow expressions; deref `*r` unwraps it. Index,
+//! tuple, range, method-call, generic instantiation, and trait satisfaction
+//! all remain deferred to slice T3.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -41,12 +45,11 @@
 use std::collections::HashMap;
 
 use clifford_ast::{
-    Block, EffectDecl, Expr, ExprKind, FnDecl, InterruptDecl, Item, PrimitiveType, Program, Stmt,
-    StmtKind, TransitionDecl, TypeExpr, TypeKind, UnaryOp,
+    AutomatonDecl, BinaryOp, Block, EffectDecl, Expr, ExprKind, FnDecl, InterruptDecl, Item,
+    Param, PrimitiveType, Program, Stmt, StmtKind, TransitionDecl, TypeExpr, TypeKind, UnaryOp,
 };
-use clifford_ast::{AutomatonDecl, BinaryOp};
 use clifford_lexer::Span;
-use clifford_resolve::Resolution;
+use clifford_resolve::{BindingRef, Resolution, Symbol, SymbolKind};
 use thiserror::Error;
 
 /// Errors produced during type checking.
@@ -97,6 +100,49 @@ pub enum TypeError {
         /// Byte offset of the `let` statement.
         at: usize,
     },
+
+    /// A function call's argument count or types don't match the callee's
+    /// declared signature.
+    ///
+    /// The diagnostic carries the callee name, the parameter index that
+    /// failed (1-based for human readability — `arg #1` is the first
+    /// positional argument), the expected and actual types, and the byte
+    /// offset of the call site.
+    #[error("E0513: call to `{callee}` argument #{arg} expected {expected}, got {actual} (at byte {at})")]
+    CallArgMismatch {
+        /// Callee name (the function/effect/interrupt being called).
+        callee: String,
+        /// 1-based positional index of the mismatched argument.
+        arg: usize,
+        /// Display name of the expected parameter type.
+        expected: String,
+        /// Display name of the actual argument type.
+        actual: String,
+        /// Byte offset of the call expression.
+        at: usize,
+    },
+
+    /// A function call has the wrong number of arguments.
+    #[error("E0514: call to `{callee}` expected {expected} argument(s), got {actual} (at byte {at})")]
+    CallArityMismatch {
+        /// Callee name.
+        callee: String,
+        /// Number of declared parameters.
+        expected: usize,
+        /// Number of arguments supplied at the call site.
+        actual: usize,
+        /// Byte offset of the call expression.
+        at: usize,
+    },
+
+    /// A `*r` deref expression is applied to a value that isn't a reference.
+    #[error("E0515: cannot deref `*` on non-reference type {operand} (at byte {at})")]
+    DerefNonReference {
+        /// Display name of the operand type.
+        operand: String,
+        /// Byte offset of the unary expression.
+        at: usize,
+    },
 }
 
 /// A fully-resolved Clifford type — the abstract counterpart to `TypeExpr`
@@ -106,17 +152,25 @@ pub enum TypeError {
 /// segments, etc.); `Type` is the *semantic* form (canonical, comparable,
 /// produced by the type checker once names have been resolved).
 ///
-/// Slice-1 scope: only [`Type::Unit`], [`Type::Primitive`], and
-/// [`Type::Unknown`] (placeholder for expressions whose type the slice-1
-/// engine cannot yet compute). Generic parameters, references, slices,
-/// arrays, tuples, function-pointer types, ADTs, and access types arrive
-/// in subsequent slices alongside their specific use cases.
+/// Slice-2 scope: [`Type::Unit`], [`Type::Primitive`], [`Type::Ref`],
+/// [`Type::StringSlice`], and [`Type::Unknown`]. Slice arrays, tuples,
+/// fn-pointer types, ADTs, and access types arrive in subsequent slices
+/// alongside their specific use cases.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     /// `()` — the unit type.
     Unit,
     /// One of the predeclared primitive types from §4.1.
     Primitive(PrimitiveType),
+    /// `&T` (immutable) or `&mut T` — a body-scoped reference per Decision #13.
+    /// Slice 2 introduces this variant for borrow-expression typing and
+    /// deref-typing. Slice / array reference subtleties land in slice T3.
+    Ref {
+        /// `true` for `&mut T`, `false` for `&T`.
+        mutable: bool,
+        /// The referenced type.
+        inner: Box<Type>,
+    },
     /// `&[u8]` for string literals — modelled here so slice 1 doesn't need
     /// the full slice-type machinery from §4. When real slice/reference
     /// types land, this collapses into the general representation.
@@ -136,6 +190,10 @@ impl Type {
         match self {
             Self::Unit => "()".to_owned(),
             Self::Primitive(p) => primitive_name(*p).to_owned(),
+            Self::Ref { mutable, inner } => {
+                let prefix = if *mutable { "&mut " } else { "&" };
+                format!("{prefix}{}", inner.display())
+            }
             Self::StringSlice => "&[u8]".to_owned(),
             Self::Unknown(reason) => format!("<unknown: {reason}>"),
         }
@@ -245,8 +303,13 @@ impl Typing {
 /// assert!(typing.len() > 0);
 /// ```
 pub fn infer(program: &Program, resolution: &Resolution) -> Result<Typing, Vec<TypeError>> {
+    let signatures = build_signatures(program);
+    let automaton_field_types = build_automaton_field_types(program);
+
     let mut walker = Inferer {
         resolution,
+        signatures: &signatures,
+        automaton_field_types: &automaton_field_types,
         types: HashMap::new(),
         errors: Vec::new(),
         scopes: Vec::new(),
@@ -270,10 +333,73 @@ pub fn infer(program: &Program, resolution: &Resolution) -> Result<Typing, Vec<T
     }
 }
 
+/// One callable's signature: parameter types in order + return type.
+#[derive(Debug, Clone)]
+struct Signature {
+    params: Vec<Type>,
+    return_type: Type,
+}
+
+/// Build a `name → Signature` registry for every top-level callable
+/// (`@fn`, `#effect`, `#interrupt`). Used by the call-typing path so it
+/// doesn't have to re-walk the AST per call site.
+fn build_signatures(program: &Program) -> HashMap<String, Signature> {
+    let mut map: HashMap<String, Signature> = HashMap::new();
+    for item in &program.items {
+        match item {
+            Item::Fn(decl) => {
+                map.insert(decl.name.clone(), signature_from_params(&decl.params, decl.return_type.as_ref()));
+            }
+            Item::Effect(decl) => {
+                map.insert(decl.name.clone(), signature_from_params(&decl.params, decl.return_type.as_ref()));
+            }
+            Item::Interrupt(decl) => {
+                map.insert(decl.name.clone(), signature_from_params(&decl.params, decl.return_type.as_ref()));
+            }
+            _ => {}
+        }
+    }
+    map
+}
+
+fn signature_from_params(params: &[Param], return_type: Option<&TypeExpr>) -> Signature {
+    Signature {
+        params: params.iter().map(|p| type_from_type_expr(&p.ty)).collect(),
+        return_type: return_type
+            .map(type_from_type_expr)
+            .unwrap_or(Type::Unit),
+    }
+}
+
+/// Build a `automaton-name → field-name → Type` registry for every
+/// `#automaton`'s declared fields. Used by the FieldAccess-typing path
+/// to look up `Counter.value`'s type without re-walking.
+fn build_automaton_field_types(program: &Program) -> HashMap<String, HashMap<String, Type>> {
+    let mut map: HashMap<String, HashMap<String, Type>> = HashMap::new();
+    for item in &program.items {
+        if let Item::Automaton(decl) = item {
+            let fields: HashMap<String, Type> = decl
+                .fields
+                .iter()
+                .map(|f| (f.name.clone(), type_from_type_expr(&f.ty)))
+                .collect();
+            map.insert(decl.name.clone(), fields);
+        }
+    }
+    map
+}
+
 // ─── Internal walker ────────────────────────────────────────────────────────
 
 struct Inferer<'a> {
     resolution: &'a Resolution,
+    /// Top-level signatures keyed by callable name. Built once at the start
+    /// of [`infer`] so per-call lookups are O(1).
+    signatures: &'a HashMap<String, Signature>,
+    /// Per-automaton field type table: `automaton-name → field-name → Type`.
+    /// Used by [`Self::field_access_type`] to look up `Counter.value`'s
+    /// declared type without re-walking the AST.
+    automaton_field_types: &'a HashMap<String, HashMap<String, Type>>,
     types: HashMap<Span, Type>,
     errors: Vec<TypeError>,
     /// Stack of nested scopes mirroring the resolver's. Each scope holds
@@ -472,22 +598,16 @@ impl<'a> Inferer<'a> {
                 let _ = self.infer_expr(count);
                 Type::Unknown("array-repeat type construction is slice T2 work")
             }
-            ExprKind::FieldAccess { obj, .. } => {
+            ExprKind::FieldAccess { obj, field } => {
                 let _ = self.infer_expr(obj);
-                Type::Unknown("field-access typing is slice T2 work")
+                self.field_access_type(expr.span, field)
             }
             ExprKind::Index { obj, index } => {
                 let _ = self.infer_expr(obj);
                 let _ = self.infer_expr(index);
                 Type::Unknown("index typing is slice T2 work")
             }
-            ExprKind::Call { callee, args } => {
-                let _ = self.infer_expr(callee);
-                for a in args {
-                    let _ = self.infer_expr(a);
-                }
-                Type::Unknown("function-call typing is slice T2 work")
-            }
+            ExprKind::Call { callee, args } => self.call_type(callee, args, expr.span),
             ExprKind::MethodCall { obj, args, .. } => {
                 let _ = self.infer_expr(obj);
                 for a in args {
@@ -502,11 +622,19 @@ impl<'a> Inferer<'a> {
                 self.unary_type(*op, &operand_ty, expr.span)
             }
 
-            // Borrow expression — `&T` / `&mut T`. Slice 2 introduces
-            // reference types; for now record the operand and return Unknown.
-            ExprKind::Ref { operand, .. } => {
-                let _ = self.infer_expr(operand);
-                Type::Unknown("reference typing is slice T2 work")
+            // Borrow expression — `&T` / `&mut T`. Decision #13 body-scoped
+            // references: type checker assigns the reference type; provenance
+            // / lifetime checking is `clifford-check`'s slice T3 work.
+            ExprKind::Ref { mutable, operand } => {
+                let inner = self.infer_expr(operand);
+                if inner.is_unknown() {
+                    Type::Unknown("ref of unknown operand")
+                } else {
+                    Type::Ref {
+                        mutable: *mutable,
+                        inner: Box::new(inner),
+                    }
+                }
             }
 
             // Binary operators on primitives.
@@ -560,6 +688,107 @@ impl<'a> Inferer<'a> {
         ty
     }
 
+    /// Type a function-call expression `callee(args)`.
+    ///
+    /// Slice-2 scope: callee must be a `Path([X])` resolving to a top-level
+    /// `@fn` / `#effect` / `#interrupt` whose signature is in the
+    /// [`SignatureRegistry`]. Higher-order calls (calling a parameter typed
+    /// as `@fn(...)`, etc.) require the function-pointer type machinery
+    /// from §2.7 and land in slice T3.
+    ///
+    /// Argument count is checked first (E0514). Each argument is then
+    /// type-checked against its parameter (E0513). Argument count
+    /// mismatches don't suppress per-argument type errors for the
+    /// arguments that *do* exist — both classes accumulate.
+    fn call_type(&mut self, callee: &Expr, args: &[Expr], at: Span) -> Type {
+        let arg_types: Vec<Type> = args.iter().map(|a| self.infer_expr(a)).collect();
+
+        // Resolve the callee to a top-level signature. We accept only
+        // single-segment `Path([X])` callees in slice 2; everything else
+        // walks the callee for its expression-side effects and returns
+        // Unknown.
+        let callee_name: Option<&str> = match &callee.kind {
+            ExprKind::Path(segs) if segs.len() == 1 => Some(segs[0].as_str()),
+            _ => None,
+        };
+        let _ = self.infer_expr(callee);
+
+        let Some(name) = callee_name else {
+            return Type::Unknown("non-path callee typing is slice T3 work");
+        };
+
+        // Verify the callee resolves to a callable Symbol (Fn/Effect/Interrupt).
+        // The resolver tagged the callee's span with a `BindingRef::TopLevel`
+        // for those cases; if it's a local or anything else, we don't have
+        // a signature and must fall through to Unknown.
+        let is_callable_top_level = self
+            .resolution
+            .lookup(callee.span)
+            .map(|b| match b {
+                BindingRef::TopLevel(Symbol { kind, .. }) => matches!(
+                    kind,
+                    SymbolKind::Fn | SymbolKind::Effect | SymbolKind::Interrupt
+                ),
+                _ => false,
+            })
+            .unwrap_or(false);
+        if !is_callable_top_level {
+            return Type::Unknown("callee is not a top-level callable");
+        }
+
+        let Some(sig) = self.signatures.get(name) else {
+            return Type::Unknown("callee signature not in registry");
+        };
+
+        if sig.params.len() != arg_types.len() {
+            self.errors.push(TypeError::CallArityMismatch {
+                callee: name.to_owned(),
+                expected: sig.params.len(),
+                actual: arg_types.len(),
+                at: at.start,
+            });
+        }
+
+        // Check each provided argument against its parameter's type.
+        // Arity-only mismatches still get per-position checks for the
+        // arguments that exist within the overlap.
+        let limit = sig.params.len().min(arg_types.len());
+        for (i, actual) in arg_types.iter().take(limit).enumerate() {
+            let expected = &sig.params[i];
+            if !expected.is_unknown()
+                && !actual.is_unknown()
+                && !types_compatible(expected, actual)
+            {
+                self.errors.push(TypeError::CallArgMismatch {
+                    callee: name.to_owned(),
+                    arg: i + 1,
+                    expected: expected.display(),
+                    actual: actual.display(),
+                    at: at.start,
+                });
+            }
+        }
+
+        sig.return_type.clone()
+    }
+
+    /// Type a `FieldAccess` expression. The resolver already validated that
+    /// `obj` resolves to an automaton (or this isn't an automaton field at
+    /// all); slice 2 looks up the field's declared type via the resolver's
+    /// `BindingRef::AutomatonField` recorded under the FieldAccess's span.
+    fn field_access_type(&self, span: Span, field: &str) -> Type {
+        let Some(BindingRef::AutomatonField { automaton, .. }) =
+            self.resolution.lookup(span)
+        else {
+            return Type::Unknown("field-access on non-automaton receiver is slice T3 work");
+        };
+        self.automaton_field_types
+            .get(&automaton.name)
+            .and_then(|fields| fields.get(field))
+            .cloned()
+            .unwrap_or(Type::Unknown("field not in automaton-field registry"))
+    }
+
     /// Determine the result type of a unary operator, or push a
     /// [`TypeError::UnaryTypeMismatch`] and return [`Type::Unknown`].
     fn unary_type(&mut self, op: UnaryOp, operand: &Type, at: Span) -> Type {
@@ -604,8 +833,19 @@ impl<'a> Inferer<'a> {
                 }
             }
             UnaryOp::Deref => {
-                // Reference / access types are slice 2.
-                Type::Unknown("deref typing is slice T2 work")
+                // `*r` unwraps a reference. Access-type deref (raw access<T>)
+                // arrives in slice T3 alongside access-type modeling.
+                match operand {
+                    Type::Ref { inner, .. } => (**inner).clone(),
+                    other if other.is_unknown() => other.clone(),
+                    other => {
+                        self.errors.push(TypeError::DerefNonReference {
+                            operand: other.display(),
+                            at: at.start,
+                        });
+                        Type::Unknown("deref non-ref")
+                    }
+                }
             }
         }
     }
@@ -731,13 +971,23 @@ fn type_from_type_expr(t: &TypeExpr) -> Type {
     match &t.kind {
         TypeKind::Unit => Type::Unit,
         TypeKind::Primitive(p) => Type::Primitive(*p),
-        TypeKind::Path(_) => Type::Unknown("nominal-path type lookup is slice T2 work"),
-        TypeKind::Ref(_) => Type::Unknown("reference type is slice T2 work"),
-        TypeKind::Access(_) => Type::Unknown("access<T> type is slice T2 work"),
-        TypeKind::Array(_) => Type::Unknown("array type is slice T2 work"),
-        TypeKind::Slice(_) => Type::Unknown("slice type is slice T2 work"),
-        TypeKind::Tuple(_) => Type::Unknown("tuple type is slice T2 work"),
-        TypeKind::Fn(_) => Type::Unknown("@fn pointer type is slice T2 work"),
+        TypeKind::Ref(rt) => {
+            // The inner type is recursively translated; a `&[u8]` parameter
+            // (the most common shape in real code) translates to
+            // `Ref { inner: Unknown("slice...") }` for now since
+            // `Slice` typing itself is slice T3 work. That's still useful:
+            // the "this is a reference" property is preserved.
+            Type::Ref {
+                mutable: rt.mutable,
+                inner: Box::new(type_from_type_expr(&rt.inner)),
+            }
+        }
+        TypeKind::Path(_) => Type::Unknown("nominal-path type lookup is slice T3 work"),
+        TypeKind::Access(_) => Type::Unknown("access<T> type is slice T3 work"),
+        TypeKind::Array(_) => Type::Unknown("array type is slice T3 work"),
+        TypeKind::Slice(_) => Type::Unknown("slice type is slice T3 work"),
+        TypeKind::Tuple(_) => Type::Unknown("tuple type is slice T3 work"),
+        TypeKind::Fn(_) => Type::Unknown("@fn pointer type is slice T3 work"),
         // `TypeKind` is `#[non_exhaustive]`. New variants default to Unknown;
         // add an explicit arm when one lands.
         _ => Type::Unknown("forward-compat: new TypeKind variant"),
@@ -1257,5 +1507,228 @@ mod tests {
         assert_eq!(Type::Primitive(PrimitiveType::Bool).display(), "bool");
         assert_eq!(Type::StringSlice.display(), "&[u8]");
         assert!(Type::Unknown("test").display().contains("test"));
+    }
+
+    // ─── Slice 2: function calls, automaton fields, references ───────────
+
+    #[test]
+    fn ref_display_immutable() {
+        let t = Type::Ref {
+            mutable: false,
+            inner: Box::new(Type::Primitive(PrimitiveType::U32)),
+        };
+        assert_eq!(t.display(), "&u32");
+    }
+
+    #[test]
+    fn ref_display_mutable() {
+        let t = Type::Ref {
+            mutable: true,
+            inner: Box::new(Type::Primitive(PrimitiveType::U32)),
+        };
+        assert_eq!(t.display(), "&mut u32");
+    }
+
+    // ── Borrow expressions ───────────────────────────────────────────────
+
+    #[test]
+    fn borrow_immutable_yields_ref_type() {
+        let typing = infer_str("@fn f(x: u32) { let _r := &x; }").unwrap();
+        let saw_ref = types_in(&typing).iter().any(|t| {
+            matches!(t,
+                Type::Ref { mutable: false, inner }
+                    if matches!(**inner, Type::Primitive(PrimitiveType::U32))
+            )
+        });
+        assert!(saw_ref, "expected &u32 to appear in the typing map");
+    }
+
+    #[test]
+    fn borrow_mutable_yields_mut_ref_type() {
+        let typing = infer_str("@fn f(mut x: u32) { let _r := &mut x; }").unwrap();
+        let saw_mut_ref = types_in(&typing).iter().any(|t| {
+            matches!(t,
+                Type::Ref { mutable: true, inner }
+                    if matches!(**inner, Type::Primitive(PrimitiveType::U32))
+            )
+        });
+        assert!(saw_mut_ref);
+    }
+
+    #[test]
+    fn ref_param_type_carries_through() {
+        // `@fn f(p: &u32)` — `p` is a Ref(u32) local. Returning `*p` yields u32.
+        let typing = infer_str("@fn f(p: &u32) -> u32 { return *p; }").unwrap();
+        // The deref `*p` should be u32.
+        let saw_u32 = types_in(&typing)
+            .iter()
+            .any(|t| matches!(t, Type::Primitive(PrimitiveType::U32)));
+        assert!(saw_u32);
+    }
+
+    #[test]
+    fn deref_non_reference_is_e0515() {
+        // `*42i32` — can't deref a non-reference.
+        let errors = infer_str("@fn f() -> i32 { return *42i32; }").unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, TypeError::DerefNonReference { .. })));
+    }
+
+    // ── Function calls ───────────────────────────────────────────────────
+
+    #[test]
+    fn call_returns_callee_return_type() {
+        let typing = infer_str(
+            "@fn helper() -> u32 { return 0u32; } \
+             @fn caller() { let _x: u32 = helper(); }",
+        )
+        .unwrap();
+        // The call expression `helper()` should be typed as u32.
+        let u32_count = types_in(&typing)
+            .iter()
+            .filter(|t| matches!(t, Type::Primitive(PrimitiveType::U32)))
+            .count();
+        // Two u32s: the literal `0u32` inside helper, and the call result.
+        assert!(u32_count >= 2, "got {u32_count} u32s");
+    }
+
+    #[test]
+    fn call_arity_mismatch_is_e0514() {
+        let errors = infer_str(
+            "@fn add(a: u32, b: u32) -> u32 { return 0u32; } \
+             @fn caller() { let _x := add(1u32); }",
+        )
+        .unwrap_err();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            TypeError::CallArityMismatch { callee, expected: 2, actual: 1, .. } if callee == "add"
+        )));
+    }
+
+    #[test]
+    fn call_arg_type_mismatch_is_e0513() {
+        let errors = infer_str(
+            "@fn helper(x: u32) -> u32 { return x; } \
+             @fn caller() { let _x := helper(1u8); }",
+        )
+        .unwrap_err();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            TypeError::CallArgMismatch { callee, arg: 1, .. } if callee == "helper"
+        )));
+    }
+
+    #[test]
+    fn call_with_correct_args_succeeds() {
+        let res = infer_str(
+            "@fn add(a: u32, b: u32) -> u32 { return 0u32; } \
+             @fn caller() { let _x: u32 = add(1u32, 2u32); }",
+        );
+        assert!(res.is_ok(), "got errors: {:?}", res);
+    }
+
+    #[test]
+    fn call_to_local_is_unknown_not_error() {
+        // Calling a parameter (typed as Unknown for callable-ness in slice 2)
+        // should produce Unknown, not a spurious error.
+        let res = infer_str(
+            "@fn caller() { let helper := 0u32; let _y := helper(); }",
+        );
+        // No errors expected — we don't know what `helper` is callable as
+        // but it's not a top-level fn so we skip arg checking.
+        assert!(res.is_ok(), "got errors: {:?}", res);
+    }
+
+    #[test]
+    fn call_to_undefined_callee_silent_in_typer() {
+        // The resolver catches undefined names — by the time the typer runs,
+        // the call wouldn't even reach `infer` (resolve fails). Test that
+        // we handle the `is_callable_top_level == false` case cleanly.
+        // We construct this by calling something that resolves to a local:
+        let res = infer_str(
+            "@fn helper() -> u32 { return 0u32; } \
+             @fn caller() { let helper: u32 = 0u32; let _x := helper(); }",
+        );
+        // `helper` shadowed by the local — call resolves to a Local Let,
+        // not a TopLevel Fn. The typer skips signature checking.
+        assert!(res.is_ok());
+    }
+
+    // ── Automaton field access typing ────────────────────────────────────
+
+    #[test]
+    fn auto_field_read_yields_field_type() {
+        let typing = infer_str(
+            "#automaton Counter { value: u32; } \
+             #effect peek() #mutates: [] { let _x: u32 = Counter.value; }",
+        )
+        .unwrap();
+        // Counter.value should be typed as u32.
+        let saw_u32 = types_in(&typing)
+            .iter()
+            .any(|t| matches!(t, Type::Primitive(PrimitiveType::U32)));
+        assert!(saw_u32);
+    }
+
+    #[test]
+    fn auto_field_in_arithmetic_propagates_correctly() {
+        // `Counter.value + 1u32` — the field's u32 type drives the literal's
+        // type to match (well, the literal is already u32 from its suffix;
+        // but the binary still type-checks).
+        let res = infer_str(
+            "#automaton Counter { value: u32; } \
+             #effect e() #mutates: [Counter] { let next: u32 = Counter.value + 1u32; }",
+        );
+        assert!(res.is_ok(), "got errors: {:?}", res);
+    }
+
+    #[test]
+    fn auto_field_type_mismatch_in_let_is_e0512() {
+        let errors = infer_str(
+            "#automaton Counter { value: u32; } \
+             #effect e() #mutates: [] { let _x: u8 = Counter.value; }",
+        )
+        .unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, TypeError::LetTypeMismatch { .. })));
+    }
+
+    #[test]
+    fn self_field_in_transition_yields_field_type() {
+        let typing = infer_str(
+            "#automaton Counter { value: u32; \
+             #transition tick { let _x: u32 = Self.value; } }",
+        )
+        .unwrap();
+        let saw_u32 = types_in(&typing)
+            .iter()
+            .any(|t| matches!(t, Type::Primitive(PrimitiveType::U32)));
+        assert!(saw_u32);
+    }
+
+    // ── Realistic combined exercise ──────────────────────────────────────
+
+    #[test]
+    fn realistic_program_with_calls_and_fields() {
+        let src = "\
+            #automaton Counter { value: u32; }\n\
+            @fn double(x: u32) -> u32 { return x; }\n\
+            #effect bump() #mutates: [Counter] {\n  \
+              let next: u32 = double(Counter.value);\n  \
+              Counter.value = next;\n  \
+              return;\n\
+            }\n\
+        ";
+        let res = infer_str(src);
+        assert!(res.is_ok(), "got errors: {:?}", res);
+        let typing = res.unwrap();
+        // Plenty of u32s expected.
+        let u32_count = types_in(&typing)
+            .iter()
+            .filter(|t| matches!(t, Type::Primitive(PrimitiveType::U32)))
+            .count();
+        assert!(u32_count >= 4, "got {u32_count}");
     }
 }
