@@ -7,6 +7,36 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Phase 1 resolver slice 2: body name resolution (2026-05-01)
+
+- `clifford-resolve`: public entry point `resolve(&Program) -> Result<Resolution, Vec<ResolveError>>`.
+  Walks every `@fn` / `#effect` / `#interrupt` body, building a scope chain
+  (parameters at the bottom; `let` and `let :=` bindings stacked above), and
+  resolves every single-segment `Path([X])` expression to a `BindingRef` —
+  either a top-level `Symbol` or a `LocalBinding`.
+- New types: `Resolution` (carries `SymbolTable` + `bindings: HashMap<Span, BindingRef>`),
+  `BindingRef::{TopLevel, Local}`, `LocalBinding`, `LocalKind::{Param, Let, LetShort}`.
+- `Auto@state` reads, `#mutate Auto { … }`, and `Auto.field <op>= …` mutation
+  sugar verify their automaton-name component resolves to an `#automaton`
+  symbol; mismatches surface as the new `E0403 NotAnAutomaton` error
+  (carries the actual kind found, e.g. "function", or `"undefined"`).
+- New `E0402 UndefinedName` error for unresolved single-segment names in
+  expression position.
+- Locals shadow top-level symbols (a `let helper := …` inside a function
+  hides the global `@fn helper` for the rest of the block). `let x = x + 1`
+  references the *outer* `x` on the RHS — initializer is walked before the
+  binding is declared.
+- `#> proc(args)` walks its arguments but does not resolve the proc name
+  itself (that's slice 3 work alongside CallContext tagging per Refinement #5b).
+- 25 new tests + 1 new doctest covering: param/let/let-short resolution,
+  mutability + type-annotation tracking, outer-binding-on-let-RHS semantics,
+  shadowing, undefined-name errors collected (not fail-fast),
+  `#mutate` / `Auto.field <op>=` / `Auto@state` automaton verification
+  including wrong-kind diagnostics, scope-chain depth (3-let chain),
+  recursion through Binary/Index/Call/ArrayRepeat/Unsafe-load expressions,
+  proc-call argument walking, mixed slice-1+slice-2 error reporting, and a
+  realistic 3-item program. Total resolver test count: **46 unit + 2 doctests**.
+
 ### Added — Phase 1 resolver slice 1: top-level SymbolTable (2026-05-01)
 
 - `clifford-resolve`: first real implementation. `SymbolTable::build(&Program)`
