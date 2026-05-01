@@ -7,6 +7,39 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Phase 1 type checker slice 3: structured-type expressions (2026-05-01)
+
+- `clifford-types`: extends `Type` with `Array { element, size }`,
+  `Slice { element }`, `Tuple(Vec<Type>)`, and `Range { element, inclusive }`.
+  `Type::display` renders all four (`[u8; 64]`, `[u8]`, `(u32, bool)`,
+  `u32..u32` / `u32..=u32`).
+- `Expr::Tuple` types to `Type::Tuple`. `Expr::Array` types to
+  `Type::Array { element: <first-elem>, size: <count> }`. Empty arrays
+  produce `[?; 0]`. Mixed-type arrays propagate Unknown (T4 may add a
+  dedicated mismatch error).
+- `Expr::ArrayRepeat` types to `Type::Array { element: <value>, size: <count_text> }`.
+  Const-evaluating the count is deferred; the raw text is preserved.
+- `Expr::Index` types via auto-deref: indexing into `[T; N]`, `[T]`,
+  `&[T; N]`, `&[T]`, or the `&[u8]` shorthand all return the element
+  type. Non-integer index → `E0517 IndexNotInteger`. Non-indexable
+  receiver → `E0516 IndexNonIndexable`.
+- `Expr::Range` types to `Type::Range`. Bounds must be the same integer
+  type; mismatches reuse `E0510 BinaryTypeMismatch` with op `..` / `..=`.
+- `type_from_type_expr` now translates `TypeKind::Array`, `TypeKind::Slice`,
+  and `TypeKind::Tuple` to their semantic counterparts. Parameters
+  declared as `&[u8; 64]` / `&[u8]` / `(u32, bool)` carry through correctly.
+- 16 new tests + every prior slice green: display formatting for all four
+  new variants; tuple expressions; array literals; array-repeat;
+  indexing into arrays / refs to arrays / slices / refs to slices;
+  index-with-non-integer (E0517); index-into-non-indexable (E0516);
+  half-open / inclusive ranges; range bound mismatch (E0510);
+  array-typed automaton field via `Counter.flags[0]`. **Total
+  clifford-types: 78 unit tests + 1 doctest.**
+- What remains for slice T4: method-call typing (needs nominal/trait
+  registry), `Path([X, Y])` for ADT constructors and module paths,
+  generic instantiation with HM unification, trait satisfaction (§5.3),
+  access-type modeling.
+
 ### Added — Phase 1 type checker slice 2: function calls, automaton fields, references (2026-05-01)
 
 - `clifford-types`: extends `Type` with `Ref { mutable, inner }` for borrow

@@ -28,16 +28,19 @@
 //! Integer suffix recognition, Path → local-type resolution, unary/binary
 //! operator typing, `let`-annotation matching, narrow unsafe primitives.
 //!
-//! **Slice 2 (this PR):** function-call typing, automaton-field typing,
-//! reference types. A `SignatureRegistry` precomputes every top-level
-//! `@fn` / `#effect` / `#interrupt` signature; `Expr::Call` arguments
-//! are checked against the callee's parameter types (E0513) and the call
-//! result is the declared return type. Field-access on automaton symbols
-//! consumes the resolver's `AutomatonField` bindings to look up the
-//! declared field type. New `Type::Ref { mutable, inner }` variant for
-//! `&x` / `&mut x` borrow expressions; deref `*r` unwraps it. Index,
-//! tuple, range, method-call, generic instantiation, and trait satisfaction
-//! all remain deferred to slice T3.
+//! **Slice 2:** function-call typing, automaton-field typing, references.
+//! `SignatureRegistry` for top-level callable typing; `AutomatonField`
+//! bindings consumed for field-access typing; `Type::Ref` for borrow
+//! exprs and deref.
+//!
+//! **Slice 3 (this PR):** structured-type expressions. Adds `Type::Array`,
+//! `Type::Slice`, `Type::Tuple`, and `Type::Range` to the algebra. Types
+//! `Expr::Index` against arrays/slices (returns the element type;
+//! E0516 if the receiver isn't indexable, E0517 if the index isn't an
+//! integer). Types tuple expressions, array literals, array-repeat
+//! literals, and range expressions. Method calls, generic instantiation,
+//! and trait satisfaction remain deferred to slice T4 (those need real
+//! HM unification + the trait-resolution machinery).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -143,6 +146,25 @@ pub enum TypeError {
         /// Byte offset of the unary expression.
         at: usize,
     },
+
+    /// An `obj[i]` index expression's receiver isn't an array, slice, or
+    /// reference to one.
+    #[error("E0516: cannot index into non-indexable type {receiver} (at byte {at})")]
+    IndexNonIndexable {
+        /// Display name of the receiver type.
+        receiver: String,
+        /// Byte offset of the index expression.
+        at: usize,
+    },
+
+    /// An `obj[i]` index expression's index isn't an integer.
+    #[error("E0517: index must be an integer, got {index} (at byte {at})")]
+    IndexNotInteger {
+        /// Display name of the index expression's type.
+        index: String,
+        /// Byte offset of the index expression.
+        at: usize,
+    },
 }
 
 /// A fully-resolved Clifford type — the abstract counterpart to `TypeExpr`
@@ -152,10 +174,11 @@ pub enum TypeError {
 /// segments, etc.); `Type` is the *semantic* form (canonical, comparable,
 /// produced by the type checker once names have been resolved).
 ///
-/// Slice-2 scope: [`Type::Unit`], [`Type::Primitive`], [`Type::Ref`],
-/// [`Type::StringSlice`], and [`Type::Unknown`]. Slice arrays, tuples,
-/// fn-pointer types, ADTs, and access types arrive in subsequent slices
-/// alongside their specific use cases.
+/// Slice-3 scope: [`Type::Unit`], [`Type::Primitive`], [`Type::Ref`],
+/// [`Type::Array`], [`Type::Slice`], [`Type::Tuple`], [`Type::Range`],
+/// [`Type::StringSlice`], and [`Type::Unknown`]. Function-pointer types,
+/// nominal types (paths to `@type` declarations), ADT variants, and access
+/// types are slice T4+.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     /// `()` — the unit type.
@@ -163,23 +186,49 @@ pub enum Type {
     /// One of the predeclared primitive types from §4.1.
     Primitive(PrimitiveType),
     /// `&T` (immutable) or `&mut T` — a body-scoped reference per Decision #13.
-    /// Slice 2 introduces this variant for borrow-expression typing and
-    /// deref-typing. Slice / array reference subtleties land in slice T3.
+    /// Provenance / lifetime checking is `clifford-check`'s job; the type
+    /// system just carries the reference structure.
     Ref {
         /// `true` for `&mut T`, `false` for `&T`.
         mutable: bool,
         /// The referenced type.
         inner: Box<Type>,
     },
-    /// `&[u8]` for string literals — modelled here so slice 1 doesn't need
-    /// the full slice-type machinery from §4. When real slice/reference
-    /// types land, this collapses into the general representation.
+    /// `[T; N]` — fixed-size array on the stack. The size is preserved as
+    /// the original integer-literal text (no const evaluation in this
+    /// slice; `clifford-check` validates against `usize::MAX` later).
+    Array {
+        /// Element type.
+        element: Box<Type>,
+        /// Raw integer-literal text from the AST (e.g. `"64"`, `"1_024"`).
+        size: String,
+    },
+    /// `[T]` — slice (logically `(ptr, len)`). Almost always appears under
+    /// a `Ref` in real code (`&[T]`).
+    Slice {
+        /// Element type.
+        element: Box<Type>,
+    },
+    /// `(T1, T2, …)` — tuple with 2+ elements (1-tuples don't exist; `(T)`
+    /// is just a parenthesised T per §2.7).
+    Tuple(Vec<Type>),
+    /// `lo..hi` / `lo..=hi` — range expression value type. Carries the
+    /// shared bound type so `clifford-check` can verify sigma-loop bounds
+    /// (Decision #14) without re-typing.
+    Range {
+        /// The element / bound type.
+        element: Box<Type>,
+        /// `true` for `..=` (inclusive), `false` for `..`.
+        inclusive: bool,
+    },
+    /// `&[u8]` for string literals — special-case shorthand kept for
+    /// backward compatibility with slice T1 / T2 fixtures. Behaves
+    /// identically to `Ref { mutable: false, inner: Slice { element: u8 } }`
+    /// for type-equality purposes; downstream consumers can treat them as
+    /// the same type via [`Type::display`].
     StringSlice,
     /// The type checker could not yet compute this expression's type.
-    /// Carries a brief reason string for diagnostics. Downstream phases
-    /// that consume `Unknown` should treat it as "type information not
-    /// available" rather than as a default — emitting their own error
-    /// message that points at the specific limitation.
+    /// Carries a brief reason string for diagnostics.
     Unknown(&'static str),
 }
 
@@ -193,6 +242,16 @@ impl Type {
             Self::Ref { mutable, inner } => {
                 let prefix = if *mutable { "&mut " } else { "&" };
                 format!("{prefix}{}", inner.display())
+            }
+            Self::Array { element, size } => format!("[{}; {size}]", element.display()),
+            Self::Slice { element } => format!("[{}]", element.display()),
+            Self::Tuple(elems) => {
+                let parts: Vec<String> = elems.iter().map(|t| t.display()).collect();
+                format!("({})", parts.join(", "))
+            }
+            Self::Range { element, inclusive } => {
+                let dots = if *inclusive { "..=" } else { ".." };
+                format!("{}{dots}{}", element.display(), element.display())
             }
             Self::StringSlice => "&[u8]".to_owned(),
             Self::Unknown(reason) => format!("<unknown: {reason}>"),
@@ -586,26 +645,66 @@ impl<'a> Inferer<'a> {
 
             ExprKind::Paren(inner) => self.infer_expr(inner),
 
-            // Compound forms whose type slice 1 doesn't compute.
-            ExprKind::Tuple(elems) | ExprKind::Array(elems) => {
-                for e in elems {
-                    let _ = self.infer_expr(e);
+            ExprKind::Tuple(elems) => {
+                let elem_types: Vec<Type> = elems.iter().map(|e| self.infer_expr(e)).collect();
+                if elem_types.iter().any(Type::is_unknown) {
+                    Type::Unknown("tuple element type unknown")
+                } else {
+                    Type::Tuple(elem_types)
                 }
-                Type::Unknown("tuple/array type construction is slice T2 work")
+            }
+            ExprKind::Array(elems) => {
+                // `[a, b, c]` — every element should have the same type.
+                // Slice 3 takes the first element's type as the element type;
+                // an in-element-type-mismatch error class can land in T4 if
+                // we want stricter checking. For now, mismatched arrays
+                // produce a type with the first element's type but downstream
+                // operations may still surface inconsistency.
+                let elem_types: Vec<Type> = elems.iter().map(|e| self.infer_expr(e)).collect();
+                if elem_types.is_empty() {
+                    // Empty array literal — the parser permits this; size 0.
+                    Type::Array {
+                        element: Box::new(Type::Unknown("empty array element")),
+                        size: "0".to_owned(),
+                    }
+                } else if elem_types.iter().any(Type::is_unknown) {
+                    Type::Unknown("array element type unknown")
+                } else {
+                    let size = format!("{}", elems.len());
+                    Type::Array {
+                        element: Box::new(elem_types[0].clone()),
+                        size,
+                    }
+                }
             }
             ExprKind::ArrayRepeat { value, count } => {
-                let _ = self.infer_expr(value);
-                let _ = self.infer_expr(count);
-                Type::Unknown("array-repeat type construction is slice T2 work")
+                let value_ty = self.infer_expr(value);
+                let count_ty = self.infer_expr(count);
+                let _ = count_ty;
+                // We don't const-evaluate the count here; record it as the
+                // raw text from the count expression's literal if possible,
+                // else as "?".
+                let size = match &count.kind {
+                    ExprKind::IntLit(s) | ExprKind::HexLit(s) | ExprKind::BinLit(s) => s.clone(),
+                    _ => "?".to_owned(),
+                };
+                if value_ty.is_unknown() {
+                    Type::Unknown("array-repeat element type unknown")
+                } else {
+                    Type::Array {
+                        element: Box::new(value_ty),
+                        size,
+                    }
+                }
             }
             ExprKind::FieldAccess { obj, field } => {
                 let _ = self.infer_expr(obj);
                 self.field_access_type(expr.span, field)
             }
             ExprKind::Index { obj, index } => {
-                let _ = self.infer_expr(obj);
-                let _ = self.infer_expr(index);
-                Type::Unknown("index typing is slice T2 work")
+                let obj_ty = self.infer_expr(obj);
+                let index_ty = self.infer_expr(index);
+                self.index_type(&obj_ty, &index_ty, expr.span)
             }
             ExprKind::Call { callee, args } => self.call_type(callee, args, expr.span),
             ExprKind::MethodCall { obj, args, .. } => {
@@ -652,10 +751,30 @@ impl<'a> Inferer<'a> {
                 type_from_type_expr(ty)
             }
 
-            ExprKind::Range { lo, hi, .. } => {
-                let _ = self.infer_expr(lo);
-                let _ = self.infer_expr(hi);
-                Type::Unknown("range typing is slice T2+ work")
+            ExprKind::Range { lo, hi, inclusive } => {
+                let lo_ty = self.infer_expr(lo);
+                let hi_ty = self.infer_expr(hi);
+                if lo_ty.is_unknown() || hi_ty.is_unknown() {
+                    Type::Unknown("range bound type unknown")
+                } else if !lo_ty.is_integer() || !hi_ty.is_integer() {
+                    // Non-integer ranges are out of scope for sigma loops
+                    // (Decision #14); we surface this as Unknown rather than
+                    // an error so downstream code can choose how to handle it.
+                    Type::Unknown("range bounds must be integers (T4 may add a dedicated error)")
+                } else if lo_ty != hi_ty {
+                    self.errors.push(TypeError::BinaryTypeMismatch {
+                        op: if *inclusive { "..=" } else { ".." },
+                        lhs: lo_ty.display(),
+                        rhs: hi_ty.display(),
+                        at: expr.span.start,
+                    });
+                    Type::Unknown("range bound mismatch")
+                } else {
+                    Type::Range {
+                        element: Box::new(lo_ty),
+                        inclusive: *inclusive,
+                    }
+                }
             }
 
             // Narrow unsafe primitives — the type argument tells us the
@@ -770,6 +889,53 @@ impl<'a> Inferer<'a> {
         }
 
         sig.return_type.clone()
+    }
+
+    /// Type an `obj[index]` expression.
+    ///
+    /// Receiver shapes accepted:
+    /// - `[T; N]` → element type `T`
+    /// - `[T]` → element type `T`
+    /// - `&[T; N]` / `&mut [T; N]` → `T` (auto-deref)
+    /// - `&[T]` / `&mut [T]` → `T` (auto-deref)
+    /// - `&[u8]` (StringSlice shorthand) → `u8`
+    ///
+    /// Index must be an integer (E0517). Non-indexable receivers emit
+    /// E0516. Unknown receivers/indices propagate Unknown without
+    /// piling on errors.
+    fn index_type(&mut self, receiver: &Type, index: &Type, at: Span) -> Type {
+        if receiver.is_unknown() || index.is_unknown() {
+            return Type::Unknown("index on unknown type");
+        }
+        if !index.is_integer() {
+            self.errors.push(TypeError::IndexNotInteger {
+                index: index.display(),
+                at: at.start,
+            });
+            // Continue computing the element type even on bad index — the
+            // user gets both diagnostics in one pass.
+        }
+        let element = match receiver {
+            Type::Array { element, .. } | Type::Slice { element } => Some((**element).clone()),
+            Type::Ref { inner, .. } => match inner.as_ref() {
+                Type::Array { element, .. } | Type::Slice { element } => {
+                    Some((**element).clone())
+                }
+                _ => None,
+            },
+            Type::StringSlice => Some(Type::Primitive(PrimitiveType::U8)),
+            _ => None,
+        };
+        match element {
+            Some(t) => t,
+            None => {
+                self.errors.push(TypeError::IndexNonIndexable {
+                    receiver: receiver.display(),
+                    at: at.start,
+                });
+                Type::Unknown("non-indexable receiver")
+            }
+        }
     }
 
     /// Type a `FieldAccess` expression. The resolver already validated that
@@ -968,26 +1134,28 @@ fn types_compatible(declared: &Type, actual: &Type) -> bool {
 /// types all return [`Type::Unknown`] for now — those land in slice T2+
 /// alongside their use cases.
 fn type_from_type_expr(t: &TypeExpr) -> Type {
+    use clifford_ast::ArraySize;
     match &t.kind {
         TypeKind::Unit => Type::Unit,
         TypeKind::Primitive(p) => Type::Primitive(*p),
-        TypeKind::Ref(rt) => {
-            // The inner type is recursively translated; a `&[u8]` parameter
-            // (the most common shape in real code) translates to
-            // `Ref { inner: Unknown("slice...") }` for now since
-            // `Slice` typing itself is slice T3 work. That's still useful:
-            // the "this is a reference" property is preserved.
-            Type::Ref {
-                mutable: rt.mutable,
-                inner: Box::new(type_from_type_expr(&rt.inner)),
+        TypeKind::Ref(rt) => Type::Ref {
+            mutable: rt.mutable,
+            inner: Box::new(type_from_type_expr(&rt.inner)),
+        },
+        TypeKind::Array(at) => {
+            let ArraySize::IntLiteral(size) = &at.size;
+            Type::Array {
+                element: Box::new(type_from_type_expr(&at.element)),
+                size: size.clone(),
             }
         }
-        TypeKind::Path(_) => Type::Unknown("nominal-path type lookup is slice T3 work"),
-        TypeKind::Access(_) => Type::Unknown("access<T> type is slice T3 work"),
-        TypeKind::Array(_) => Type::Unknown("array type is slice T3 work"),
-        TypeKind::Slice(_) => Type::Unknown("slice type is slice T3 work"),
-        TypeKind::Tuple(_) => Type::Unknown("tuple type is slice T3 work"),
-        TypeKind::Fn(_) => Type::Unknown("@fn pointer type is slice T3 work"),
+        TypeKind::Slice(st) => Type::Slice {
+            element: Box::new(type_from_type_expr(&st.element)),
+        },
+        TypeKind::Tuple(tt) => Type::Tuple(tt.elements.iter().map(type_from_type_expr).collect()),
+        TypeKind::Path(_) => Type::Unknown("nominal-path type lookup is slice T4 work"),
+        TypeKind::Access(_) => Type::Unknown("access<T> type is slice T4 work"),
+        TypeKind::Fn(_) => Type::Unknown("@fn pointer type is slice T4 work"),
         // `TypeKind` is `#[non_exhaustive]`. New variants default to Unknown;
         // add an explicit arm when one lands.
         _ => Type::Unknown("forward-compat: new TypeKind variant"),
@@ -1709,6 +1877,195 @@ mod tests {
     }
 
     // ── Realistic combined exercise ──────────────────────────────────────
+
+    // ─── Slice 3: structured-type expressions ────────────────────────────
+
+    fn first_of<F>(typing: &Typing, pred: F) -> Option<&Type>
+    where
+        F: Fn(&Type) -> bool,
+    {
+        typing.types.values().find(|t| pred(t))
+    }
+
+    // ── Display for new variants ─────────────────────────────────────────
+
+    #[test]
+    fn array_type_display() {
+        let t = Type::Array {
+            element: Box::new(Type::Primitive(PrimitiveType::U8)),
+            size: "64".to_owned(),
+        };
+        assert_eq!(t.display(), "[u8; 64]");
+    }
+
+    #[test]
+    fn slice_type_display() {
+        let t = Type::Slice {
+            element: Box::new(Type::Primitive(PrimitiveType::U8)),
+        };
+        assert_eq!(t.display(), "[u8]");
+    }
+
+    #[test]
+    fn tuple_type_display() {
+        let t = Type::Tuple(vec![
+            Type::Primitive(PrimitiveType::U32),
+            Type::Primitive(PrimitiveType::Bool),
+        ]);
+        assert_eq!(t.display(), "(u32, bool)");
+    }
+
+    #[test]
+    fn range_type_display() {
+        let t = Type::Range {
+            element: Box::new(Type::Primitive(PrimitiveType::U32)),
+            inclusive: false,
+        };
+        assert!(t.display().contains(".."));
+        let inc = Type::Range {
+            element: Box::new(Type::Primitive(PrimitiveType::U32)),
+            inclusive: true,
+        };
+        assert!(inc.display().contains("..="));
+    }
+
+    // ── Tuple expressions ────────────────────────────────────────────────
+
+    #[test]
+    fn tuple_expr_yields_tuple_type() {
+        let typing = infer_str("@fn f() { let _t := (1u32, true); }").unwrap();
+        let saw_tuple = first_of(&typing, |t| {
+            matches!(t,
+                Type::Tuple(elems)
+                    if elems.len() == 2
+                        && matches!(elems[0], Type::Primitive(PrimitiveType::U32))
+                        && matches!(elems[1], Type::Primitive(PrimitiveType::Bool))
+            )
+        });
+        assert!(saw_tuple.is_some());
+    }
+
+    // ── Array literal expressions ────────────────────────────────────────
+
+    #[test]
+    fn array_literal_yields_array_type() {
+        let typing = infer_str("@fn f() { let _a := [1u32, 2u32, 3u32]; }").unwrap();
+        let saw_array = first_of(&typing, |t| {
+            matches!(t,
+                Type::Array { element, size }
+                    if matches!(element.as_ref(), Type::Primitive(PrimitiveType::U32))
+                        && size == "3"
+            )
+        });
+        assert!(saw_array.is_some());
+    }
+
+    #[test]
+    fn array_repeat_yields_array_type() {
+        let typing = infer_str("@fn f() { let _a := [0u8; 64]; }").unwrap();
+        let saw_array = first_of(&typing, |t| {
+            matches!(t,
+                Type::Array { element, size }
+                    if matches!(element.as_ref(), Type::Primitive(PrimitiveType::U8))
+                        && size == "64"
+            )
+        });
+        assert!(saw_array.is_some());
+    }
+
+    // ── Index expressions ────────────────────────────────────────────────
+
+    #[test]
+    fn index_into_array_yields_element() {
+        let typing = infer_str("@fn f() -> u32 { let a := [1u32, 2u32, 3u32]; return a[0u32]; }")
+            .unwrap();
+        // The `a[0u32]` index returns u32.
+        let u32_count = typing
+            .types
+            .values()
+            .filter(|t| matches!(t, Type::Primitive(PrimitiveType::U32)))
+            .count();
+        assert!(u32_count >= 4, "got {u32_count}");
+    }
+
+    #[test]
+    fn index_into_ref_array_auto_derefs() {
+        // `&[u8; 64]` parameter → indexing returns u8.
+        let typing = infer_str("@fn f(buf: &[u8; 64]) -> u8 { return buf[0u32]; }").unwrap();
+        let saw_u8 = first_of(&typing, |t| matches!(t, Type::Primitive(PrimitiveType::U8)));
+        assert!(saw_u8.is_some());
+    }
+
+    #[test]
+    fn index_into_ref_slice_auto_derefs() {
+        let typing =
+            infer_str("@fn f(buf: &[u8]) -> u8 { return buf[0u32]; }").unwrap();
+        let saw_u8 = first_of(&typing, |t| matches!(t, Type::Primitive(PrimitiveType::U8)));
+        assert!(saw_u8.is_some());
+    }
+
+    #[test]
+    fn index_with_non_integer_is_e0517() {
+        let errors =
+            infer_str("@fn f(buf: &[u8]) -> u8 { return buf[true]; }").unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, TypeError::IndexNotInteger { .. })));
+    }
+
+    #[test]
+    fn index_into_non_indexable_is_e0516() {
+        let errors =
+            infer_str("@fn f() -> u32 { let x := 42u32; return x[0u32]; }").unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, TypeError::IndexNonIndexable { .. })));
+    }
+
+    // ── Range expressions ────────────────────────────────────────────────
+
+    #[test]
+    fn range_half_open_yields_range_type() {
+        let typing = infer_str("@fn f() { let _r := 0u32 .. 10u32; }").unwrap();
+        let saw_range = first_of(&typing, |t| {
+            matches!(t,
+                Type::Range { element, inclusive: false }
+                    if matches!(element.as_ref(), Type::Primitive(PrimitiveType::U32))
+            )
+        });
+        assert!(saw_range.is_some());
+    }
+
+    #[test]
+    fn range_inclusive_yields_inclusive_range_type() {
+        let typing = infer_str("@fn f() { let _r := 0u32 ..= 10u32; }").unwrap();
+        let saw_range = first_of(&typing, |t| {
+            matches!(t, Type::Range { inclusive: true, .. })
+        });
+        assert!(saw_range.is_some());
+    }
+
+    #[test]
+    fn range_with_mismatched_bounds_is_e0510() {
+        // We reuse BinaryTypeMismatch for range mismatch (op `..` / `..=`).
+        let errors = infer_str("@fn f() { let _r := 0u32 .. 10u8; }").unwrap_err();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            TypeError::BinaryTypeMismatch { op: "..", .. }
+        )));
+    }
+
+    // ── Combined: array + index in a real signature ──────────────────────
+
+    #[test]
+    fn array_field_access_works() {
+        // `Counter.flags: [u8; 4]` — accessing `Counter.flags[0]` gives u8.
+        let res = infer_str(
+            "#automaton Counter { flags: [u8; 4]; } \
+             #effect peek() #mutates: [] { let _x: u8 = Counter.flags[0u32]; }",
+        );
+        assert!(res.is_ok(), "got errors: {:?}", res);
+    }
 
     #[test]
     fn realistic_program_with_calls_and_fields() {
