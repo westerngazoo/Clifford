@@ -245,9 +245,33 @@ pub enum TokenKind {
     Dollar,
 
     // ─ Literals ────────────────────────────────────────────────────────────
-    /// Decimal integer literal. Stores the raw textual digits for now;
-    /// numeric value parsing and type-suffix handling land in slice 3.
+    /// Decimal integer literal. Stores the raw textual digits *including*
+    /// any optional type suffix (e.g. `42`, `1_000_000`, `42u32`). Numeric
+    /// value parsing happens at the type-checker layer; this token form
+    /// preserves the source text faithfully so diagnostics can quote it.
     IntLiteral(String),
+    /// Hexadecimal integer literal: `0x` prefix preserved (e.g. `0xDEAD_BEEF`,
+    /// `0xFFu8`).
+    HexLiteral(String),
+    /// Binary integer literal: `0b` prefix preserved (e.g. `0b1010_0101`,
+    /// `0b1111u8`).
+    BinLiteral(String),
+    /// Float literal: `<digits>.<digits>(e[+-]?<digits>)?<suffix>?`. The
+    /// raw source text is preserved, including any `f32` / `f64` suffix.
+    /// Per §1.2, the leading and trailing digits around the `.` are
+    /// mandatory; `1.` and `.5` are *not* float literals.
+    FloatLiteral(String),
+    /// Character literal `'X'`. Escape sequences (`\n`, `\\`, `\xHH`, …) are
+    /// resolved at lex time; the stored value is the resulting Unicode scalar.
+    CharLiteral(char),
+    /// Byte literal `b'X'` (Decision #15 / §1.2). Escape sequences are
+    /// resolved; the stored value is a single `u8`. Non-ASCII bytes are
+    /// rejected at lex time per §1.2's grammar.
+    ByteLiteral(u8),
+    /// String literal `"…"`. Escape sequences are resolved at lex time; the
+    /// stored value is the resulting `String`. Multi-line strings and raw
+    /// strings are out of scope for v0.1.
+    StringLiteral(String),
 
     // ─ Operators and punctuation (§1.4) ────────────────────────────────────
     /// `(`
@@ -392,6 +416,56 @@ pub enum LexError {
         /// Byte offset of the opening `/*`.
         at: usize,
     },
+
+    /// A string literal was opened but never closed before EOF or LF.
+    #[error("E0107: unterminated string literal opened at byte {at}")]
+    UnterminatedStringLiteral {
+        /// Byte offset of the opening `"`.
+        at: usize,
+    },
+
+    /// A char or byte literal was opened but never closed.
+    #[error("E0108: unterminated {kind} literal opened at byte {at}")]
+    UnterminatedCharLiteral {
+        /// `"char"` or `"byte"`.
+        kind: &'static str,
+        /// Byte offset of the opening `'`.
+        at: usize,
+    },
+
+    /// An invalid escape sequence (`\…`) was encountered inside a string,
+    /// char, or byte literal.
+    #[error("E0109: invalid escape sequence '\\{ch}' at byte {at}")]
+    InvalidEscape {
+        /// The character that followed the backslash.
+        ch: char,
+        /// Byte offset of the backslash.
+        at: usize,
+    },
+
+    /// A char literal contained zero or more than one character.
+    #[error("E0110: char literal must contain exactly one character (at byte {at})")]
+    InvalidCharLiteral {
+        /// Byte offset of the opening `'`.
+        at: usize,
+    },
+
+    /// A byte literal contained a non-ASCII character.
+    #[error("E0111: byte literal must be ASCII (at byte {at})")]
+    NonAsciiByteLiteral {
+        /// Byte offset of the opening `'`.
+        at: usize,
+    },
+
+    /// A numeric literal had a malformed prefix (`0x` / `0b`) with no digits
+    /// following, or a malformed exponent (`1.0e` with no digits).
+    #[error("E0112: malformed numeric literal at byte {at}: {msg}")]
+    MalformedNumber {
+        /// Byte offset where the literal begins.
+        at: usize,
+        /// Human-readable reason.
+        msg: &'static str,
+    },
 }
 
 // ─── Public API ──────────────────────────────────────────────────────────────
@@ -534,8 +608,13 @@ impl<'src> Lexer<'src> {
         };
 
         match b {
+            // Byte literal `b'X'`. Must dispatch before ident lexing because
+            // bare `b` is otherwise an identifier start.
+            b'b' if self.peek(1) == Some(b'\'') => self.lex_byte_literal(start),
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => Ok(self.lex_ident_or_keyword(start)),
-            b'0'..=b'9' => Ok(self.lex_integer(start)),
+            b'0'..=b'9' => self.lex_number(start),
+            b'\'' => self.lex_char_literal(start),
+            b'"' => self.lex_string_literal(start),
             b'#' => self.lex_hash_form(start),
             b'@' => self.lex_at_form(start),
             b'$' => {
@@ -591,10 +670,33 @@ impl<'src> Lexer<'src> {
         }
     }
 
-    fn lex_integer(&mut self, start: usize) -> Token {
-        // Decimal digits with optional `_` separators per §1.2
-        // `integer := [0-9]+ ('_' [0-9]+)* type_suffix?`. Type suffix and
-        // hex / binary / float forms land in slice 3.
+    /// Lex a numeric literal — dispatches between integer (decimal / hex /
+    /// binary) and float per §1.2.
+    ///
+    /// Caller has verified `peek(0)` is an ASCII digit at `start`.
+    fn lex_number(&mut self, start: usize) -> Result<Token, LexError> {
+        // Hex / binary prefix dispatch.
+        if self.peek(0) == Some(b'0') {
+            match self.peek(1) {
+                Some(b'x' | b'X') => {
+                    self.pos += 2;
+                    return self.lex_hex_or_bin_tail(start, /*is_hex=*/ true);
+                }
+                Some(b'b' | b'B') => {
+                    // Disambiguate from a bare `0` followed by an ident `b…` —
+                    // but per §1.2 binary literals always have ≥1 binary digit
+                    // immediately after `0b`. If what follows is not a 0/1, we
+                    // fall back to decimal.
+                    if matches!(self.peek(2), Some(b'0' | b'1')) {
+                        self.pos += 2;
+                        return self.lex_hex_or_bin_tail(start, /*is_hex=*/ false);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Decimal integer digits with optional `_` separators.
         while let Some(b) = self.peek(0) {
             if b.is_ascii_digit() || b == b'_' {
                 self.pos += 1;
@@ -602,13 +704,281 @@ impl<'src> Lexer<'src> {
                 break;
             }
         }
-        let text = std::str::from_utf8(&self.src[start..self.pos])
-            .expect("integer literal bytes are ASCII; UTF-8 valid by construction")
-            .to_owned();
-        Token {
+
+        // Float dispatch: `<digits>.<digit>…` (digit immediately after the
+        // dot is required per §1.2; this also keeps `1..5` and `tup.0` from
+        // being misread as floats).
+        if self.peek(0) == Some(b'.') && matches!(self.peek(1), Some(b'0'..=b'9')) {
+            self.pos += 1; // the dot
+            while let Some(b) = self.peek(0) {
+                if b.is_ascii_digit() || b == b'_' {
+                    self.pos += 1;
+                } else {
+                    break;
+                }
+            }
+            // Optional exponent: `e` / `E` followed by optional sign, ≥1 digit.
+            if matches!(self.peek(0), Some(b'e' | b'E')) {
+                let exp_start = self.pos;
+                self.pos += 1;
+                if matches!(self.peek(0), Some(b'+' | b'-')) {
+                    self.pos += 1;
+                }
+                let digits_start = self.pos;
+                while let Some(b) = self.peek(0) {
+                    if b.is_ascii_digit() {
+                        self.pos += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if self.pos == digits_start {
+                    return Err(LexError::MalformedNumber {
+                        at: exp_start,
+                        msg: "exponent has no digits",
+                    });
+                }
+            }
+            // Optional float type suffix: f32 / f64.
+            self.consume_float_suffix();
+            let text = self.text(start);
+            return Ok(Token {
+                kind: TokenKind::FloatLiteral(text),
+                span: Span::new(start, self.pos),
+            });
+        }
+
+        // Plain integer; consume optional type suffix.
+        self.consume_int_suffix();
+        let text = self.text(start);
+        Ok(Token {
             kind: TokenKind::IntLiteral(text),
             span: Span::new(start, self.pos),
+        })
+    }
+
+    /// Common tail for hex (`0x…`) and binary (`0b…`) literals. Caller has
+    /// already advanced past the prefix.
+    fn lex_hex_or_bin_tail(&mut self, start: usize, is_hex: bool) -> Result<Token, LexError> {
+        let digits_start = self.pos;
+        while let Some(b) = self.peek(0) {
+            let ok = if is_hex {
+                b.is_ascii_hexdigit() || b == b'_'
+            } else {
+                matches!(b, b'0' | b'1' | b'_')
+            };
+            if ok {
+                self.pos += 1;
+            } else {
+                break;
+            }
         }
+        if self.pos == digits_start {
+            return Err(LexError::MalformedNumber {
+                at: start,
+                msg: if is_hex {
+                    "hex literal has no digits after `0x`"
+                } else {
+                    "binary literal has no digits after `0b`"
+                },
+            });
+        }
+        self.consume_int_suffix();
+        let text = self.text(start);
+        Ok(Token {
+            kind: if is_hex {
+                TokenKind::HexLiteral(text)
+            } else {
+                TokenKind::BinLiteral(text)
+            },
+            span: Span::new(start, self.pos),
+        })
+    }
+
+    /// Consume an optional integer type suffix (`u8`/`u16`/`u32`/`u64`/`usize`/
+    /// `i8`/`i16`/`i32`/`i64`/`isize`) per §1.2 if present. The validity of
+    /// the suffix string is verified at the type checker; the lexer accepts
+    /// anything that looks like an identifier starting with `u` or `i` —
+    /// downstream resolves it.
+    fn consume_int_suffix(&mut self) {
+        if matches!(self.peek(0), Some(b'u' | b'i')) {
+            // Greedily consume identifier-shaped chars.
+            while let Some(b) = self.peek(0) {
+                if b.is_ascii_alphanumeric() || b == b'_' {
+                    self.pos += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Consume an optional float type suffix (`f32` / `f64`) per §1.2.
+    fn consume_float_suffix(&mut self) {
+        if self.peek(0) == Some(b'f') {
+            while let Some(b) = self.peek(0) {
+                if b.is_ascii_alphanumeric() || b == b'_' {
+                    self.pos += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Slice the source between `start` and `self.pos` as an owned String,
+    /// asserting the bytes form valid UTF-8.
+    fn text(&self, start: usize) -> String {
+        std::str::from_utf8(&self.src[start..self.pos])
+            .expect("literal bytes are valid UTF-8 by construction")
+            .to_owned()
+    }
+
+    /// Lex `'X'` char literal. Caller has verified `peek(0) == Some(b'\'')`.
+    fn lex_char_literal(&mut self, start: usize) -> Result<Token, LexError> {
+        self.pos += 1; // opening `'`
+        let ch = match self.peek(0) {
+            None | Some(b'\n') => {
+                return Err(LexError::UnterminatedCharLiteral { kind: "char", at: start });
+            }
+            Some(b'\\') => {
+                self.pos += 1;
+                self.consume_escape_char(start)?
+            }
+            Some(b) => {
+                // Read one Unicode scalar from the source. The byte may be
+                // the lead byte of a multi-byte UTF-8 sequence.
+                let (ch, width) = self.decode_one_utf8_char(self.pos);
+                self.pos += width;
+                let _ = b;
+                ch
+            }
+        };
+        if self.peek(0) != Some(b'\'') {
+            return Err(LexError::InvalidCharLiteral { at: start });
+        }
+        self.pos += 1; // closing `'`
+        Ok(Token {
+            kind: TokenKind::CharLiteral(ch),
+            span: Span::new(start, self.pos),
+        })
+    }
+
+    /// Lex `b'X'` byte literal. Caller has verified `peek(0) == Some(b'b')`
+    /// and `peek(1) == Some(b'\'')`.
+    fn lex_byte_literal(&mut self, start: usize) -> Result<Token, LexError> {
+        self.pos += 2; // `b'`
+        let value: u8 = match self.peek(0) {
+            None | Some(b'\n') => {
+                return Err(LexError::UnterminatedCharLiteral { kind: "byte", at: start });
+            }
+            Some(b'\\') => {
+                self.pos += 1;
+                let ch = self.consume_escape_char(start)?;
+                if !ch.is_ascii() {
+                    return Err(LexError::NonAsciiByteLiteral { at: start });
+                }
+                ch as u8
+            }
+            Some(b) => {
+                if !b.is_ascii() {
+                    return Err(LexError::NonAsciiByteLiteral { at: start });
+                }
+                self.pos += 1;
+                b
+            }
+        };
+        if self.peek(0) != Some(b'\'') {
+            return Err(LexError::InvalidCharLiteral { at: start });
+        }
+        self.pos += 1; // closing `'`
+        Ok(Token {
+            kind: TokenKind::ByteLiteral(value),
+            span: Span::new(start, self.pos),
+        })
+    }
+
+    /// Lex `"…"` string literal. Caller has verified `peek(0) == Some(b'"')`.
+    fn lex_string_literal(&mut self, start: usize) -> Result<Token, LexError> {
+        self.pos += 1; // opening `"`
+        let mut out = String::new();
+        loop {
+            match self.peek(0) {
+                None => {
+                    return Err(LexError::UnterminatedStringLiteral { at: start });
+                }
+                Some(b'"') => {
+                    self.pos += 1;
+                    return Ok(Token {
+                        kind: TokenKind::StringLiteral(out),
+                        span: Span::new(start, self.pos),
+                    });
+                }
+                Some(b'\\') => {
+                    self.pos += 1;
+                    let ch = self.consume_escape_char(start)?;
+                    out.push(ch);
+                }
+                Some(_) => {
+                    let (ch, width) = self.decode_one_utf8_char(self.pos);
+                    self.pos += width;
+                    out.push(ch);
+                }
+            }
+        }
+    }
+
+    /// Decode one UTF-8 character starting at `at`, returning `(char, width)`.
+    /// Source is required to be valid UTF-8 (we receive a `&str` at the
+    /// public boundary, which guarantees this), so this never fails.
+    fn decode_one_utf8_char(&self, at: usize) -> (char, usize) {
+        let s = std::str::from_utf8(&self.src[at..])
+            .expect("source is valid UTF-8 by construction");
+        let ch = s.chars().next().expect("at least one char available");
+        (ch, ch.len_utf8())
+    }
+
+    /// Process an escape sequence starting *after* the leading `\\`.
+    /// Recognises `\n \r \t \\ \' \" \0 \xHH` per §1.2 `escape :=`.
+    fn consume_escape_char(&mut self, lit_start: usize) -> Result<char, LexError> {
+        let (ch, at) = match self.peek(0) {
+            None => {
+                return Err(LexError::UnterminatedCharLiteral {
+                    kind: "char",
+                    at: lit_start,
+                });
+            }
+            Some(b) => (b, self.pos),
+        };
+        self.pos += 1;
+        Ok(match ch {
+            b'n' => '\n',
+            b'r' => '\r',
+            b't' => '\t',
+            b'\\' => '\\',
+            b'\'' => '\'',
+            b'"' => '"',
+            b'0' => '\0',
+            b'x' => {
+                // Two hex digits.
+                let h1 = self.peek(0).ok_or(LexError::InvalidEscape { ch: 'x', at })?;
+                let h2 = self.peek(1).ok_or(LexError::InvalidEscape { ch: 'x', at })?;
+                if !h1.is_ascii_hexdigit() || !h2.is_ascii_hexdigit() {
+                    return Err(LexError::InvalidEscape { ch: 'x', at });
+                }
+                self.pos += 2;
+                let high = ascii_hex_value(h1);
+                let low = ascii_hex_value(h2);
+                let value = (high << 4) | low;
+                value as char
+            }
+            other => {
+                return Err(LexError::InvalidEscape {
+                    ch: other as char,
+                    at,
+                });
+            }
+        })
     }
 
     fn lex_hash_form(&mut self, start: usize) -> Result<Token, LexError> {
@@ -888,6 +1258,20 @@ impl<'src> Lexer<'src> {
             kind,
             span: Span::new(start, self.pos),
         })
+    }
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Convert a single ASCII hex digit byte (0–9, a–f, A–F) to its 0–15 value.
+/// Caller must ensure the byte is a valid hex digit (`is_ascii_hexdigit`).
+#[inline]
+fn ascii_hex_value(b: u8) -> u8 {
+    match b {
+        b'0'..=b'9' => b - b'0',
+        b'a'..=b'f' => b - b'a' + 10,
+        b'A'..=b'F' => b - b'A' + 10,
+        _ => unreachable!("ascii_hex_value called on non-hex byte"),
     }
 }
 
@@ -1367,5 +1751,252 @@ mod tests {
         let a = tokenize(src).unwrap();
         let b = tokenize(src).unwrap();
         assert_eq!(a, b);
+    }
+
+    // ─── Slice 3: literal family ──────────────────────────────────────────
+
+    #[test]
+    fn integer_with_type_suffix() {
+        assert_eq!(
+            kinds("42u32 7i64 100usize"),
+            vec![
+                TokenKind::IntLiteral("42u32".into()),
+                TokenKind::IntLiteral("7i64".into()),
+                TokenKind::IntLiteral("100usize".into()),
+                TokenKind::Eof,
+            ],
+        );
+    }
+
+    #[test]
+    fn hex_literal() {
+        assert_eq!(
+            kinds("0xDEAD_BEEF 0xFFu8 0X1234"),
+            vec![
+                TokenKind::HexLiteral("0xDEAD_BEEF".into()),
+                TokenKind::HexLiteral("0xFFu8".into()),
+                TokenKind::HexLiteral("0X1234".into()),
+                TokenKind::Eof,
+            ],
+        );
+    }
+
+    #[test]
+    fn binary_literal() {
+        assert_eq!(
+            kinds("0b1010_0101 0b11u8"),
+            vec![
+                TokenKind::BinLiteral("0b1010_0101".into()),
+                TokenKind::BinLiteral("0b11u8".into()),
+                TokenKind::Eof,
+            ],
+        );
+    }
+
+    #[test]
+    fn empty_hex_or_binary_errors() {
+        assert!(matches!(
+            tokenize("0x"),
+            Err(LexError::MalformedNumber { .. }),
+        ));
+    }
+
+    #[test]
+    fn binary_prefix_falls_back_when_no_binary_digit() {
+        // `0b3` is NOT a binary literal (3 is not a binary digit). Treat as
+        // decimal `0` followed by ident `b3` so existing programs don't
+        // accidentally lex strangely.
+        assert_eq!(
+            kinds("0b3"),
+            vec![
+                TokenKind::IntLiteral("0".into()),
+                TokenKind::Ident("b3".into()),
+                TokenKind::Eof,
+            ],
+        );
+    }
+
+    #[test]
+    fn float_literal_basic() {
+        assert_eq!(
+            kinds("3.14 0.5 1_000.000_1"),
+            vec![
+                TokenKind::FloatLiteral("3.14".into()),
+                TokenKind::FloatLiteral("0.5".into()),
+                TokenKind::FloatLiteral("1_000.000_1".into()),
+                TokenKind::Eof,
+            ],
+        );
+    }
+
+    #[test]
+    fn float_with_exponent_and_suffix() {
+        assert_eq!(
+            kinds("1.0e5 2.5E-3 3.14f32 1.0e+10f64"),
+            vec![
+                TokenKind::FloatLiteral("1.0e5".into()),
+                TokenKind::FloatLiteral("2.5E-3".into()),
+                TokenKind::FloatLiteral("3.14f32".into()),
+                TokenKind::FloatLiteral("1.0e+10f64".into()),
+                TokenKind::Eof,
+            ],
+        );
+    }
+
+    #[test]
+    fn dot_after_int_does_not_eat_method_call() {
+        // `tup.0` is field-access, NOT a float `tup` followed by `.0`.
+        // And `1..5` is a range, NOT a float `1.` followed by `.5`.
+        assert_eq!(
+            kinds("tup.0 1..5"),
+            vec![
+                TokenKind::Ident("tup".into()),
+                TokenKind::Dot,
+                TokenKind::IntLiteral("0".into()),
+                TokenKind::IntLiteral("1".into()),
+                TokenKind::DotDot,
+                TokenKind::IntLiteral("5".into()),
+                TokenKind::Eof,
+            ],
+        );
+    }
+
+    #[test]
+    fn float_requires_digits_after_dot() {
+        // Per §1.2, `1.` alone is not a float; tokenises as int + dot.
+        assert_eq!(
+            kinds("1."),
+            vec![
+                TokenKind::IntLiteral("1".into()),
+                TokenKind::Dot,
+                TokenKind::Eof,
+            ],
+        );
+    }
+
+    #[test]
+    fn float_exponent_without_digits_errors() {
+        assert!(matches!(
+            tokenize("1.0e"),
+            Err(LexError::MalformedNumber { .. }),
+        ));
+    }
+
+    #[test]
+    fn char_literal_basic_and_escape() {
+        assert_eq!(
+            kinds(r"'a' 'Z' '\n' '\\' '\'' '\0' '\x41'"),
+            vec![
+                TokenKind::CharLiteral('a'),
+                TokenKind::CharLiteral('Z'),
+                TokenKind::CharLiteral('\n'),
+                TokenKind::CharLiteral('\\'),
+                TokenKind::CharLiteral('\''),
+                TokenKind::CharLiteral('\0'),
+                TokenKind::CharLiteral('A'), // 0x41 = 'A'
+                TokenKind::Eof,
+            ],
+        );
+    }
+
+    #[test]
+    fn byte_literal_basic_and_escape() {
+        assert_eq!(
+            kinds(r"b'a' b'\n' b'\x41'"),
+            vec![
+                TokenKind::ByteLiteral(b'a'),
+                TokenKind::ByteLiteral(b'\n'),
+                TokenKind::ByteLiteral(0x41),
+                TokenKind::Eof,
+            ],
+        );
+    }
+
+    #[test]
+    fn byte_literal_rejects_non_ascii() {
+        // Multi-byte UTF-8 (é = 0xC3 0xA9) is not ASCII and is rejected
+        // with E0111.
+        assert!(matches!(
+            tokenize("b'é'"),
+            Err(LexError::NonAsciiByteLiteral { .. }),
+        ));
+    }
+
+    #[test]
+    fn string_literal_basic_and_escape() {
+        assert_eq!(
+            kinds(r#""hello" "with\nnewline" "quoted\"text""#),
+            vec![
+                TokenKind::StringLiteral("hello".into()),
+                TokenKind::StringLiteral("with\nnewline".into()),
+                TokenKind::StringLiteral("quoted\"text".into()),
+                TokenKind::Eof,
+            ],
+        );
+    }
+
+    #[test]
+    fn string_literal_with_hex_escape() {
+        assert_eq!(
+            kinds(r#""\x41\x42""#),
+            vec![TokenKind::StringLiteral("AB".into()), TokenKind::Eof],
+        );
+    }
+
+    #[test]
+    fn unterminated_string_errors() {
+        assert!(matches!(
+            tokenize(r#""never closed"#),
+            Err(LexError::UnterminatedStringLiteral { .. }),
+        ));
+    }
+
+    #[test]
+    fn invalid_escape_errors() {
+        assert!(matches!(
+            tokenize(r"'\q'"),
+            Err(LexError::InvalidEscape { ch: 'q', .. }),
+        ));
+    }
+
+    #[test]
+    fn empty_char_literal_errors() {
+        assert!(matches!(
+            tokenize("''"),
+            Err(LexError::InvalidCharLiteral { .. }),
+        ));
+    }
+
+    #[test]
+    fn ident_starting_with_b_is_not_byte_literal() {
+        // `b` followed by `'` → byte literal. `b` followed by anything
+        // else (including alphanumerics) → identifier.
+        assert_eq!(
+            kinds("b basic blink_count"),
+            vec![
+                TokenKind::Ident("b".into()),
+                TokenKind::Ident("basic".into()),
+                TokenKind::Ident("blink_count".into()),
+                TokenKind::Eof,
+            ],
+        );
+    }
+
+    #[test]
+    fn realistic_decision15_sugar_with_hex() {
+        // `Usart1.CR1 = 0xD;` — the kind of register write Decision #15
+        // sugar enables, with hex literal RHS.
+        assert_eq!(
+            kinds("Usart1.CR1 = 0xD;"),
+            vec![
+                TokenKind::Ident("Usart1".into()),
+                TokenKind::Dot,
+                TokenKind::Ident("CR1".into()),
+                TokenKind::Eq,
+                TokenKind::HexLiteral("0xD".into()),
+                TokenKind::Semi,
+                TokenKind::Eof,
+            ],
+        );
     }
 }
