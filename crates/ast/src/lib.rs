@@ -205,15 +205,135 @@ pub struct Param {
 
 /// An `#automaton Name { … }` declaration.
 ///
-/// First-slice scope: name + span only. `#address` register-block annotation
-/// (Decision #6), `#basis` clause (Decision #4), `#states` list, automaton
-/// fields, named transitions (Refinement #5b) all arrive in subsequent
-/// slices.
+/// Slice-8 scope: full automaton body. Members appear in any order inside
+/// the braces:
+///
+/// - `#address: HEX;` — register-block annotation (Decision #6). When present,
+///   the automaton is a *register block*; every field must carry an
+///   `#offset:` clause and may carry an `#access:` clause. Enforced by
+///   `clifford-check` (§5.5), not by the parser.
+/// - `#basis: name;` — explicit GA basis-vector assignment (Decision #4). When
+///   absent, the GA orthogonality engine (§7) auto-assigns one.
+/// - `#states: [Name1, Name2, …];` — explicit state list (Decision #5).
+///   When absent, the AST records `states = None` (caller treats this as a
+///   monoid automaton with synthetic state `[Ready]` per Decision #5).
+/// - field declarations: `name: TypeExpr (#offset: HEX)? (#access: MODE)?;`
+/// - `#transition name (-> Dest)? { stmts }` named transition blocks
+///   (Refinement #5b). State changes happen *exclusively* inside transitions.
+///
+/// Generic parameters on `#automaton` are deferred to a later slice — none
+/// of the worked examples use them yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutomatonDecl {
     /// The automaton's name.
     pub name: String,
-    /// Source span covering `#automaton Name { }` end-to-end.
+    /// `#address: 0xHEX;` clause if present — marks this as a register block
+    /// per Decision #6.
+    pub address: Option<AddressClause>,
+    /// `#basis: ident;` clause if present per Decision #4. When `None`, the
+    /// GA engine assigns a basis vector at §7 lowering time.
+    pub basis: Option<BasisClause>,
+    /// `#states: [Name1, Name2, …];` clause. `None` means *no `#states`
+    /// clause appeared* — the automaton is a monoid (single synthetic state
+    /// `[Ready]` per Decision #5). An empty `Some(vec![])` is rejected by
+    /// the parser as semantically nonsensical (a multi-state automaton with
+    /// zero states cannot exist).
+    pub states: Option<Vec<StateName>>,
+    /// Field declarations in source order.
+    pub fields: Vec<AutomatonField>,
+    /// Named `#transition` blocks in source order.
+    pub transitions: Vec<TransitionDecl>,
+    /// Source span covering `#automaton Name { … }` end-to-end.
+    pub span: Span,
+}
+
+/// `#address: 0xHEX;` clause on an automaton (Decision #6).
+///
+/// The raw hex-literal text is preserved (`"0x4000_0000"`) so that error
+/// messages can reproduce the source spelling. The numeric value is parsed
+/// at type-check time (§5) where target-pointer-width validation happens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressClause {
+    /// Raw hex-literal text from the lexer, e.g. `"0x4000_0000"`.
+    pub value: String,
+    /// Source span covering `#address: 0xHEX`.
+    pub span: Span,
+}
+
+/// `#basis: name;` clause on an automaton (Decision #4).
+///
+/// The named identifier becomes the GA basis-vector for this automaton in
+/// the orthogonality engine (§7). Absent ⇒ engine auto-assigns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BasisClause {
+    /// The basis-vector identifier the user supplied.
+    pub name: String,
+    /// Source span covering `#basis: name`.
+    pub span: Span,
+}
+
+/// One state name inside `#states: [Name1, Name2, …]`.
+///
+/// Held as a name+span pair so error messages can point back to a specific
+/// entry — the GA orthogonality engine in particular needs precise spans
+/// when reporting state-conflict diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateName {
+    /// The state's identifier.
+    pub name: String,
+    /// Source span covering the identifier.
+    pub span: Span,
+}
+
+/// A single field declaration inside an `#automaton` body.
+///
+/// For ordinary automata: `name: TypeExpr;` — `offset` and `access` are both
+/// `None`. For register-block automata (those with an `#address` clause per
+/// Decision #6): every field requires `#offset: 0xHEX` and may declare an
+/// `#access:` mode. The parser preserves whatever the user wrote;
+/// `clifford-check` (§5.5) enforces "register-block automata require
+/// `#offset` on every field".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutomatonField {
+    /// Field name.
+    pub name: String,
+    /// Field type.
+    pub ty: TypeExpr,
+    /// `#offset: 0xHEX` if present. Raw hex-literal text preserved.
+    pub offset: Option<String>,
+    /// `#access: read|write|read_write` if present.
+    pub access: Option<AccessMode>,
+    /// Source span covering the whole field declaration end-to-end.
+    pub span: Span,
+}
+
+/// Access mode on a register-block field (Decision #6 `#access:` clause).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AccessMode {
+    /// `#access: read` — readable, not writable.
+    Read,
+    /// `#access: write` — writable, not readable (write-only registers).
+    Write,
+    /// `#access: read_write` — both.
+    ReadWrite,
+}
+
+/// A `#transition name (-> Dest)? { stmts }` block (Refinement #5b).
+///
+/// Per Decision #5, state changes happen *exclusively* inside named
+/// transition blocks — no inline state assignments anywhere else.
+/// `destination` is optional because monoid automata (no `#states` clause)
+/// have nowhere to transition *to*; their transitions just mutate fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionDecl {
+    /// The transition's name.
+    pub name: String,
+    /// Optional `-> NextState` target. `None` for monoid-automaton
+    /// transitions and for transitions that stay in the current state.
+    pub destination: Option<String>,
+    /// Transition body — sequence of statements per §2.6.
+    pub body: Block,
+    /// Source span covering `#transition name (-> Dest)? { … }` end-to-end.
     pub span: Span,
 }
 
@@ -1106,6 +1226,11 @@ mod tests {
 
         let a = Item::Automaton(AutomatonDecl {
             name: "Bar".into(),
+            address: None,
+            basis: None,
+            states: None,
+            fields: Vec::new(),
+            transitions: Vec::new(),
             span: Span::new(0, 14),
         });
         assert_eq!(a.layer(), Layer::Imperative);

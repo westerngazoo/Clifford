@@ -55,11 +55,12 @@
 #![warn(missing_docs)]
 
 use clifford_ast::{
-    AccessType, ArraySize, ArrayType, AssignOp, AutomatonDecl, BinaryOp, Block, EffectDecl, Expr,
-    ExprKind, Field, FieldAssign, FnDecl, FnType, GenericParam, ImplDecl, InterfaceDecl,
-    InterfaceMethod, InterruptDecl, Item, Param, PathType, PriorityLevel, PrimitiveType, Program,
-    RefType, SequentialAttr, SliceType, Stmt, StmtKind, TestDecl, TraitDecl, TraitMethod,
-    TraitRef, TupleType, TypeBody, TypeDecl, TypeExpr, TypeKind, UnaryOp, Variant, VariantData,
+    AccessMode, AccessType, AddressClause, ArraySize, ArrayType, AssignOp, AutomatonDecl,
+    AutomatonField, BasisClause, BinaryOp, Block, EffectDecl, Expr, ExprKind, Field, FieldAssign,
+    FnDecl, FnType, GenericParam, ImplDecl, InterfaceDecl, InterfaceMethod, InterruptDecl, Item,
+    Param, PathType, PriorityLevel, PrimitiveType, Program, RefType, SequentialAttr, SliceType,
+    StateName, Stmt, StmtKind, TestDecl, TraitDecl, TraitMethod, TraitRef, TransitionDecl,
+    TupleType, TypeBody, TypeDecl, TypeExpr, TypeKind, UnaryOp, Variant, VariantData,
 };
 use clifford_lexer::{Span, Token, TokenKind};
 use thiserror::Error;
@@ -95,6 +96,25 @@ pub enum ParseError {
     UnexpectedEof {
         /// What was being parsed when EOF arrived.
         context: &'static str,
+    },
+
+    /// A clause that may appear at most once in a declaration appeared twice.
+    /// E.g. two `#address` clauses in the same `#automaton` body.
+    #[error("E0210: duplicate `{clause}` clause at byte {at}")]
+    DuplicateClause {
+        /// The clause that was duplicated, with its leading sigil.
+        clause: &'static str,
+        /// Byte offset where the second occurrence began.
+        at: usize,
+    },
+
+    /// `#states: [];` is semantically nonsensical — a multi-state automaton
+    /// with zero states cannot exist. Use no `#states` clause to mean
+    /// monoid-automaton instead per Decision #5.
+    #[error("E0211: `#states: []` is empty at byte {at}; use no `#states` clause for a monoid (single-state) automaton")]
+    EmptyStatesList {
+        /// Byte offset where the `#states` keyword began.
+        at: usize,
     },
 }
 
@@ -295,19 +315,314 @@ impl<'t> Parser<'t> {
         })
     }
 
-    /// Parse `#automaton Name { }`.
+    /// Parse `#automaton Name { members }`.
     ///
-    /// First-slice form. `#address` register-block annotation, `#basis`
-    /// clause, `#states` list, automaton fields, and named transitions all
-    /// arrive in subsequent slices.
+    /// Slice-8 form: full body parsing. Members appear in any order:
+    /// `#address: HEX;` (Decision #6), `#basis: name;` (Decision #4),
+    /// `#states: [Name1, …];` (Decision #5), field declarations
+    /// (`name: TypeExpr (#offset: HEX)? (#access: MODE)?;`), and named
+    /// `#transition` blocks (Refinement #5b).
+    ///
+    /// The parser does not enforce "register-block automata require `#offset`
+    /// on every field" — that's `clifford-check`'s job (§5.5). Here we just
+    /// preserve what the user wrote and let the later phase reject ill-formed
+    /// register blocks.
+    ///
+    /// Duplicate `#address` / `#basis` / `#states` clauses are rejected at
+    /// parse time (E0210) because they're a clear-cut grammatical mistake;
+    /// reordering them later doesn't change semantics, but writing two of
+    /// the same one is always wrong.
     fn parse_automaton_decl(&mut self, start: usize) -> Result<AutomatonDecl, ParseError> {
         self.advance(); // `#automaton`
         let (name, _) = self.expect_ident("automaton name after `#automaton`")?;
         self.expect(TokenKind::LBrace, "`{` to open automaton body")?;
+
+        let mut address: Option<AddressClause> = None;
+        let mut basis: Option<BasisClause> = None;
+        let mut states: Option<Vec<StateName>> = None;
+        let mut fields: Vec<AutomatonField> = Vec::new();
+        let mut transitions: Vec<TransitionDecl> = Vec::new();
+
+        while !matches!(self.peek().kind, TokenKind::RBrace | TokenKind::Eof) {
+            match self.peek().kind {
+                TokenKind::KwHashAddress => {
+                    if address.is_some() {
+                        return Err(ParseError::DuplicateClause {
+                            clause: "#address",
+                            at: self.peek().span.start,
+                        });
+                    }
+                    address = Some(self.parse_address_clause()?);
+                }
+                TokenKind::KwHashBasis => {
+                    if basis.is_some() {
+                        return Err(ParseError::DuplicateClause {
+                            clause: "#basis",
+                            at: self.peek().span.start,
+                        });
+                    }
+                    basis = Some(self.parse_basis_clause()?);
+                }
+                TokenKind::KwHashStates => {
+                    if states.is_some() {
+                        return Err(ParseError::DuplicateClause {
+                            clause: "#states",
+                            at: self.peek().span.start,
+                        });
+                    }
+                    states = Some(self.parse_states_clause()?);
+                }
+                TokenKind::KwHashTransition => {
+                    transitions.push(self.parse_transition_decl()?);
+                }
+                TokenKind::Ident(_) => {
+                    fields.push(self.parse_automaton_field()?);
+                }
+                TokenKind::Eof => {
+                    return Err(ParseError::UnexpectedEof {
+                        context: "automaton body",
+                    });
+                }
+                _ => {
+                    let t = self.peek().clone();
+                    return Err(ParseError::Expected {
+                        expected:
+                            "`#address`, `#basis`, `#states`, `#transition`, field declaration, \
+                             or `}` in automaton body",
+                        found: t.kind,
+                        at: t.span.start,
+                    });
+                }
+            }
+        }
+
         let close = self.expect(TokenKind::RBrace, "`}` to close automaton body")?;
         Ok(AutomatonDecl {
             name,
+            address,
+            basis,
+            states,
+            fields,
+            transitions,
             span: Span::new(start, close.end),
+        })
+    }
+
+    /// Parse `#address: 0xHEX;`. The hex literal text is preserved verbatim.
+    fn parse_address_clause(&mut self) -> Result<AddressClause, ParseError> {
+        let start = self.peek().span.start;
+        self.advance(); // `#address`
+        self.expect(TokenKind::Colon, "`:` after `#address`")?;
+        let tok = self.peek().clone();
+        let value = match tok.kind {
+            TokenKind::HexLiteral(s) => {
+                self.advance();
+                s
+            }
+            TokenKind::Eof => {
+                return Err(ParseError::UnexpectedEof {
+                    context: "`#address` value (expected hex literal)",
+                });
+            }
+            other => {
+                return Err(ParseError::Expected {
+                    expected: "hex literal (e.g. `0x4000_0000`) as `#address` value",
+                    found: other,
+                    at: tok.span.start,
+                });
+            }
+        };
+        let close = self.expect(TokenKind::Semi, "`;` to terminate `#address` clause")?;
+        Ok(AddressClause {
+            value,
+            span: Span::new(start, close.end),
+        })
+    }
+
+    /// Parse `#basis: name;`.
+    fn parse_basis_clause(&mut self) -> Result<BasisClause, ParseError> {
+        let start = self.peek().span.start;
+        self.advance(); // `#basis`
+        self.expect(TokenKind::Colon, "`:` after `#basis`")?;
+        let (name, _) = self.expect_ident("basis-vector identifier after `#basis:`")?;
+        let close = self.expect(TokenKind::Semi, "`;` to terminate `#basis` clause")?;
+        Ok(BasisClause {
+            name,
+            span: Span::new(start, close.end),
+        })
+    }
+
+    /// Parse `#states: [Name1, Name2, …];`. The list must be non-empty —
+    /// an empty list is semantically nonsensical (a multi-state automaton
+    /// with zero states cannot exist). Use *no* `#states` clause to mean
+    /// "monoid automaton" instead.
+    fn parse_states_clause(&mut self) -> Result<Vec<StateName>, ParseError> {
+        let clause_start = self.peek().span.start;
+        self.advance(); // `#states`
+        self.expect(TokenKind::Colon, "`:` after `#states`")?;
+        self.expect(TokenKind::LBracket, "`[` to open `#states` list")?;
+        let mut names: Vec<StateName> = Vec::new();
+        if matches!(self.peek().kind, TokenKind::RBracket) {
+            return Err(ParseError::EmptyStatesList {
+                at: clause_start,
+            });
+        }
+        loop {
+            let (n, span) = self.expect_ident("state name in `#states` list")?;
+            names.push(StateName { name: n, span });
+            match self.peek().kind {
+                TokenKind::Comma => {
+                    self.advance();
+                    if matches!(self.peek().kind, TokenKind::RBracket) {
+                        break;
+                    }
+                }
+                TokenKind::RBracket => break,
+                TokenKind::Eof => {
+                    return Err(ParseError::UnexpectedEof {
+                        context: "`#states` list",
+                    });
+                }
+                _ => {
+                    let t = self.peek().clone();
+                    return Err(ParseError::Expected {
+                        expected: "`,` or `]` in `#states` list",
+                        found: t.kind,
+                        at: t.span.start,
+                    });
+                }
+            }
+        }
+        self.expect(TokenKind::RBracket, "`]` to close `#states` list")?;
+        self.expect(TokenKind::Semi, "`;` to terminate `#states` clause")?;
+        Ok(names)
+    }
+
+    /// Parse one automaton field:
+    /// `name: TypeExpr (#offset: HEX)? (#access: MODE)?;`.
+    ///
+    /// `#offset` and `#access` may appear in either order; each at most once.
+    fn parse_automaton_field(&mut self) -> Result<AutomatonField, ParseError> {
+        let start = self.peek().span.start;
+        let (name, _) = self.expect_ident("field name in automaton body")?;
+        self.expect(TokenKind::Colon, "`:` between field name and type")?;
+        let ty = self.parse_type()?;
+
+        let mut offset: Option<String> = None;
+        let mut access: Option<AccessMode> = None;
+        loop {
+            match self.peek().kind {
+                TokenKind::KwHashOffset => {
+                    if offset.is_some() {
+                        return Err(ParseError::DuplicateClause {
+                            clause: "#offset",
+                            at: self.peek().span.start,
+                        });
+                    }
+                    self.advance();
+                    self.expect(TokenKind::Colon, "`:` after `#offset`")?;
+                    let tok = self.peek().clone();
+                    match tok.kind {
+                        TokenKind::HexLiteral(s) => {
+                            self.advance();
+                            offset = Some(s);
+                        }
+                        TokenKind::Eof => {
+                            return Err(ParseError::UnexpectedEof {
+                                context: "`#offset` value (expected hex literal)",
+                            });
+                        }
+                        other => {
+                            return Err(ParseError::Expected {
+                                expected: "hex literal (e.g. `0x04`) as `#offset` value",
+                                found: other,
+                                at: tok.span.start,
+                            });
+                        }
+                    }
+                }
+                TokenKind::KwHashAccess => {
+                    if access.is_some() {
+                        return Err(ParseError::DuplicateClause {
+                            clause: "#access",
+                            at: self.peek().span.start,
+                        });
+                    }
+                    self.advance();
+                    self.expect(TokenKind::Colon, "`:` after `#access`")?;
+                    access = Some(self.parse_access_mode()?);
+                }
+                _ => break,
+            }
+        }
+
+        let close = self.expect(TokenKind::Semi, "`;` to terminate field declaration")?;
+        Ok(AutomatonField {
+            name,
+            ty,
+            offset,
+            access,
+            span: Span::new(start, close.end),
+        })
+    }
+
+    /// Parse `read | write | read_write` as an `#access` mode value.
+    /// These are contextual keywords (lexed as `Ident`).
+    fn parse_access_mode(&mut self) -> Result<AccessMode, ParseError> {
+        let tok = self.peek().clone();
+        match tok.kind {
+            TokenKind::Ident(ref name) => {
+                let mode = match name.as_str() {
+                    "read" => AccessMode::Read,
+                    "write" => AccessMode::Write,
+                    "read_write" => AccessMode::ReadWrite,
+                    _ => {
+                        return Err(ParseError::Expected {
+                            expected: "`read`, `write`, or `read_write` as `#access` value",
+                            found: tok.kind,
+                            at: tok.span.start,
+                        });
+                    }
+                };
+                self.advance();
+                Ok(mode)
+            }
+            TokenKind::Eof => Err(ParseError::UnexpectedEof {
+                context: "`#access` value",
+            }),
+            other => Err(ParseError::Expected {
+                expected: "`read`, `write`, or `read_write` as `#access` value",
+                found: other,
+                at: tok.span.start,
+            }),
+        }
+    }
+
+    /// Parse `#transition name (-> Dest)? { stmts }`.
+    ///
+    /// Per Decision #5, named transitions are the only place where state
+    /// changes happen. The destination state is optional: monoid automata
+    /// (no `#states` clause) and same-state transitions both elide it.
+    /// `clifford-check` validates that named destinations exist in the
+    /// enclosing automaton's `#states` list (§5.5).
+    fn parse_transition_decl(&mut self) -> Result<TransitionDecl, ParseError> {
+        let start = self.peek().span.start;
+        self.advance(); // `#transition`
+        let (name, _) = self.expect_ident("transition name after `#transition`")?;
+        let destination = if matches!(self.peek().kind, TokenKind::Arrow) {
+            self.advance();
+            let (dest, _) = self.expect_ident("destination state after `->`")?;
+            Some(dest)
+        } else {
+            None
+        };
+        let body = self.parse_block()?;
+        let end = body.span.end;
+        Ok(TransitionDecl {
+            name,
+            destination,
+            body,
+            span: Span::new(start, end),
         })
     }
 
@@ -4827,6 +5142,449 @@ mod tests {
                 expected: "EOF after expression",
                 ..
             }
+        ));
+    }
+
+    // ─── Slice 8: automaton members (Decisions #4, #5, #6 + Refinement #5b) ─
+
+    use clifford_ast::{
+        AccessMode, AddressClause, AutomatonField, BasisClause, StateName,
+    };
+
+    fn auto(p: &Program, idx: usize) -> &clifford_ast::AutomatonDecl {
+        match &p.items[idx] {
+            Item::Automaton(a) => a,
+            other => panic!("expected Automaton at {idx}, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn empty_automaton_has_no_members() {
+        let p = parse_str("#automaton Counter { }").unwrap();
+        let a = auto(&p, 0);
+        assert_eq!(a.name, "Counter");
+        assert!(a.address.is_none());
+        assert!(a.basis.is_none());
+        assert!(a.states.is_none());
+        assert!(a.fields.is_empty());
+        assert!(a.transitions.is_empty());
+    }
+
+    #[test]
+    fn automaton_with_single_field() {
+        let p = parse_str("#automaton Counter { value: u32; }").unwrap();
+        let a = auto(&p, 0);
+        assert_eq!(a.fields.len(), 1);
+        let AutomatonField { name, ty, offset, access, .. } = &a.fields[0];
+        assert_eq!(name, "value");
+        assert_eq!(ty.kind, TypeKind::Primitive(PrimitiveType::U32));
+        assert!(offset.is_none());
+        assert!(access.is_none());
+    }
+
+    #[test]
+    fn automaton_with_multiple_fields() {
+        let p = parse_str(
+            "#automaton Counter { value: u32; last: u32; flags: u8; }",
+        )
+        .unwrap();
+        let a = auto(&p, 0);
+        let names: Vec<_> = a.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["value", "last", "flags"]);
+    }
+
+    // ── #address (Decision #6) ───────────────────────────────────────────
+
+    #[test]
+    fn automaton_with_address() {
+        let p = parse_str("#automaton Usart1 { #address: 0x4000_0000; }").unwrap();
+        let a = auto(&p, 0);
+        assert!(a.address.is_some());
+        let AddressClause { value, .. } = a.address.as_ref().unwrap();
+        assert_eq!(value, "0x4000_0000");
+    }
+
+    #[test]
+    fn address_requires_hex_literal() {
+        let err = parse_str("#automaton X { #address: 1024; }")
+            .expect_err("decimal literal should fail");
+        assert!(matches!(
+            err,
+            ParseError::Expected {
+                expected: "hex literal (e.g. `0x4000_0000`) as `#address` value",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn duplicate_address_rejected() {
+        let err = parse_str(
+            "#automaton X { #address: 0x4000_0000; #address: 0x5000_0000; }",
+        )
+        .expect_err("duplicate #address");
+        assert!(matches!(
+            err,
+            ParseError::DuplicateClause { clause: "#address", .. }
+        ));
+    }
+
+    // ── #basis (Decision #4) ─────────────────────────────────────────────
+
+    #[test]
+    fn automaton_with_basis() {
+        let p = parse_str("#automaton Counter { #basis: counter_basis; }").unwrap();
+        let a = auto(&p, 0);
+        let BasisClause { name, .. } = a.basis.as_ref().unwrap();
+        assert_eq!(name, "counter_basis");
+    }
+
+    #[test]
+    fn duplicate_basis_rejected() {
+        let err = parse_str("#automaton X { #basis: a; #basis: b; }")
+            .expect_err("duplicate #basis");
+        assert!(matches!(
+            err,
+            ParseError::DuplicateClause { clause: "#basis", .. }
+        ));
+    }
+
+    // ── #states (Decision #5) ────────────────────────────────────────────
+
+    #[test]
+    fn automaton_with_states() {
+        let p = parse_str(
+            "#automaton Counter { #states: [Idle, Counting, Halted]; }",
+        )
+        .unwrap();
+        let a = auto(&p, 0);
+        let states = a.states.as_ref().unwrap();
+        let names: Vec<_> = states.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["Idle", "Counting", "Halted"]);
+    }
+
+    #[test]
+    fn no_states_clause_means_monoid() {
+        let p = parse_str("#automaton Counter { value: u32; }").unwrap();
+        let a = auto(&p, 0);
+        assert!(a.states.is_none(), "no #states clause ⇒ monoid (None)");
+    }
+
+    #[test]
+    fn empty_states_list_rejected() {
+        let err =
+            parse_str("#automaton X { #states: []; }").expect_err("empty #states list");
+        assert!(matches!(err, ParseError::EmptyStatesList { .. }));
+    }
+
+    #[test]
+    fn duplicate_states_rejected() {
+        let err = parse_str(
+            "#automaton X { #states: [A]; #states: [B]; }",
+        )
+        .expect_err("duplicate #states");
+        assert!(matches!(
+            err,
+            ParseError::DuplicateClause { clause: "#states", .. }
+        ));
+    }
+
+    #[test]
+    fn states_preserves_each_span() {
+        let src = "#automaton X { #states: [A, B]; }";
+        let p = parse_str(src).unwrap();
+        let states = auto(&p, 0).states.as_ref().unwrap();
+        let StateName { name: a_name, span: a_span } = &states[0];
+        let StateName { name: b_name, span: b_span } = &states[1];
+        assert_eq!(a_name, "A");
+        assert_eq!(b_name, "B");
+        // Each span must point at distinct, non-overlapping ranges.
+        assert!(a_span.end <= b_span.start);
+        assert_eq!(&src[a_span.start..a_span.end], "A");
+        assert_eq!(&src[b_span.start..b_span.end], "B");
+    }
+
+    // ── Field metadata (Decision #6 register-block fields) ──────────────
+
+    #[test]
+    fn field_with_offset() {
+        let p = parse_str("#automaton X { status: u32 #offset: 0x00; }").unwrap();
+        let a = auto(&p, 0);
+        assert_eq!(a.fields[0].offset.as_deref(), Some("0x00"));
+        assert!(a.fields[0].access.is_none());
+    }
+
+    #[test]
+    fn field_with_offset_and_access_read() {
+        let p = parse_str("#automaton X { status: u32 #offset: 0x04 #access: read; }")
+            .unwrap();
+        let f = &auto(&p, 0).fields[0];
+        assert_eq!(f.offset.as_deref(), Some("0x04"));
+        assert_eq!(f.access, Some(AccessMode::Read));
+    }
+
+    #[test]
+    fn field_access_modes_all_three() {
+        for (src_mode, expected) in [
+            ("read", AccessMode::Read),
+            ("write", AccessMode::Write),
+            ("read_write", AccessMode::ReadWrite),
+        ] {
+            let src = format!(
+                "#automaton X {{ f: u32 #offset: 0x00 #access: {src_mode}; }}"
+            );
+            let p = parse_str(&src).unwrap_or_else(|e| panic!("{src}: {e}"));
+            let f = &auto(&p, 0).fields[0];
+            assert_eq!(f.access, Some(expected), "src: {src}");
+        }
+    }
+
+    #[test]
+    fn field_access_rejects_invalid_mode() {
+        let err = parse_str("#automaton X { f: u32 #offset: 0x00 #access: maybe; }")
+            .expect_err("invalid access mode");
+        assert!(matches!(
+            err,
+            ParseError::Expected {
+                expected: "`read`, `write`, or `read_write` as `#access` value",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn field_offset_requires_hex_literal() {
+        let err = parse_str("#automaton X { f: u32 #offset: 4; }")
+            .expect_err("decimal offset");
+        assert!(matches!(
+            err,
+            ParseError::Expected {
+                expected: "hex literal (e.g. `0x04`) as `#offset` value",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn field_meta_in_either_order() {
+        // `#access` before `#offset` should also work.
+        let p = parse_str(
+            "#automaton X { f: u32 #access: read_write #offset: 0x10; }",
+        )
+        .unwrap();
+        let f = &auto(&p, 0).fields[0];
+        assert_eq!(f.offset.as_deref(), Some("0x10"));
+        assert_eq!(f.access, Some(AccessMode::ReadWrite));
+    }
+
+    #[test]
+    fn duplicate_field_offset_rejected() {
+        let err = parse_str(
+            "#automaton X { f: u32 #offset: 0x00 #offset: 0x04; }",
+        )
+        .expect_err("duplicate #offset");
+        assert!(matches!(
+            err,
+            ParseError::DuplicateClause { clause: "#offset", .. }
+        ));
+    }
+
+    #[test]
+    fn duplicate_field_access_rejected() {
+        let err = parse_str(
+            "#automaton X { f: u32 #access: read #access: write; }",
+        )
+        .expect_err("duplicate #access");
+        assert!(matches!(
+            err,
+            ParseError::DuplicateClause { clause: "#access", .. }
+        ));
+    }
+
+    // ── #transition (Refinement #5b) ─────────────────────────────────────
+
+    #[test]
+    fn transition_with_no_destination() {
+        let p = parse_str(
+            "#automaton Counter { #transition tick { Counter.value += 1; } }",
+        )
+        .unwrap();
+        let t = &auto(&p, 0).transitions[0];
+        assert_eq!(t.name, "tick");
+        assert!(t.destination.is_none());
+        assert_eq!(t.body.stmts.len(), 1);
+    }
+
+    #[test]
+    fn transition_with_destination_state() {
+        let p = parse_str(
+            "#automaton Sm { \
+             #states: [Idle, Running]; \
+             #transition start -> Running { } \
+             }",
+        )
+        .unwrap();
+        let t = &auto(&p, 0).transitions[0];
+        assert_eq!(t.name, "start");
+        assert_eq!(t.destination.as_deref(), Some("Running"));
+    }
+
+    #[test]
+    fn multiple_transitions_in_source_order() {
+        let p = parse_str(
+            "#automaton Sm { \
+             #states: [A, B, C]; \
+             #transition go_b -> B { } \
+             #transition go_c -> C { } \
+             #transition stay { } \
+             }",
+        )
+        .unwrap();
+        let names: Vec<_> = auto(&p, 0)
+            .transitions
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["go_b", "go_c", "stay"]);
+    }
+
+    #[test]
+    fn transition_body_can_have_complex_statements() {
+        let p = parse_str(
+            "#automaton Counter { \
+             #transition advance { \
+               let next: u32 = Counter.value + 1; \
+               Counter.value = next; \
+               #> log(next); \
+             } \
+             }",
+        )
+        .unwrap();
+        let body = &auto(&p, 0).transitions[0].body;
+        assert_eq!(body.stmts.len(), 3);
+        assert!(matches!(body.stmts[0].kind, StmtKind::Let { .. }));
+        assert!(matches!(body.stmts[1].kind, StmtKind::MutateShort { .. }));
+        assert!(matches!(body.stmts[2].kind, StmtKind::ProcCall { .. }));
+    }
+
+    // ── Mixed-member ordering ────────────────────────────────────────────
+
+    #[test]
+    fn members_can_appear_in_any_order() {
+        let p = parse_str(
+            "#automaton Mixed { \
+             value: u32; \
+             #basis: mixed_basis; \
+             #transition tick { } \
+             #states: [A, B]; \
+             flags: u8; \
+             #address: 0x4000_0000; \
+             #transition reset -> A { } \
+             }",
+        )
+        .unwrap();
+        let a = auto(&p, 0);
+        assert!(a.address.is_some());
+        assert!(a.basis.is_some());
+        assert_eq!(a.states.as_ref().unwrap().len(), 2);
+        assert_eq!(a.fields.len(), 2);
+        assert_eq!(a.transitions.len(), 2);
+    }
+
+    #[test]
+    fn unknown_member_is_clear_error() {
+        // `@trait` lexes fine but is not a valid `#automaton` member.
+        let err = parse_str("#automaton X { @trait Foo {} }")
+            .expect_err("invalid member sigil");
+        // The dispatcher's catch-all fires; check we got a useful diagnostic
+        // pointing at the right thing.
+        match err {
+            ParseError::Expected { expected, .. } => {
+                assert!(
+                    expected.contains("#address")
+                        && expected.contains("#transition")
+                        && expected.contains("field declaration"),
+                    "diagnostic should enumerate valid member kinds, got: {expected}"
+                );
+            }
+            other => panic!("expected Expected error, got {:?}", other),
+        }
+    }
+
+    // ── Realistic register-block automaton ───────────────────────────────
+
+    #[test]
+    fn realistic_register_block_automaton() {
+        // The shape of a UART peripheral register block per Decision #6.
+        let src = "\
+            #automaton Usart1 {\n  \
+              #address: 0x4000_0000;\n  \
+              #basis: usart1_basis;\n  \
+              status: u32 #offset: 0x00 #access: read;\n  \
+              data:   u32 #offset: 0x04 #access: read_write;\n  \
+              ctrl:   u32 #offset: 0x08 #access: write;\n\
+            }";
+        let p = parse_str(src).expect("parse register-block automaton");
+        let a = auto(&p, 0);
+        assert_eq!(a.name, "Usart1");
+        assert!(a.address.is_some());
+        assert!(a.basis.is_some());
+        assert!(a.states.is_none(), "register block with no #states is monoid");
+        assert_eq!(a.fields.len(), 3);
+        assert!(a.transitions.is_empty(), "no transitions on a register block");
+
+        let f1 = &a.fields[0];
+        assert_eq!(f1.name, "status");
+        assert_eq!(f1.offset.as_deref(), Some("0x00"));
+        assert_eq!(f1.access, Some(AccessMode::Read));
+
+        let f2 = &a.fields[1];
+        assert_eq!(f2.access, Some(AccessMode::ReadWrite));
+
+        let f3 = &a.fields[2];
+        assert_eq!(f3.access, Some(AccessMode::Write));
+    }
+
+    // ── Realistic multi-state state machine ──────────────────────────────
+
+    #[test]
+    fn realistic_multistate_automaton() {
+        let src = "\
+            #automaton Counter {\n  \
+              #basis: counter_basis;\n  \
+              #states: [Idle, Counting, Halted];\n  \
+              value: u32;\n  \
+              last_irq: u32;\n  \
+              #transition start -> Counting {\n    \
+                Counter.value = 0;\n  \
+              }\n  \
+              #transition tick {\n    \
+                Counter.value += 1;\n  \
+              }\n  \
+              #transition halt -> Halted { }\n\
+            }";
+        let p = parse_str(src).expect("parse multi-state automaton");
+        let a = auto(&p, 0);
+        assert!(a.address.is_none());
+        assert!(a.basis.is_some());
+        let state_names: Vec<_> = a.states.as_ref().unwrap()
+            .iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(state_names, vec!["Idle", "Counting", "Halted"]);
+        assert_eq!(a.fields.len(), 2);
+        assert_eq!(a.transitions.len(), 3);
+
+        let trans_names: Vec<_> =
+            a.transitions.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(trans_names, vec!["start", "tick", "halt"]);
+        assert_eq!(a.transitions[0].destination.as_deref(), Some("Counting"));
+        assert!(a.transitions[1].destination.is_none(), "tick stays in Counting");
+        assert_eq!(a.transitions[2].destination.as_deref(), Some("Halted"));
+
+        // The `start` transition body has one statement: Counter.value = 0;
+        assert_eq!(a.transitions[0].body.stmts.len(), 1);
+        assert!(matches!(
+            a.transitions[0].body.stmts[0].kind,
+            StmtKind::MutateShort { .. }
         ));
     }
 

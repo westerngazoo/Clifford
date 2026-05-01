@@ -7,6 +7,38 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Phase 0 parser slice 8: automaton members (2026-05-01)
+
+- `clifford-ast`: `AutomatonDecl` extended with `address: Option<AddressClause>`
+  (Decision #6 register-block annotation), `basis: Option<BasisClause>`
+  (Decision #4 explicit GA basis assignment), `states: Option<Vec<StateName>>`
+  (Decision #5; `None` = monoid), `fields: Vec<AutomatonField>`,
+  `transitions: Vec<TransitionDecl>`.
+- New AST types: `AddressClause`, `BasisClause`, `StateName` (each with
+  per-element span tracking), `AutomatonField` with optional `#offset` /
+  `#access` field-meta clauses, `AccessMode` (`Read` / `Write` /
+  `ReadWrite`), `TransitionDecl` with optional destination state and a
+  full `Block` body (Refinement #5b).
+- `clifford-parser`: full automaton body parsing — dispatch on the leading
+  token of each member (`#address` / `#basis` / `#states` / `#transition` /
+  identifier-for-field), with members allowed in any order. `#offset`
+  and `#access` field-meta clauses likewise allowed in either order.
+- New parser errors: `E0210 DuplicateClause` (rejects double `#address` /
+  `#basis` / `#states` / `#offset` / `#access`) and `E0211 EmptyStatesList`
+  (rejects `#states: []` since a multi-state automaton with zero states
+  is nonsense; use no `#states` clause for a monoid).
+- `clifford-parser`: 30 new tests covering every member kind, field metadata
+  in both orders, all three access modes, mixed-member ordering, duplicate-
+  clause rejection, hex-literal validation, plus realistic register-block
+  and multi-state state-machine fixtures. All up: **205 parser+AST tests
+  passing**.
+- The realistic test fixture `realistic_register_block_automaton` parses a
+  three-register UART peripheral with `#address`, `#basis`, three fields
+  with full `#offset` + `#access` metadata and three distinct access modes.
+  `realistic_multistate_automaton` parses a Counter with three states and
+  three named transitions exercising both same-state (`#transition tick`)
+  and cross-state (`#transition start -> Counting`) forms.
+
 ### Added — Phase 0 parser slice 7: function/effect/interrupt bodies (2026-05-01)
 
 - `clifford-ast`: full `Expr` / `ExprKind` covering §2.6 — literals (int/hex/bin/
