@@ -157,19 +157,40 @@ impl Item {
     }
 }
 
-/// An `@fn name() -> T { … }` declaration.
+/// An `@fn name(params) -> T $ [TraitList] { … }` declaration.
 ///
-/// Slice-3 scope: name, optional return type, span. Generic parameters,
-/// value parameters, trait list (`$ [TraitList]` — Decision #2),
-/// where-clause, extern modifier, and body all arrive in subsequent slices.
+/// Slice-4 scope: name, value parameters, optional return type, optional
+/// trait list, span. Generic parameters, where-clause, extern modifier,
+/// and body content arrive in subsequent slices.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FnDecl {
     /// The function's name.
     pub name: String,
+    /// Value parameters in source order. Empty for `@fn name() { }`.
+    pub params: Vec<Param>,
     /// Optional return type. `None` means `()` (unit) by spec convention,
     /// preserved as `None` so round-tripping reproduces source exactly.
     pub return_type: Option<TypeExpr>,
-    /// Source span covering `@fn name() -> T { }` end-to-end.
+    /// `$ [Trait, Trait, …]` markers per Decision #2 / §4.5. Empty if no
+    /// `$ [...]` clause appears in source. Per Emergent Rule 2, an empty
+    /// trait list at the AST level is interpreted as `[Pure]` by `clifford-types`.
+    pub trait_list: Vec<TraitRef>,
+    /// Source span covering `@fn name(params) -> T $ [...] { }` end-to-end.
+    pub span: Span,
+}
+
+/// A single function parameter `mut? name: TypeExpr`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Param {
+    /// `true` if the binding is declared `mut name: …`. Per §4.6, a `mut`
+    /// parameter binding is only meaningful inside a mutation context;
+    /// `clifford-check` (§5.4) rejects `mut` parameters in `@fn` bodies.
+    pub mutable: bool,
+    /// Parameter name.
+    pub name: String,
+    /// Parameter type.
+    pub ty: TypeExpr,
+    /// Source span covering `mut? name: type` end-to-end.
     pub span: Span,
 }
 
@@ -187,35 +208,49 @@ pub struct AutomatonDecl {
     pub span: Span,
 }
 
-/// An `#effect name() #mutates: [A, B] { … }` declaration (top-level per
-/// Refinement #5a).
+/// An `#effect name(params) -> T #mutates: [A, B] { … }` declaration
+/// (top-level per Refinement #5a).
 ///
-/// Slice-2 scope: name + `#mutates` automaton list + `#cannot_mutate` (if
-/// present) + span. Empty parameter list, empty body. Parameters, return
-/// type, full effect-meta clauses (`#invariant`, `#atomic`), trait list,
-/// and body content all arrive in subsequent slices.
+/// Slice-4 scope: parameters and optional return type wired in. Body
+/// content (statements) lands in slice 6. The `#mutates` clause is
+/// required (per §2.5 notes for `#effect`); it may be empty (`#mutates: []`)
+/// for pure effects. `#cannot_mutate` is optional. Other effect_meta
+/// clauses (`#invariant`, `#atomic`) arrive in subsequent slices.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectDecl {
     /// The effect's name.
     pub name: String,
+    /// Value parameters in source order. Empty for `#effect tick() …`.
+    pub params: Vec<Param>,
+    /// Optional return type. `None` ⇒ unit.
+    pub return_type: Option<TypeExpr>,
     /// Automaton names listed in `#mutates: [...]`. May be empty for pure
     /// effects (the spec permits an empty list).
     pub mutates: Vec<String>,
     /// Automaton names listed in `#cannot_mutate: [...]`. Optional.
     pub cannot_mutate: Vec<String>,
-    /// Source span covering `#effect name() #mutates: [...] { }` end-to-end.
+    /// Source span covering the full declaration end-to-end.
     pub span: Span,
 }
 
-/// An `#interrupt NAME() #mutates: [A] #priority: HIGH { … }` declaration.
+/// An `#interrupt NAME(params) -> T #mutates: [A] #priority: HIGH { … }` declaration.
 ///
 /// The `name` is the linker symbol per Decision #10 — users write the
 /// target-standard interrupt vector name (e.g., `USART1_IRQHandler`).
-/// `#priority` is required for `#interrupt` (per §2.5 notes).
+/// `#priority` is required for `#interrupt` (per §2.5 notes). Interrupts
+/// rarely take parameters in real firmware (the calling convention is
+/// fixed by the target), but the grammar permits them and `clifford-check`
+/// will validate against the target's interrupt ABI in §8.5 lowering.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterruptDecl {
     /// Interrupt vector name; becomes the linker symbol (Decision #10).
     pub name: String,
+    /// Value parameters in source order. Usually empty for interrupt
+    /// handlers; permitted by grammar.
+    pub params: Vec<Param>,
+    /// Optional return type. Interrupts almost always return unit; the
+    /// grammar permits otherwise but the type checker may reject.
+    pub return_type: Option<TypeExpr>,
     /// Automaton names listed in `#mutates: [...]`.
     pub mutates: Vec<String>,
     /// Required `#priority: …` per §2.5 effect_meta requirements for `#interrupt`.
@@ -498,7 +533,9 @@ mod tests {
     fn item_layer_is_derived_from_variant() {
         let f = Item::Fn(FnDecl {
             name: "foo".into(),
+            params: Vec::new(),
             return_type: None,
+            trait_list: Vec::new(),
             span: Span::new(0, 10),
         });
         assert_eq!(f.layer(), Layer::Functional);

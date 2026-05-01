@@ -56,7 +56,7 @@
 
 use clifford_ast::{
     AccessType, ArraySize, ArrayType, AutomatonDecl, EffectDecl, FnDecl, FnType, ImplDecl,
-    InterfaceDecl, InterruptDecl, Item, PathType, PriorityLevel, PrimitiveType, Program,
+    InterfaceDecl, InterruptDecl, Item, Param, PathType, PriorityLevel, PrimitiveType, Program,
     RefType, SequentialAttr, SliceType, TestDecl, TraitRef, TupleType, TypeExpr, TypeKind,
 };
 use clifford_lexer::{Span, Token, TokenKind};
@@ -233,27 +233,34 @@ impl<'t> Parser<'t> {
         }
     }
 
-    /// Parse `@fn name() -> T { }`.
+    /// Parse `@fn name(params) -> T $ [TraitList] { }`.
     ///
-    /// Slice-3 form: optional return type after `->`. Generic parameters,
-    /// value parameters, trait list, where-clause, extern modifier, and
-    /// body content all arrive in subsequent slices.
+    /// Slice-4 form: value parameters, optional return type, optional
+    /// trait list. Generic parameters, where-clause, extern modifier,
+    /// and body content all arrive in subsequent slices.
     fn parse_fn_decl(&mut self, start: usize) -> Result<FnDecl, ParseError> {
         self.advance(); // `@fn`
         let (name, _) = self.expect_ident("function name after `@fn`")?;
-        self.expect(TokenKind::LParen, "`(` after function name")?;
-        self.expect(TokenKind::RParen, "`)` (empty parameter list in this slice)")?;
+        let params = self.parse_param_list()?;
         let return_type = if matches!(self.peek().kind, TokenKind::Arrow) {
             self.advance(); // `->`
             Some(self.parse_type()?)
         } else {
             None
         };
+        let trait_list = if matches!(self.peek().kind, TokenKind::Dollar) {
+            let (list, _) = self.parse_trait_list()?;
+            list
+        } else {
+            Vec::new()
+        };
         self.expect(TokenKind::LBrace, "`{` to open function body")?;
         let close = self.expect(TokenKind::RBrace, "`}` to close function body")?;
         Ok(FnDecl {
             name,
+            params,
             return_type,
+            trait_list,
             span: Span::new(start, close.end),
         })
     }
@@ -274,19 +281,24 @@ impl<'t> Parser<'t> {
         })
     }
 
-    /// Parse `#effect name() #mutates: [A, B] { }`.
+    /// Parse `#effect name(params) -> T #mutates: [A, B] { }`.
     ///
-    /// Slice-2 form. The empty parameter list `()` is required; parameters
-    /// land in slice 3. Body content (statements) lands in slice 4. The
-    /// `#mutates` clause is required (per §2.5 notes for `#effect`); it may
-    /// be empty (`#mutates: []`) for pure effects. `#cannot_mutate` is
-    /// optional. Other effect_meta clauses (`#invariant`, `#atomic`) land
-    /// in subsequent slices.
+    /// Slice-4 form: parameters and optional return type wired in. Body
+    /// content (statements) lands in slice 6. The `#mutates` clause is
+    /// required (per §2.5 notes for `#effect`); it may be empty
+    /// (`#mutates: []`) for pure effects. `#cannot_mutate` is optional.
+    /// Other effect_meta clauses (`#invariant`, `#atomic`) arrive in
+    /// subsequent slices.
     fn parse_effect_decl(&mut self, start: usize) -> Result<EffectDecl, ParseError> {
         self.advance(); // `#effect`
         let (name, _) = self.expect_ident("effect name after `#effect`")?;
-        self.expect(TokenKind::LParen, "`(` after effect name")?;
-        self.expect(TokenKind::RParen, "`)` (empty parameter list in this slice)")?;
+        let params = self.parse_param_list()?;
+        let return_type = if matches!(self.peek().kind, TokenKind::Arrow) {
+            self.advance();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
 
         let (mutates, cannot_mutate) = self.parse_effect_meta_for_effect()?;
 
@@ -294,21 +306,28 @@ impl<'t> Parser<'t> {
         let close = self.expect(TokenKind::RBrace, "`}` to close effect body")?;
         Ok(EffectDecl {
             name,
+            params,
+            return_type,
             mutates,
             cannot_mutate,
             span: Span::new(start, close.end),
         })
     }
 
-    /// Parse `#interrupt NAME() #mutates: [A] #priority: HIGH { }`.
+    /// Parse `#interrupt NAME(params) -> T #mutates: [A] #priority: HIGH { }`.
     ///
     /// Per §2.5 notes, `#interrupt` requires both `#mutates` and `#priority`.
     /// The name becomes the linker symbol per Decision #10.
     fn parse_interrupt_decl(&mut self, start: usize) -> Result<InterruptDecl, ParseError> {
         self.advance(); // `#interrupt`
         let (name, _) = self.expect_ident("interrupt vector name after `#interrupt`")?;
-        self.expect(TokenKind::LParen, "`(` after interrupt name")?;
-        self.expect(TokenKind::RParen, "`)` (empty parameter list in this slice)")?;
+        let params = self.parse_param_list()?;
+        let return_type = if matches!(self.peek().kind, TokenKind::Arrow) {
+            self.advance();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
 
         let (mutates, priority) = self.parse_effect_meta_for_interrupt(start)?;
 
@@ -316,9 +335,74 @@ impl<'t> Parser<'t> {
         let close = self.expect(TokenKind::RBrace, "`}` to close interrupt body")?;
         Ok(InterruptDecl {
             name,
+            params,
+            return_type,
             mutates,
             priority,
             span: Span::new(start, close.end),
+        })
+    }
+
+    // ─── Parameter list parsing ───────────────────────────────────────────
+
+    /// Parse `( param (, param)* )` or `()`. Each `param` is `mut? ident : type`.
+    fn parse_param_list(&mut self) -> Result<Vec<Param>, ParseError> {
+        self.expect(TokenKind::LParen, "`(` to open parameter list")?;
+        let mut params = Vec::new();
+        if matches!(self.peek().kind, TokenKind::RParen) {
+            self.advance(); // empty `()`
+            return Ok(params);
+        }
+        loop {
+            params.push(self.parse_param()?);
+            match self.peek().kind {
+                TokenKind::Comma => {
+                    self.advance();
+                    // Trailing comma allowed: `(a: T,)`.
+                    if matches!(self.peek().kind, TokenKind::RParen) {
+                        self.advance();
+                        return Ok(params);
+                    }
+                }
+                TokenKind::RParen => {
+                    self.advance();
+                    return Ok(params);
+                }
+                TokenKind::Eof => {
+                    return Err(ParseError::UnexpectedEof {
+                        context: "parameter list",
+                    });
+                }
+                _ => {
+                    let t = self.peek().clone();
+                    return Err(ParseError::Expected {
+                        expected: "`,` or `)` in parameter list",
+                        found: t.kind,
+                        at: t.span.start,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Parse a single `mut? name : TypeExpr` parameter.
+    fn parse_param(&mut self) -> Result<Param, ParseError> {
+        let start = self.peek().span.start;
+        let mutable = if matches!(self.peek().kind, TokenKind::KwMut) {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        let (name, _) = self.expect_ident("parameter name")?;
+        self.expect(TokenKind::Colon, "`:` between parameter name and type")?;
+        let ty = self.parse_type()?;
+        let end = ty.span.end;
+        Ok(Param {
+            mutable,
+            name,
+            ty,
+            span: Span::new(start, end),
         })
     }
 
@@ -1088,10 +1172,11 @@ mod tests {
     #[test]
     fn fn_must_have_parens() {
         let err = parse_str("@fn main { }").expect_err("missing parens");
+        // Now goes through `parse_param_list` which expects `(`.
         assert!(matches!(
             err,
             ParseError::Expected {
-                expected: "`(` after function name",
+                expected: "`(` to open parameter list",
                 ..
             }
         ));
@@ -1822,6 +1907,287 @@ mod tests {
                 }
             }
             other => panic!("expected Fn, got {:?}", other),
+        }
+    }
+
+    // ─── Slice 4: parameters + trait list on @fn ─────────────────────────
+
+    use clifford_ast::Param;
+
+    #[test]
+    fn fn_with_one_param() {
+        let p = parse_str("@fn double(x: u32) -> u32 { }").expect("parse @fn one param");
+        match &p.items[0] {
+            Item::Fn(FnDecl { params, .. }) => {
+                assert_eq!(params.len(), 1);
+                let Param {
+                    mutable, name, ty, ..
+                } = &params[0];
+                assert!(!mutable);
+                assert_eq!(name, "x");
+                assert_eq!(ty.kind, TypeKind::Primitive(PrimitiveType::U32));
+            }
+            other => panic!("expected Fn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fn_with_multiple_params() {
+        let p = parse_str("@fn add(a: u32, b: u32) -> u32 { }").expect("parse @fn add");
+        match &p.items[0] {
+            Item::Fn(FnDecl { params, .. }) => {
+                assert_eq!(params.len(), 2);
+                assert_eq!(params[0].name, "a");
+                assert_eq!(params[1].name, "b");
+            }
+            other => panic!("expected Fn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fn_with_mut_param() {
+        // `mut buf: &mut [u8; 12]` — common out-parameter shape.
+        let p =
+            parse_str("@fn fill(mut buf: &mut [u8; 12]) { }").expect("parse @fn with mut param");
+        match &p.items[0] {
+            Item::Fn(FnDecl { params, .. }) => {
+                assert_eq!(params.len(), 1);
+                assert!(params[0].mutable);
+                assert_eq!(params[0].name, "buf");
+                assert!(matches!(params[0].ty.kind, TypeKind::Ref(_)));
+            }
+            other => panic!("expected Fn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fn_with_complex_param_types() {
+        // `(snap: &SchedulerSnapshot, deadline: u64)` — the kernel
+        // scheduler signature shape from the worked example.
+        let p = parse_str(
+            "@fn pick_next(snap: &SchedulerSnapshot, deadline: u64) -> Decision { }",
+        )
+        .expect("parse scheduler-shape signature");
+        match &p.items[0] {
+            Item::Fn(FnDecl {
+                params,
+                return_type,
+                ..
+            }) => {
+                assert_eq!(params.len(), 2);
+                assert_eq!(params[0].name, "snap");
+                assert!(matches!(params[0].ty.kind, TypeKind::Ref(_)));
+                assert_eq!(params[1].name, "deadline");
+                assert_eq!(params[1].ty.kind, TypeKind::Primitive(PrimitiveType::U64));
+                let rt = return_type.as_ref().expect("return type");
+                match &rt.kind {
+                    TypeKind::Path(PathType { segments, .. }) => {
+                        assert_eq!(segments, &vec!["Decision".to_string()]);
+                    }
+                    other => panic!("expected Path, got {:?}", other),
+                }
+            }
+            other => panic!("expected Fn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fn_with_trailing_comma_in_params() {
+        let p = parse_str("@fn f(a: u32, b: u32,) { }").expect("trailing comma is allowed");
+        match &p.items[0] {
+            Item::Fn(FnDecl { params, .. }) => assert_eq!(params.len(), 2),
+            other => panic!("expected Fn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fn_with_trait_list() {
+        let p = parse_str("@fn pure_helper(x: u32) -> u32 $ [Pure] { }")
+            .expect("parse @fn $ [Pure]");
+        match &p.items[0] {
+            Item::Fn(FnDecl { trait_list, .. }) => {
+                assert_eq!(trait_list.len(), 1);
+                assert_eq!(trait_list[0].name, "Pure");
+            }
+            other => panic!("expected Fn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fn_with_multi_trait_list() {
+        let p = parse_str("@fn read_state(s: &Foo) -> u32 $ [Readable, Observable] { }")
+            .expect("parse multi-trait list");
+        match &p.items[0] {
+            Item::Fn(FnDecl { trait_list, .. }) => {
+                let names: Vec<_> = trait_list.iter().map(|t| t.name.as_str()).collect();
+                assert_eq!(names, vec!["Readable", "Observable"]);
+            }
+            other => panic!("expected Fn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fn_with_generic_trait_in_list() {
+        let p = parse_str("@fn iter() -> u32 $ [PointerAuditor<Sanitizer>] { }")
+            .expect("parse generic trait in list");
+        match &p.items[0] {
+            Item::Fn(FnDecl { trait_list, .. }) => {
+                assert_eq!(trait_list.len(), 1);
+                assert_eq!(trait_list[0].name, "PointerAuditor");
+                assert_eq!(trait_list[0].generic_args.len(), 1);
+            }
+            other => panic!("expected Fn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fn_no_trait_list_keeps_empty() {
+        let p = parse_str("@fn anon() { }").expect("no $ clause");
+        match &p.items[0] {
+            Item::Fn(FnDecl { trait_list, .. }) => assert!(trait_list.is_empty()),
+            other => panic!("expected Fn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fn_full_signature() {
+        // Everything together: params, return type, trait list.
+        let src =
+            "@fn cmd_is_help(buf: &[u8], min_len: usize) -> bool $ [Pure] { }";
+        let p = parse_str(src).expect("parse full @fn signature");
+        match &p.items[0] {
+            Item::Fn(FnDecl {
+                params,
+                return_type,
+                trait_list,
+                ..
+            }) => {
+                assert_eq!(params.len(), 2);
+                assert!(return_type.is_some());
+                assert_eq!(trait_list.len(), 1);
+                assert_eq!(trait_list[0].name, "Pure");
+            }
+            other => panic!("expected Fn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn param_requires_colon_and_type() {
+        let err = parse_str("@fn f(x) { }").expect_err("missing `: type`");
+        assert!(matches!(
+            err,
+            ParseError::Expected {
+                expected: "`:` between parameter name and type",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn param_requires_name() {
+        let err = parse_str("@fn f(: u32) { }").expect_err("missing param name");
+        assert!(matches!(
+            err,
+            ParseError::Expected {
+                expected: "parameter name",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn effect_with_params() {
+        let p = parse_str("#effect log(b: u8) #mutates: [Logger] { }")
+            .expect("parse #effect with params");
+        match &p.items[0] {
+            Item::Effect(EffectDecl {
+                params,
+                return_type,
+                ..
+            }) => {
+                assert_eq!(params.len(), 1);
+                assert_eq!(params[0].name, "b");
+                assert!(return_type.is_none());
+            }
+            other => panic!("expected Effect, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn effect_with_params_and_return() {
+        let p = parse_str(
+            "#effect read_byte() -> u8 #mutates: [Usart1] { }",
+        )
+        .expect("parse #effect -> u8");
+        match &p.items[0] {
+            Item::Effect(EffectDecl {
+                params,
+                return_type,
+                ..
+            }) => {
+                assert!(params.is_empty());
+                assert_eq!(
+                    return_type.as_ref().unwrap().kind,
+                    TypeKind::Primitive(PrimitiveType::U8)
+                );
+            }
+            other => panic!("expected Effect, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn interrupt_with_params_and_return() {
+        let p = parse_str(
+            "#interrupt CustomISR(arg: u32) -> u32 #mutates: [Sched] #priority: HIGH { }",
+        )
+        .expect("parse #interrupt with params + return");
+        match &p.items[0] {
+            Item::Interrupt(InterruptDecl {
+                params,
+                return_type,
+                ..
+            }) => {
+                assert_eq!(params.len(), 1);
+                assert!(return_type.is_some());
+            }
+            other => panic!("expected Interrupt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parser_slice_4_blinky_skeleton_with_typed_signatures() {
+        // Updated blinky skeleton with realistic typed signatures.
+        let src = "\
+            #automaton Counter { }\n\
+            #effect tick(b: u8) #mutates: [Counter] { }\n\
+            #interrupt USART1_IRQHandler() #mutates: [Counter] #priority: HIGH { }\n\
+            @fn cmd_is_help(buf: &[u8]) -> bool $ [Pure] { }\n\
+            @fn main() { }\n\
+        ";
+        let p = parse_str(src).expect("parse typed-signature blinky skeleton");
+        assert_eq!(p.items.len(), 5);
+
+        // Spot-check: the @fn cmd_is_help has 1 param, return type, and trait list.
+        match &p.items[3] {
+            Item::Fn(FnDecl {
+                name,
+                params,
+                return_type,
+                trait_list,
+                ..
+            }) => {
+                assert_eq!(name, "cmd_is_help");
+                assert_eq!(params.len(), 1);
+                assert_eq!(params[0].name, "buf");
+                assert!(matches!(params[0].ty.kind, TypeKind::Ref(_)));
+                assert_eq!(
+                    return_type.as_ref().unwrap().kind,
+                    TypeKind::Primitive(PrimitiveType::Bool)
+                );
+                assert_eq!(trait_list.len(), 1);
+                assert_eq!(trait_list[0].name, "Pure");
+            }
+            other => panic!("expected cmd_is_help, got {:?}", other),
         }
     }
 }
