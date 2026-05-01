@@ -7,6 +7,45 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Phase 1 resolver slice 3: transitions, Self, ProcCall, field validation (2026-05-01)
+
+- `clifford-resolve`: walks `#automaton.transitions[].body` with the
+  enclosing automaton in context. `Self` resolves to a new
+  `BindingRef::SelfRef { automaton }` variant; `Self.field` validates
+  against the automaton's declared fields and records a
+  `BindingRef::AutomatonField { automaton, field_name }` binding.
+- `Auto.field` field-access in expression position validates the field
+  against the automaton's declared fields when the receiver resolves to
+  an `#automaton` symbol. Same `BindingRef::AutomatonField` shape.
+- `#mutate Auto { field = … }` and `Auto.field <op>= …` mutation sugar
+  validate the field name against the automaton's fields. Field-validation
+  is suppressed when the automaton itself is undefined (avoids redundant
+  `E0405 + E0403` noise).
+- `#> proc(args)` callee resolution with `CallContext` tagging per
+  Refinement #5b: `Identity` (callee is a top-level `#effect`) /
+  `Transition` (callee is a `#transition` of an automaton in `#mutates`
+  scope, or a sibling transition of the enclosing transition's automaton).
+  Records a `BindingRef::Proc { name, target_span, ctx }`.
+- New errors: `E0404 UnknownProc` (proc name not an effect or transition
+  in scope), `E0405 UnknownField` (field name not on the named automaton).
+- `Symbol` gains `name: String` so consumers holding a `Symbol` (e.g. inside
+  `BindingRef::SelfRef` or `BindingRef::AutomatonField`) can recover the
+  original identifier without reverse-iterating the symbol table.
+- `BindingRef` is now `#[non_exhaustive]` (forward-compat for
+  Generic-context proc calls / impl method bodies / module paths).
+- 22 new tests covering: Self in transitions, Self outside transitions,
+  Self.field validation (positive and unknown-field), Auto.field reads
+  (positive and unknown-field), field-access on non-automatons silently
+  no-ops, `#mutate` / `MutateShort` field-name validation,
+  field-check suppression on undefined automatons, all four ProcCall
+  shapes (top-level effect → Identity, transition in mutates scope →
+  Transition, sibling transition inside a transition body → Transition,
+  unknown proc → E0404, function-as-proc → E0404, transition outside
+  mutates scope → E0404), Proc target_span correctness, transition body
+  let-bindings, AutomatonField cross-automaton correctness, and a
+  realistic 3-item program exercising every slice-3 feature together.
+  Total resolver test count: **68 unit + 2 doctests**.
+
 ### Added — Phase 1 resolver slice 2: body name resolution (2026-05-01)
 
 - `clifford-resolve`: public entry point `resolve(&Program) -> Result<Resolution, Vec<ResolveError>>`.

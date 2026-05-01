@@ -28,23 +28,31 @@
 //! **Slice 1:** top-level [`SymbolTable`] — global namespace name → declaring
 //! item; duplicate detection (E0401).
 //!
-//! **Slice 2 (this PR):** body name resolution. Public entry point
-//! [`resolve`] walks every `@fn` / `#effect` / `#interrupt` body, building a
-//! scope chain (parameters at the bottom; `let` and `let :=` bindings stacked
-//! above), and resolves every single-segment `Path([X])` expression to a
-//! [`BindingRef`] — either a top-level [`Symbol`] or a [`LocalBinding`].
-//! `Auto@state` reads, `#mutate`, and `Auto.field <op>= …` mutation-sugar
-//! statements verify their automaton-name component resolves to an
-//! `#automaton` symbol (E0403). `#> proc(args)`, `#impl` method bodies,
-//! `#transition` body walking with `Self` field-access, multi-segment path
-//! semantics, and CallContext tagging per Refinement #5b are slice 3.
+//! **Slice 2:** body name resolution. Public entry point [`resolve`] walks
+//! every `@fn` / `#effect` / `#interrupt` body, building a scope chain
+//! (parameters + `let` / `let :=` bindings), and resolves every
+//! single-segment `Path([X])` expression to a [`BindingRef`]. Mutation-sugar
+//! and `#mutate` automaton names resolve to `#automaton` symbols (E0403).
+//!
+//! **Slice 3 (this PR):** `#transition` body walking with implicit `Self`
+//! binding, `Self.field` / `Auto.field` field-access validation against the
+//! enclosing or named automaton's field set (E0405), `#mutate` / mutation-
+//! sugar field-name validation, and `#> proc(args)` callee resolution with
+//! [`CallContext`] tagging per Refinement #5b — Identity (top-level
+//! `#effect`), Transition (named transition of an automaton in `#mutates`
+//! scope), or unknown (E0404). Generic-context (interface-method) calls and
+//! `#impl` method bodies remain deferred until parser slice 9+ produces the
+//! AST for them.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use clifford_ast::{Block, EffectDecl, Expr, ExprKind, FnDecl, InterruptDecl, Item, Layer, Param, Program, Stmt, StmtKind};
+use clifford_ast::{
+    AutomatonDecl, Block, EffectDecl, Expr, ExprKind, FnDecl, InterruptDecl, Item, Layer, Param,
+    Program, Stmt, StmtKind, TransitionDecl,
+};
 use clifford_lexer::Span;
 use thiserror::Error;
 
@@ -104,6 +112,38 @@ pub enum ResolveError {
         /// it doesn't resolve at all).
         found: &'static str,
     },
+
+    /// A `#> name(args)` procedure call references a name that doesn't
+    /// resolve to either a top-level `#effect` or a `#transition` of an
+    /// automaton in the enclosing `#mutates` scope.
+    ///
+    /// The diagnostic intentionally lists both options the user has, since
+    /// the most common cause is a typo in either an effect name or a
+    /// transition name.
+    #[error("E0404: unknown procedure `{name}` at byte {at} (must be a top-level `#effect` or a `#transition` of an automaton in `#mutates` scope)")]
+    UnknownProc {
+        /// The unresolved procedure name.
+        name: String,
+        /// Byte offset of the reference.
+        at: usize,
+    },
+
+    /// A `Self.field` / `Auto.field` reference, or a `#mutate` field-assign,
+    /// names a field that doesn't exist on the target automaton.
+    ///
+    /// `automaton` is the automaton's name; `field` is the bad field name;
+    /// `at` is the byte offset of the reference. Diagnostics that want the
+    /// list of valid fields fetch them from the AST via the automaton's
+    /// item index.
+    #[error("E0405: `{automaton}` has no field `{field}` (referenced at byte {at})")]
+    UnknownField {
+        /// Name of the automaton being indexed into.
+        automaton: String,
+        /// The bad field name.
+        field: String,
+        /// Byte offset of the reference.
+        at: usize,
+    },
 }
 
 /// Which kind of top-level item a [`Symbol`] refers to.
@@ -139,10 +179,17 @@ pub enum SymbolKind {
 /// A resolved top-level symbol.
 ///
 /// Holds enough information for downstream phases to (a) classify the symbol
-/// by kind, (b) navigate back to the declaring AST node via `item_index`,
-/// and (c) point users at the original declaration in diagnostics via `span`.
+/// by kind, (b) recover the original identifier without consulting the
+/// [`SymbolTable`] index, (c) navigate back to the declaring AST node via
+/// `item_index`, and (d) point users at the original declaration in
+/// diagnostics via `span`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Symbol {
+    /// The declaring item's identifier — same as the [`SymbolTable`] key.
+    /// Carried on the symbol so downstream consumers that hold a `Symbol`
+    /// (e.g. inside a [`BindingRef`]) can produce diagnostics or look up
+    /// side tables without reverse-iterating the [`SymbolTable`].
+    pub name: String,
     /// What kind of item this symbol refers to.
     pub kind: SymbolKind,
     /// Index into [`Program::items`] for the declaring item.
@@ -253,6 +300,7 @@ impl SymbolTable {
                     items.insert(
                         name.to_owned(),
                         Symbol {
+                            name: name.to_owned(),
                             kind,
                             item_index: index,
                             layer: item.layer(),
@@ -294,18 +342,65 @@ impl SymbolTable {
 
 // ─── Slice 2: body name resolution ──────────────────────────────────────────
 
-/// What a name reference in expression position resolves to.
+/// What a name reference (or compound reference) in expression / statement
+/// position resolves to.
 ///
-/// Produced by [`resolve`] for every single-segment `Path([X])` expression
-/// found while walking `@fn` / `#effect` / `#interrupt` bodies. Multi-segment
-/// paths receive a `BindingRef` for their first segment only in this slice;
-/// full multi-segment semantics are slice 3 work.
+/// Produced by [`resolve`] for every resolvable AST node — `Path([X])`,
+/// `Self`, `obj.field`, `Auto@state`, `#mutate Auto { … }`,
+/// `Auto.field <op>= …`, `#> proc(args)`. The variant tells downstream
+/// phases what *kind* of binding the reference resolves to without
+/// requiring them to re-walk the AST.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BindingRef {
     /// Resolved to a top-level item via the [`SymbolTable`].
     TopLevel(Symbol),
     /// Resolved to a parameter or `let` binding in the enclosing block-scope chain.
     Local(LocalBinding),
+    /// A bare `Self` reference resolved to the enclosing `#automaton` (only
+    /// inside `#transition` bodies). Carries the automaton's [`Symbol`] for
+    /// downstream consumers.
+    SelfRef {
+        /// The enclosing automaton.
+        automaton: Symbol,
+    },
+    /// An `Auto.field` or `Self.field` field-access whose `field` was
+    /// validated against the automaton's declared field set. Recorded under
+    /// the *outer* expression's span (the `FieldAccess` expression), or
+    /// under the field-assign's span for `#mutate { field = … }` /
+    /// mutation-sugar uses.
+    AutomatonField {
+        /// The automaton being indexed into.
+        automaton: Symbol,
+        /// The validated field name.
+        field_name: String,
+    },
+    /// A `#> proc(args)` procedure call resolved to a target with a known
+    /// [`CallContext`].
+    Proc {
+        /// The procedure name.
+        name: String,
+        /// Source span of the target declaration (effect or transition).
+        target_span: Span,
+        /// Which context this call falls into per Refinement #5b.
+        ctx: CallContext,
+    },
+}
+
+/// Per Refinement #5b, every `#> name(args)` call site is tagged with the
+/// kind of callee it resolves to. Determined at resolution time from the
+/// callee's declaration kind plus the enclosing `#mutates` / `#transition`
+/// context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CallContext {
+    /// Caller invokes a top-level `#effect`. The call is *identity* in the
+    /// transition sense — no state-tag change happens at the call site.
+    Identity,
+    /// Caller invokes a `#transition` of an automaton in `#mutates` scope.
+    /// The state-tag of the named automaton may change as a result.
+    Transition,
+    // Generic (interface dispatch via `Iface::method`) is reserved for the
+    // future slice that resolves Decision #16's plugin-mutator surface.
 }
 
 /// A local binding produced by a parameter or `let` statement.
@@ -411,11 +506,19 @@ impl Resolution {
 pub fn resolve(program: &Program) -> Result<Resolution, Vec<ResolveError>> {
     let (symbols, mut errors) = SymbolTable::build_partial(program);
 
+    // Build side tables once: each automaton's field-name set and
+    // transition-name set. Used during walking for `Auto.field` validation,
+    // `Self.field` validation, and `#> proc(args)` Transition-context
+    // resolution.
+    let automaton_meta = build_automaton_meta(program);
+
     let mut walker = Walker {
         symbols: &symbols,
+        automaton_meta: &automaton_meta,
         bindings: HashMap::new(),
         errors: Vec::new(),
         scopes: Vec::new(),
+        enclosing: None,
     };
 
     for item in &program.items {
@@ -423,9 +526,10 @@ pub fn resolve(program: &Program) -> Result<Resolution, Vec<ResolveError>> {
             Item::Fn(decl) => walker.walk_fn_decl(decl),
             Item::Effect(decl) => walker.walk_effect_decl(decl),
             Item::Interrupt(decl) => walker.walk_interrupt_decl(decl),
-            // Other items have no bodies that this slice walks. `#automaton`
-            // fields and `#transition` bodies arrive in slice 3 alongside
-            // `Self` and `Auto.field` resolution.
+            Item::Automaton(decl) => walker.walk_automaton_decl(decl),
+            // `@type`, `@trait`, `#interface`, `#impl`, `#test`, `@sequential`
+            // have no executable bodies that this resolver walks. Impl method
+            // bodies arrive when parser slice 9+ produces them.
             _ => {}
         }
     }
@@ -445,14 +549,85 @@ pub fn resolve(program: &Program) -> Result<Resolution, Vec<ResolveError>> {
     }
 }
 
+/// Side tables for each `#automaton` declaration: the set of declared field
+/// names and the set of declared transition names. Lookups are O(1).
+struct AutomatonMeta {
+    /// Map: automaton name → set of field names.
+    fields: HashMap<String, HashSet<String>>,
+    /// Map: automaton name → map of transition name → transition source span.
+    /// The span lets `BindingRef::Proc` point back at the transition's
+    /// declaration site.
+    transitions: HashMap<String, HashMap<String, Span>>,
+}
+
+fn build_automaton_meta(program: &Program) -> AutomatonMeta {
+    let mut fields: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut transitions: HashMap<String, HashMap<String, Span>> = HashMap::new();
+    for item in &program.items {
+        if let Item::Automaton(decl) = item {
+            let f: HashSet<String> = decl.fields.iter().map(|f| f.name.clone()).collect();
+            let t: HashMap<String, Span> = decl
+                .transitions
+                .iter()
+                .map(|t| (t.name.clone(), t.span))
+                .collect();
+            fields.insert(decl.name.clone(), f);
+            transitions.insert(decl.name.clone(), t);
+        }
+    }
+    AutomatonMeta { fields, transitions }
+}
+
 /// Internal walker state carried through one resolution pass.
 struct Walker<'a> {
     symbols: &'a SymbolTable,
+    automaton_meta: &'a AutomatonMeta,
     bindings: HashMap<Span, BindingRef>,
     errors: Vec<ResolveError>,
     /// Stack of nested scopes. Innermost is `last()`. Lookup walks
     /// outward from `last()` to `first()`.
     scopes: Vec<Scope>,
+    /// The body-context the walker is currently inside, if any. Used for
+    /// `Self` resolution (transition bodies) and `#> proc` Transition-context
+    /// lookup (effects/interrupts via `#mutates`).
+    enclosing: Option<EnclosingContext>,
+}
+
+/// Body-context information needed by `#> proc` resolution and by `Self`
+/// binding inside `#transition` bodies.
+#[derive(Debug, Clone)]
+struct EnclosingContext {
+    /// When walking a `#transition` body, the enclosing automaton's name.
+    /// `None` for `@fn` / `#effect` / `#interrupt` bodies.
+    transition_of: Option<String>,
+    /// The set of automaton names available for Transition-context proc
+    /// lookups. For `#effect` / `#interrupt` bodies this is the `#mutates`
+    /// list. For `#transition` bodies this is `[transition_of]`. For `@fn`
+    /// bodies this is empty.
+    mutates: Vec<String>,
+}
+
+impl EnclosingContext {
+    fn for_fn() -> Self {
+        Self {
+            transition_of: None,
+            mutates: Vec::new(),
+        }
+    }
+
+    fn for_effect_or_interrupt(mutates: &[String]) -> Self {
+        Self {
+            transition_of: None,
+            mutates: mutates.to_vec(),
+        }
+    }
+
+    fn for_transition(automaton: &str) -> Self {
+        Self {
+            transition_of: Some(automaton.to_owned()),
+            mutates: vec![automaton.to_owned()],
+        }
+    }
 }
 
 /// One lexical scope frame. Holds the local bindings declared in this scope.
@@ -497,7 +672,33 @@ impl<'a> Walker<'a> {
     /// Resolve a single-segment name to a [`BindingRef`]. Locals shadow
     /// top-level symbols (a `let foo` inside a function hides the global
     /// `@fn foo` for the rest of the block).
+    ///
+    /// Special case: `Self` inside a `#transition` body resolves to a
+    /// [`BindingRef::SelfRef`] pointing at the enclosing automaton. Outside
+    /// transition bodies, `Self` falls through to the normal local/top-level
+    /// lookup (and almost certainly errors as undefined — that's correct;
+    /// `Self` is meaningless in `@fn` / `#effect` / `#interrupt` bodies).
     fn resolve_name(&mut self, name: &str, at: Span) {
+        if name == "Self" {
+            if let Some(EnclosingContext {
+                transition_of: Some(auto_name),
+                ..
+            }) = &self.enclosing
+            {
+                if let Some(automaton) = self.symbols.lookup(auto_name) {
+                    self.bindings.insert(
+                        at,
+                        BindingRef::SelfRef {
+                            automaton: automaton.clone(),
+                        },
+                    );
+                    return;
+                }
+            }
+            // Fall through to error — Self outside a transition body has no
+            // binding.
+        }
+
         let resolved = if let Some(local) = self.lookup_local(name) {
             BindingRef::Local(local.clone())
         } else if let Some(symbol) = self.symbols.lookup(name) {
@@ -510,6 +711,84 @@ impl<'a> Walker<'a> {
             return;
         };
         self.bindings.insert(at, resolved);
+    }
+
+    /// Validate that `field` exists on the automaton named `automaton`.
+    /// Records nothing on success (the surrounding mutation statement
+    /// already records the automaton resolution); pushes
+    /// [`ResolveError::UnknownField`] if the field is absent.
+    ///
+    /// If `automaton` doesn't even resolve to an `#automaton` symbol, this
+    /// helper is a no-op — the upstream `require_automaton` call will have
+    /// already pushed [`ResolveError::NotAnAutomaton`], and emitting
+    /// E0405 on top would be redundant noise.
+    fn require_field(&mut self, automaton: &str, field: &str, at: Span) {
+        if let Some(field_set) = self.automaton_meta.fields.get(automaton) {
+            if !field_set.contains(field) {
+                self.errors.push(ResolveError::UnknownField {
+                    automaton: automaton.to_owned(),
+                    field: field.to_owned(),
+                    at: at.start,
+                });
+            }
+        }
+    }
+
+    /// Resolve a `#> name(args)` callee to a [`BindingRef::Proc`].
+    ///
+    /// Resolution order per Refinement #5b:
+    /// 1. Top-level `#effect` with this name → [`CallContext::Identity`].
+    /// 2. `#transition` with this name in any automaton listed in the
+    ///    enclosing `#mutates` scope → [`CallContext::Transition`].
+    /// 3. Otherwise → [`ResolveError::UnknownProc`].
+    ///
+    /// (1) is checked before (2) because effects and transitions live in
+    /// distinct namespaces; a single name can't be both a top-level effect
+    /// and a transition (effects are top-level Symbols; transitions live
+    /// inside automata). If a transition shadows an effect by name in the
+    /// same module, (1) wins — though `clifford-check` would likely diagnose
+    /// the namespace shadow separately in a later phase.
+    fn resolve_proc_call(&mut self, name: &str, at: Span) {
+        // (1) Top-level `#effect`.
+        if let Some(sym) = self.symbols.lookup(name) {
+            if matches!(sym.kind, SymbolKind::Effect) {
+                self.bindings.insert(
+                    at,
+                    BindingRef::Proc {
+                        name: name.to_owned(),
+                        target_span: sym.span,
+                        ctx: CallContext::Identity,
+                    },
+                );
+                return;
+            }
+        }
+
+        // (2) `#transition` of an automaton in the enclosing `#mutates`
+        //     (or transition's own automaton).
+        if let Some(enc) = &self.enclosing {
+            for auto_name in &enc.mutates {
+                if let Some(transitions) = self.automaton_meta.transitions.get(auto_name) {
+                    if let Some(span) = transitions.get(name) {
+                        self.bindings.insert(
+                            at,
+                            BindingRef::Proc {
+                                name: name.to_owned(),
+                                target_span: *span,
+                                ctx: CallContext::Transition,
+                            },
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+
+        // (3) Unknown.
+        self.errors.push(ResolveError::UnknownProc {
+            name: name.to_owned(),
+            at: at.start,
+        });
     }
 
     /// Verify that a name resolves to an `#automaton` symbol. Used by
@@ -540,30 +819,60 @@ impl<'a> Walker<'a> {
     }
 
     fn walk_fn_decl(&mut self, decl: &FnDecl) {
+        let prev = self.enclosing.replace(EnclosingContext::for_fn());
         self.push_scope();
         for param in &decl.params {
             self.declare_param(param);
         }
         self.walk_block(&decl.body);
         self.pop_scope();
+        self.enclosing = prev;
     }
 
     fn walk_effect_decl(&mut self, decl: &EffectDecl) {
+        let prev = self
+            .enclosing
+            .replace(EnclosingContext::for_effect_or_interrupt(&decl.mutates));
         self.push_scope();
         for param in &decl.params {
             self.declare_param(param);
         }
         self.walk_block(&decl.body);
         self.pop_scope();
+        self.enclosing = prev;
     }
 
     fn walk_interrupt_decl(&mut self, decl: &InterruptDecl) {
+        let prev = self
+            .enclosing
+            .replace(EnclosingContext::for_effect_or_interrupt(&decl.mutates));
         self.push_scope();
         for param in &decl.params {
             self.declare_param(param);
         }
         self.walk_block(&decl.body);
         self.pop_scope();
+        self.enclosing = prev;
+    }
+
+    fn walk_automaton_decl(&mut self, decl: &AutomatonDecl) {
+        // Walk every `#transition` body. `Self` resolves to this automaton
+        // and `Self.field` validates against this automaton's field set.
+        for transition in &decl.transitions {
+            self.walk_transition_decl(decl, transition);
+        }
+    }
+
+    fn walk_transition_decl(&mut self, automaton: &AutomatonDecl, transition: &TransitionDecl) {
+        let prev = self
+            .enclosing
+            .replace(EnclosingContext::for_transition(&automaton.name));
+        self.push_scope();
+        // Transitions take no parameters in the current AST (parser slice 8
+        // doesn't accept them). When that lands, declare them here.
+        self.walk_block(&transition.body);
+        self.pop_scope();
+        self.enclosing = prev;
     }
 
     fn declare_param(&mut self, param: &Param) {
@@ -617,7 +926,11 @@ impl<'a> Walker<'a> {
             StmtKind::Return(None) => {}
             StmtKind::Mutate { automaton, assigns } => {
                 self.require_automaton(automaton, stmt.span);
+                // Validate every field-assign's name against the automaton's
+                // declared fields (E0405 if absent). Then walk the index
+                // (if any) and the value expression.
                 for fa in assigns {
+                    self.require_field(automaton, &fa.field, fa.span);
                     if let Some(idx) = &fa.index {
                         self.walk_expr(idx);
                     }
@@ -625,15 +938,18 @@ impl<'a> Walker<'a> {
                 }
             }
             StmtKind::MutateShort {
-                automaton, value, ..
+                automaton,
+                field,
+                value,
+                ..
             } => {
                 self.require_automaton(automaton, stmt.span);
+                // Sugar form: validate the single field name as well.
+                self.require_field(automaton, field, stmt.span);
                 self.walk_expr(value);
             }
-            StmtKind::ProcCall { args, .. } => {
-                // Slice 3 will resolve the proc name and tag CallContext.
-                // For now: walk arguments so any name references inside
-                // them resolve.
+            StmtKind::ProcCall { name, args } => {
+                self.resolve_proc_call(name, stmt.span);
                 for a in args {
                     self.walk_expr(a);
                 }
@@ -688,7 +1004,35 @@ impl<'a> Walker<'a> {
                 self.walk_expr(value);
                 self.walk_expr(count);
             }
-            ExprKind::FieldAccess { obj, .. } => self.walk_expr(obj),
+            ExprKind::FieldAccess { obj, field } => {
+                // Walk the receiver first so its resolution lands in the
+                // bindings map.
+                self.walk_expr(obj);
+                // If the receiver resolved to an automaton (either via
+                // `Path([Auto])` resolving to `SymbolKind::Automaton`, or
+                // `Self` in a transition body), validate the field name and
+                // record an `AutomatonField` binding under the *outer*
+                // FieldAccess expression's span.
+                let auto_sym: Option<Symbol> = match self.bindings.get(&obj.span) {
+                    Some(BindingRef::TopLevel(s))
+                        if matches!(s.kind, SymbolKind::Automaton) =>
+                    {
+                        Some(s.clone())
+                    }
+                    Some(BindingRef::SelfRef { automaton }) => Some(automaton.clone()),
+                    _ => None,
+                };
+                if let Some(sym) = auto_sym {
+                    self.require_field(&sym.name, field, expr.span);
+                    self.bindings.insert(
+                        expr.span,
+                        BindingRef::AutomatonField {
+                            automaton: sym,
+                            field_name: field.clone(),
+                        },
+                    );
+                }
+            }
             ExprKind::Index { obj, index } => {
                 self.walk_expr(obj);
                 self.walk_expr(index);
@@ -1472,10 +1816,12 @@ mod tests {
 
     #[test]
     fn proc_call_args_get_walked() {
-        // `#> log(x);` — the `x` argument resolves even though slice 2
-        // doesn't yet resolve `log` itself.
+        // `#> log(x);` — both the `log` callee and the `x` argument resolve.
+        // Slice 3 added proc-call resolution; we declare `log` as a
+        // top-level `#effect` so it resolves cleanly.
         let res = resolve_str(
-            "#effect e(x: u32) #mutates: [] { #> log(x); }",
+            "#effect log(b: u32) #mutates: [] { } \
+             #effect e(x: u32) #mutates: [] { #> log(x); }",
         )
         .unwrap();
         let x_refs = res
@@ -1577,6 +1923,454 @@ mod tests {
             .count();
         assert_eq!(len_refs, 1);
     }
+
+    // ─── Slice 3: transitions, Self, ProcCall, field validation ─────────
+
+    use clifford_ast::AutomatonField;
+
+    /// Find the first BindingRef whose variant matches a predicate.
+    fn find_binding<F>(res: &Resolution, pred: F) -> Option<&BindingRef>
+    where
+        F: Fn(&BindingRef) -> bool,
+    {
+        res.bindings.values().find(|b| pred(b))
+    }
+
+    fn count_bindings<F>(res: &Resolution, pred: F) -> usize
+    where
+        F: Fn(&BindingRef) -> bool,
+    {
+        res.bindings.values().filter(|b| pred(b)).count()
+    }
+
+    // ── Self in transition bodies ────────────────────────────────────────
+
+    #[test]
+    fn self_resolves_in_transition_body() {
+        let res = resolve_str(
+            "#automaton Counter { value: u32; \
+             #transition tick { let _x := Self; } }",
+        )
+        .unwrap();
+        let b = find_binding(&res, |b| matches!(b, BindingRef::SelfRef { .. }))
+            .expect("Self resolved");
+        match b {
+            BindingRef::SelfRef { automaton } => {
+                assert_eq!(automaton.name, "Counter");
+                assert_eq!(automaton.kind, SymbolKind::Automaton);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn self_outside_transition_is_undefined() {
+        let errors = resolve_str(
+            "@fn confused() -> u32 { return Self; }",
+        )
+        .unwrap_err();
+        // Self outside a transition body has no binding → falls through to
+        // UndefinedName.
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ResolveError::UndefinedName { name, .. } if name == "Self"
+        )));
+    }
+
+    // ── Self.field validation ────────────────────────────────────────────
+
+    #[test]
+    fn self_field_validates_against_enclosing_automaton() {
+        let res = resolve_str(
+            "#automaton Counter { value: u32; \
+             #transition tick { let _x := Self.value; } }",
+        )
+        .unwrap();
+        let b = find_binding(&res, |b| matches!(b, BindingRef::AutomatonField { .. }))
+            .expect("Self.value resolved");
+        match b {
+            BindingRef::AutomatonField {
+                automaton,
+                field_name,
+            } => {
+                assert_eq!(automaton.name, "Counter");
+                assert_eq!(field_name, "value");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn self_field_unknown_is_e0405() {
+        let errors = resolve_str(
+            "#automaton Counter { value: u32; \
+             #transition tick { let _x := Self.bogus; } }",
+        )
+        .unwrap_err();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ResolveError::UnknownField {
+                automaton,
+                field,
+                ..
+            } if automaton == "Counter" && field == "bogus"
+        )));
+    }
+
+    // ── Auto.field validation in expression position ─────────────────────
+
+    #[test]
+    fn auto_field_read_validates() {
+        let res = resolve_str(
+            "#automaton Counter { value: u32; } \
+             #effect peek() #mutates: [] { let _x := Counter.value; }",
+        )
+        .unwrap();
+        let b = find_binding(&res, |b| matches!(b, BindingRef::AutomatonField { .. }))
+            .expect("Counter.value resolved");
+        match b {
+            BindingRef::AutomatonField { field_name, .. } => {
+                assert_eq!(field_name, "value");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn auto_field_unknown_is_e0405() {
+        let errors = resolve_str(
+            "#automaton Counter { value: u32; } \
+             #effect peek() #mutates: [] { let _x := Counter.bogus; }",
+        )
+        .unwrap_err();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ResolveError::UnknownField { field, .. } if field == "bogus"
+        )));
+    }
+
+    #[test]
+    fn field_access_on_non_automaton_does_not_validate() {
+        // `param.field` where `param` is a struct parameter (not an automaton)
+        // — slice 3 doesn't yet have type info to validate this, so the
+        // resolver SILENTLY recurses into the receiver and stops. No error,
+        // no AutomatonField binding.
+        let res = resolve_str(
+            "@fn f(p: SomeStruct) -> u32 { return p.x; }",
+        )
+        .unwrap();
+        // No AutomatonField binding produced.
+        assert!(find_binding(&res, |b| matches!(b, BindingRef::AutomatonField { .. })).is_none());
+    }
+
+    // ── Mutate / MutateShort field validation ────────────────────────────
+
+    #[test]
+    fn mutate_validates_field_names() {
+        let res = resolve_str(
+            "#automaton Counter { value: u32; flags: u8; } \
+             #effect e() #mutates: [Counter] { #mutate Counter { value = 1, flags = 0 }; }",
+        )
+        .unwrap();
+        // No errors → both `value` and `flags` validated successfully.
+        let _ = res;
+    }
+
+    #[test]
+    fn mutate_unknown_field_is_e0405() {
+        let errors = resolve_str(
+            "#automaton Counter { value: u32; } \
+             #effect e() #mutates: [Counter] { #mutate Counter { mystery = 1 }; }",
+        )
+        .unwrap_err();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ResolveError::UnknownField {
+                automaton,
+                field,
+                ..
+            } if automaton == "Counter" && field == "mystery"
+        )));
+    }
+
+    #[test]
+    fn mutate_short_unknown_field_is_e0405() {
+        let errors = resolve_str(
+            "#automaton Counter { value: u32; } \
+             #effect e() #mutates: [Counter] { Counter.mystery = 1; }",
+        )
+        .unwrap_err();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ResolveError::UnknownField { field, .. } if field == "mystery"
+        )));
+    }
+
+    #[test]
+    fn mutate_unknown_automaton_skips_field_check() {
+        // When the automaton is undefined, we get E0403 NotAnAutomaton
+        // but NOT also E0405 UnknownField — the field check is skipped to
+        // avoid redundant noise (you already know what's wrong).
+        let errors = resolve_str(
+            "#effect e() #mutates: [] { #mutate NotAThing { whatever = 1 }; }",
+        )
+        .unwrap_err();
+        let has_e0403 = errors
+            .iter()
+            .any(|e| matches!(e, ResolveError::NotAnAutomaton { .. }));
+        let has_e0405 = errors
+            .iter()
+            .any(|e| matches!(e, ResolveError::UnknownField { .. }));
+        assert!(has_e0403);
+        assert!(!has_e0405, "should not double-report a field on a non-automaton");
+    }
+
+    // ── #> proc resolution + CallContext tagging ─────────────────────────
+
+    #[test]
+    fn proc_call_to_top_level_effect_is_identity() {
+        let res = resolve_str(
+            "#effect log(b: u8) #mutates: [] { } \
+             #effect main_effect() #mutates: [] { #> log(0); }",
+        )
+        .unwrap();
+        let b = find_binding(&res, |b| matches!(b, BindingRef::Proc { .. }))
+            .expect("Proc binding present");
+        match b {
+            BindingRef::Proc {
+                name,
+                ctx: CallContext::Identity,
+                ..
+            } => assert_eq!(name, "log"),
+            other => panic!("expected Identity Proc, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn proc_call_to_transition_in_mutates_scope_is_transition_context() {
+        let res = resolve_str(
+            "#automaton Counter { value: u32; \
+             #transition tick { Counter.value = 1; } } \
+             #effect bumper() #mutates: [Counter] { #> tick(); }",
+        )
+        .unwrap();
+        // The `#> tick()` from inside `bumper` should resolve to the
+        // Counter::tick transition with CallContext::Transition.
+        let b = find_binding(&res, |b| {
+            matches!(
+                b,
+                BindingRef::Proc {
+                    ctx: CallContext::Transition,
+                    ..
+                }
+            )
+        })
+        .expect("Transition Proc present");
+        match b {
+            BindingRef::Proc { name, ctx, .. } => {
+                assert_eq!(name, "tick");
+                assert_eq!(*ctx, CallContext::Transition);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn proc_call_inside_transition_finds_sibling_transition() {
+        // Inside a transition's body, `#> other_transition()` should resolve
+        // because the enclosing context is the same automaton.
+        let res = resolve_str(
+            "#automaton Sm { \
+             #transition first { #> second(); } \
+             #transition second { } \
+             }",
+        )
+        .unwrap();
+        let b = find_binding(&res, |b| matches!(b, BindingRef::Proc { .. }))
+            .expect("Proc binding present");
+        match b {
+            BindingRef::Proc { name, ctx, .. } => {
+                assert_eq!(name, "second");
+                assert_eq!(*ctx, CallContext::Transition);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn proc_call_unknown_name_is_e0404() {
+        let errors = resolve_str(
+            "#effect e() #mutates: [] { #> mystery(); }",
+        )
+        .unwrap_err();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ResolveError::UnknownProc { name, .. } if name == "mystery"
+        )));
+    }
+
+    #[test]
+    fn proc_call_to_function_is_e0404() {
+        // `@fn helper` is not a proc-call target — only `#effect` and
+        // `#transition` qualify. Calling it via `#>` is E0404.
+        let errors = resolve_str(
+            "@fn helper() { } \
+             #effect e() #mutates: [] { #> helper(); }",
+        )
+        .unwrap_err();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ResolveError::UnknownProc { name, .. } if name == "helper"
+        )));
+    }
+
+    #[test]
+    fn proc_call_to_transition_outside_mutates_scope_is_e0404() {
+        // The transition exists but the caller's `#mutates` doesn't include
+        // its automaton, so it's not in scope.
+        let errors = resolve_str(
+            "#automaton Counter { value: u32; \
+             #transition tick { Counter.value = 1; } } \
+             #effect outsider() #mutates: [] { #> tick(); }",
+        )
+        .unwrap_err();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ResolveError::UnknownProc { name, .. } if name == "tick"
+        )));
+    }
+
+    #[test]
+    fn proc_call_target_span_points_at_target_decl() {
+        let src = "#effect log(b: u8) #mutates: [] { } \
+                   #effect e() #mutates: [] { #> log(0); }";
+        let res = resolve_str(src).unwrap();
+        let log_sym = res.symbols.lookup("log").unwrap();
+        let b = find_binding(&res, |b| matches!(b, BindingRef::Proc { .. }))
+            .expect("Proc binding");
+        match b {
+            BindingRef::Proc { target_span, .. } => {
+                assert_eq!(*target_span, log_sym.span);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    // ── Transition body walking ──────────────────────────────────────────
+
+    #[test]
+    fn transition_body_let_bindings_resolve() {
+        // `let next: u32 = Self.value + 1;` inside a transition body.
+        let res = resolve_str(
+            "#automaton Counter { value: u32; \
+             #transition tick { let next: u32 = Self.value; let _x := next; } }",
+        )
+        .unwrap();
+        // `next` (used in the second let RHS) resolves as a Local Let.
+        let next_refs = count_bindings(&res, |b| {
+            matches!(
+                b,
+                BindingRef::Local(LocalBinding {
+                    name,
+                    kind: LocalKind::Let { .. },
+                    ..
+                }) if name == "next"
+            )
+        });
+        assert_eq!(next_refs, 1);
+    }
+
+    #[test]
+    fn transition_body_self_field_then_arithmetic() {
+        // `Self.value + 1` — Self resolves, Self.value validates, the `1`
+        // literal has no resolution.
+        let res = resolve_str(
+            "#automaton Counter { value: u32; \
+             #transition tick { let _x: u32 = Self.value + 1; } }",
+        )
+        .unwrap();
+        let self_field_count = count_bindings(&res, |b| {
+            matches!(b, BindingRef::AutomatonField { .. })
+        });
+        assert_eq!(self_field_count, 1);
+    }
+
+    // ── Mixed program: every slice-3 feature together ────────────────────
+
+    #[test]
+    fn realistic_program_with_transitions_and_proc_calls() {
+        let src = "\
+            #automaton Counter {\n  \
+              value: u32;\n  \
+              #transition tick { Counter.value = Counter.value + 1; }\n  \
+              #transition reset { Counter.value = 0; }\n\
+            }\n\
+            #effect bump() #mutates: [Counter] {\n  \
+              #> tick();\n  \
+              return;\n\
+            }\n\
+            #effect zero() #mutates: [Counter] {\n  \
+              #> reset();\n\
+            }\n\
+        ";
+        let res = resolve_str(src).expect("resolve");
+
+        // Two Proc bindings — one Transition each.
+        let proc_count = count_bindings(&res, |b| {
+            matches!(
+                b,
+                BindingRef::Proc {
+                    ctx: CallContext::Transition,
+                    ..
+                }
+            )
+        });
+        assert_eq!(proc_count, 2);
+
+        // Counter.value field accesses across two transitions and two reads
+        // (`Counter.value = Counter.value + 1` has one read on the RHS).
+        let field_count = count_bindings(&res, |b| {
+            matches!(
+                b,
+                BindingRef::AutomatonField { field_name, .. } if field_name == "value"
+            )
+        });
+        assert!(field_count >= 1);
+    }
+
+    // ── Suppression: type info matches reality on AutomatonField bindings ─
+
+    #[test]
+    fn automaton_field_binding_carries_correct_automaton() {
+        let res = resolve_str(
+            "#automaton A { x: u32; } \
+             #automaton B { y: u32; } \
+             #effect e() #mutates: [A, B] { let _a := A.x; let _b := B.y; }",
+        )
+        .unwrap();
+        // Two AutomatonField bindings, one for A.x and one for B.y.
+        let mut saw_a_x = false;
+        let mut saw_b_y = false;
+        for b in res.bindings.values() {
+            if let BindingRef::AutomatonField {
+                automaton,
+                field_name,
+            } = b
+            {
+                if automaton.name == "A" && field_name == "x" {
+                    saw_a_x = true;
+                }
+                if automaton.name == "B" && field_name == "y" {
+                    saw_b_y = true;
+                }
+            }
+        }
+        assert!(saw_a_x && saw_b_y);
+    }
+
+    // Compiles but unused — keeps the import alive for future tests.
+    #[allow(dead_code)]
+    fn _autoref(_: &AutomatonField) {}
 
     #[test]
     fn duplicate_item_and_undefined_name_both_reported() {
