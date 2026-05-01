@@ -57,10 +57,11 @@
 use clifford_ast::{
     AccessMode, AccessType, AddressClause, ArraySize, ArrayType, AssignOp, AutomatonDecl,
     AutomatonField, BasisClause, BinaryOp, Block, EffectDecl, Expr, ExprKind, Field, FieldAssign,
-    FnDecl, FnType, GenericParam, ImplDecl, InterfaceDecl, InterfaceMethod, InterruptDecl, Item,
-    Param, PathType, PriorityLevel, PrimitiveType, Program, RefType, SequentialAttr, SliceType,
-    StateName, Stmt, StmtKind, TestDecl, TraitDecl, TraitMethod, TraitRef, TransitionDecl,
-    TupleType, TypeBody, TypeDecl, TypeExpr, TypeKind, UnaryOp, Variant, VariantData,
+    FieldKind, FnDecl, FnType, GenericParam, ImplDecl, InterfaceDecl, InterfaceMethod,
+    InterruptDecl, Item, Param, PathType, PriorityLevel, PrimitiveType, Program, RefType,
+    SequentialAttr, SliceType, StateName, Stmt, StmtKind, TestDecl, TraitDecl, TraitMethod,
+    TraitRef, TransitionDecl, TupleType, TypeBody, TypeDecl, TypeExpr, TypeKind, UnaryOp, Variant,
+    VariantData,
 };
 use clifford_lexer::{Span, Token, TokenKind};
 use thiserror::Error;
@@ -557,11 +558,14 @@ impl<'t> Parser<'t> {
         }
 
         let close = self.expect(TokenKind::Semi, "`;` to terminate field declaration")?;
+        // Per Decision #21 / spec §7.0: every v0.1–v0.6 field is Private.
+        // The `#shared` field qualifier is reserved at the lexer for v0.7+.
         Ok(AutomatonField {
             name,
             ty,
             offset,
             access,
+            kind: FieldKind::Private,
             span: Span::new(start, close.end),
         })
     }

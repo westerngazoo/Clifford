@@ -1,11 +1,11 @@
 # ADR 0002: Shared Automata via Mutator Multivectors (Mixed-Metric GA)
 
-**Status:** Draft — proposed
+**Status:** Accepted (2026-05-01)
 **Date:** 2026-05-01
-**Deciders:** Goose (architect), TBD reviewers
+**Deciders:** Goose (architect)
 **Spec impact:** §7 (Orthogonality Engine), §2 (Grammar), §4 (Type System)
-**DECISIONS.md:** Proposes Decision #21
-**Branch:** `spec/decision-21-shared-automata`
+**DECISIONS.md:** Decision #21 ✓ LOCKED
+**Branch:** `spec/decision-21-shared-automata` (merged to `main`)
 
 ---
 

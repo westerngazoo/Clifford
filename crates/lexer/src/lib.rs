@@ -217,6 +217,19 @@ pub enum TokenKind {
     KwHashStaged,
     /// `#audit` annotation (Decision #18, reserved for v0.2)
     KwHashAudit,
+    /// `#shared` field qualifier (Decision #21, reserved for v0.7+).
+    /// Lexes as a token so source compatibility holds across the v0.7
+    /// transition; the parser rejects with a "reserved for v0.7" diagnostic.
+    KwHashShared,
+    /// `#lock NAME #priority: N;` declaration (Decision #21, reserved for v0.7+).
+    KwHashLock,
+    /// `#with_lock(NAME) { … }` block (Decision #21, reserved for v0.7+).
+    KwHashWithLock,
+    /// `#reads: [...]` clause on `#effect` / `#interrupt`
+    /// (Decision #21, reserved for v0.7+).
+    KwHashReads,
+    /// `#rotor: SECTION_OFFSET` lock-rotor parameter (Decision #21, reserved for v0.7+).
+    KwHashRotor,
 
     // ─ Functional sigil-prefixed forms (`@`) — §1.3 ───────────────────────
     /// `@fn` (Decision #1)
@@ -1042,6 +1055,15 @@ impl<'src> Lexer<'src> {
             "staged" => TokenKind::KwHashStaged,
             "flush" => TokenKind::KwHashFlush,
             "audit" => TokenKind::KwHashAudit,
+            // Reserved for v0.7+ — Decision #21 (shared automata via mutator
+            // multivectors). Lexed so source compatibility holds across the
+            // v0.7 transition; the parser will reject these with a
+            // "reserved for v0.7" diagnostic in v0.1–v0.6.
+            "shared" => TokenKind::KwHashShared,
+            "lock" => TokenKind::KwHashLock,
+            "with_lock" => TokenKind::KwHashWithLock,
+            "reads" => TokenKind::KwHashReads,
+            "rotor" => TokenKind::KwHashRotor,
             other => {
                 return Err(LexError::UnknownHashForm {
                     name: other.to_owned(),
@@ -1369,7 +1391,8 @@ mod tests {
                    #address #offset #access #bits #at \
                    #unchecked_load #unchecked_store #volatile_load #volatile_store \
                    #unchecked_cast #unchecked_offset #asm #free \
-                   #staged #flush #audit";
+                   #staged #flush #audit \
+                   #shared #lock #with_lock #reads #rotor";
         let expected = vec![
             TokenKind::KwHashAutomaton,
             TokenKind::KwHashEffect,
@@ -1402,6 +1425,12 @@ mod tests {
             TokenKind::KwHashStaged,
             TokenKind::KwHashFlush,
             TokenKind::KwHashAudit,
+            // Decision #21 — reserved for v0.7+ but lexed today.
+            TokenKind::KwHashShared,
+            TokenKind::KwHashLock,
+            TokenKind::KwHashWithLock,
+            TokenKind::KwHashReads,
+            TokenKind::KwHashRotor,
             TokenKind::Eof,
         ];
         assert_eq!(kinds(src), expected);
