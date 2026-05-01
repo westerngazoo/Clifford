@@ -1095,6 +1095,65 @@ morphisms commute.
 
 ---
 
+## Decision #21: Shared Automata via Mutator Multivectors (Mixed-Metric GA) ✓ LOCKED
+
+**Date locked:** 2026-05-01
+**ADR:** [`docs/adr/0002-shared-automata-mutator-multivectors.md`](adr/0002-shared-automata-mutator-multivectors.md)
+**Spec impact:** §7 (Orthogonality Engine — adds §7.0 prologue and §7.9 mixed-metric extension), §2 (reserves new sigil-prefixed forms), §4 (Type System — `#shared` field qualifier landing v0.7).
+
+### Summary
+
+The current GA orthogonality engine works in a Clifford algebra Cl(0,0,n) — every basis vector squares to zero, which is why `a & b != 0 ⇒ wedge == 0` detects write-write races. This is mathematically clean for *disjoint-mutation* programs but cannot model *shared mutable state* that real kernels (Wari, seL4, Hubris, Linux) deliberately require — run-queues, capability tables, page allocators, IRQ binding tables.
+
+Decision #21 extends the engine to a mixed-metric Cl(p,0,n) algebra where:
+
+- **Private fields** (the v0.1 default) contribute *null* basis vectors. Their wedge collapses on overlap — current race-detection behavior, unchanged.
+- **Shared fields** (declared `#shared` per ADR §5) contribute *non-null* basis vectors. Their wedge does *not* collapse on overlap; instead, overlap discharges a separate proof obligation: the lock guarding the shared resource must be held by both concurrent contexts.
+
+The locking discipline is itself algebraic, not procedural (per ADR §5.5):
+
+- Each lock is a mixed-grade multivector `lock(L) = pri(L) + e_L` (scalar priority + identity basis vector).
+- The lock-context multivector held by an executing automaton is the wedge of every held lock.
+- Acquisition validity falls out of the wedge product:
+  - Ascending priority → canonical wedge
+  - Descending priority → Koszul-flippable
+  - Equal priority → resolved by a GA *rotor* parameterised by a canonical structural attribute (MMIO `#address` for register-block locks; link-section position / source-location hash / explicit `#rotor:` clause for software locks).
+- **Theorem (sketched):** the lock context never collapses to zero ⟺ execution is deadlock-free. Lock-ordering safety falls out of the algebra; no separate procedural checker.
+- **Interrupts and locks unify:** an `#interrupt #priority: N { … }` is a priority-ordered acquisition under the §5.5 algebra; the engine handles both with the same machinery.
+
+### What this Decision unifies
+
+Four safety properties become one statement under the mixed-metric algebra:
+
+1. **Disjoint-mutation safety** — null-subspace wedge non-zero (current §7.4 check).
+2. **Shared-state safety** — non-null subspace overlap discharges the lock-coverage proof obligation.
+3. **Deadlock-freedom** — lock-context multivector never collapses (§5.5.4 theorem).
+4. **Interrupt/lock unification** — interrupts are priority-ordered acquisitions; algebra handles both.
+
+### Phase-1 scaffolding (lands now, alongside this decision)
+
+Per the ADR's Recommendation, Phase-1 work locks the design direction without committing to engine implementation:
+
+- `docs/CLIFFORD_SPEC.md` §7.0 (new prologue) declares the v0.1–v0.6 algebra as the *restricted form* Cl(0,0,n) and reserves the mixed-metric extension for v0.7.0-draft.
+- `docs/CLIFFORD_SPEC.md` §7.9 (new) sketches the v0.7 extension and points at this Decision and ADR 0002 §5.5 for the rotor formulation.
+- `crates/ast` adds `FieldKind` enum on `AutomatonField` with one variant today (`Private`), marked `#[non_exhaustive]` so adding `Shared { lock: Ident }` later is a non-breaking AST change.
+- `crates/lexer` reserves `#shared`, `#lock`, `#with_lock`, `#reads`, `#rotor` as keyword-prefixed forms (no parser support yet — just the tokens).
+- `@lock_order` is *not* reserved; the §5.5 rotor formulation supersedes Option B's procedural lock-ordering attribute.
+
+### Phase-2 implementation (v0.7.0-draft)
+
+Surface syntax in lexer + parser, AST extensions, mixed-metric algebra in `crates/ortho`, lock-coverage analysis in `crates/check`. Lock-ordering safety is *automatic* under the §5.5 rotor formulation — no separate pass.
+
+### Reentrant locks
+
+Deferred to a future minor decision (likely v0.8). Default non-reentrant; opt-in reentrant via `#lock #reentrant L` would set `e_L² = pri(L)` (non-null self-square) instead of zero.
+
+### Why this is locked, not deferred
+
+The ADR's "Doors we keep open" section enumerates the things that would foreclose Decision #21 if we *didn't* land Phase-1 scaffolding now: hard-coded all-null algebra in `crates/ortho`, exhaustive matches on `FieldKind`, accidental token collisions on `#shared` etc. The Phase-1 cost is small (~200 LoC + spec edits + this DECISIONS entry); the cost of *not* doing it is weeks-to-months of refactoring once v0.7 work begins.
+
+---
+
 ## Decision Matrix
 
 | # | Aspect | Question | Chosen | Impact |
@@ -1119,6 +1178,7 @@ morphisms commute.
 | #18 | Runtime auditing | None vs Built-in vs `#audit` + `PointerAuditor` interface | **`#audit` + interface (designed; deferred to v0.2)** | KASAN-style runtime checking layered on Decision #17's static visibility |
 | #19 | Pointer types | Raw `*const T`/`*mut T` vs Nominal `access<T>` | **Nominal `access<T>` / `access const<T>`** | Type-distinct pointers; peripheral confusion caught at compile time; cross-type casts grep-able via `#unchecked_cast` |
 | #20 | Bitfield access | `#mutate Reg { f = (self.f & ~M) \| (v << S) }` vs First-class `Reg.f.bit = v` | **First-class `#bits` annotation with target-atomic RMW** | Eliminates bit-twiddling boilerplate; atomic RMW where a concurrent writer exists, plain RMW otherwise; subfield-level GA basis vectors |
+| #21 | Shared state | Audit-block escape vs Mixed-metric Cl(p,0,n) algebra with priority-as-scalar lock multivectors and rotor tiebreaks | **Mixed-metric Cl(p,0,n) + §5.5 rotor formulation** | Kernels (Wari, seL4-shape) become typecheckable; lock-ordering safety, deadlock-freedom, and interrupt/lock unification all fall out of the algebra; design locked v0.7, scaffolding lands now |
 
 ---
 

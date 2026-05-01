@@ -1,7 +1,7 @@
 # Clifford Language Technical Specification
 
-**Version:** 0.5.0-draft
-**Status:** Pre-implementation; reconciled with `DECISIONS.md` (Decisions #1–#19 locked; #12 and #18 designed but deferred to v0.2)
+**Version:** 0.6.0-draft
+**Status:** Pre-implementation; reconciled with `DECISIONS.md` (Decisions #1–#21 locked; #12 and #18 designed but deferred to v0.2; Decision #21 implementation gated on v0.7+)
 **Target:** LLVM IR via custom frontend
 **Audience:** Compiler implementers (human and AI agents)
 **Positioning:** General-purpose systems language. Embedded firmware is the canonical first target because the safety properties matter most there; the language is not embedded-only and the same constructs work for servers, robotics, scientific computing, game engines, and other systems-software domains. Domain-specific support (heap allocators, IO primitives, etc.) lives in Phase 5 stdlib, not in the core language.
@@ -1005,6 +1005,19 @@ The semantics in this section are the normative form of `DECISIONS.md` Decision 
 
 **What the wedge-product check proves (Emergent Rule 6).** For any two concurrent automata `A` and `B`, the parallel composition is modeled as the product category `C_A × C_B` (built from the per-automaton categories of §6.1). The orthogonality check `behavior(A) ∧ behavior(B) ≠ 0 of grade |A| + |B|` is the constructive existence proof for that product: it succeeds exactly when no two parallel morphisms (one in `C_A`, one in `C_B`) touch overlapping mutable state, which is the well-formedness condition for the product category. The bitmask implementation in §7.4 is the algorithm; `Appendix B` states the theorem.
 
+### 7.0 Algebra: restricted form (v0.1–v0.6) and full form (v0.7+) **[NORMATIVE]**
+
+This spec version (v0.5.0-draft, targeting language v0.1–v0.6) defines the orthogonality engine over the **restricted Clifford algebra Cl(0,0,n)**: every basis vector squares to zero. The bitmask check in §7.4 (`a & b != 0 ⇒ wedge == 0`) is the operational form of this restriction. Under the restricted form, two automata are concurrent-safe iff they touch *literally disjoint* state — the strongest possible isolation property and the right one for embedded firmware that does not deliberately share mutable state.
+
+**Reservation for v0.7+: mixed-metric extension.** Per `DECISIONS.md` Decision #21 (and ADR 0002), v0.7.0-draft will extend the engine to the **mixed-metric Clifford algebra Cl(p,0,n)** in which:
+
+- Private fields (the v0.1 default; `FieldKind::Private`) contribute null basis vectors, with the current §7.4 collapse-on-overlap behavior.
+- Shared fields (the v0.7+ `#shared` field qualifier, AST `FieldKind::Shared { lock }`) contribute non-null basis vectors that do *not* collapse the wedge product. Overlap on a shared basis vector is permitted; it generates a separate proof obligation that the lock guarding the shared resource is held by both concurrent contexts.
+
+The mixed-metric algebra is sketched in §7.9 below. v0.1–v0.6 implementations MUST treat every automaton field as `FieldKind::Private` and MUST reject `#shared` / `#lock` / `#with_lock` / `#reads` / `#rotor` token forms with a "reserved for v0.7" diagnostic. The lexer reserves these tokens from v0.6+ so that v0.7 enabling is a non-breaking change.
+
+**Implications for v0.1–v0.6 implementations.** No semantic change. `crates/ortho` operates on the restricted algebra. The `crates/ast` `AutomatonField::kind` field is always `FieldKind::Private`. Diagnostics, conformance tests, and downstream phases all behave as if Decision #21 did not exist — except that the reserved tokens above produce the early-rejection diagnostic.
+
 ### 7.1 Basis Vector Assignment
 
 The compiler builds two disjoint basis spaces and concatenates them into a single Geometric Algebra `G(n, 0, 0)` over Euclidean signature.
@@ -1193,6 +1206,42 @@ Per Decision #4 rule 4, the compiler exposes its basis-vector decisions to tooli
 ### 7.8 garust Integration **[OPEN]**
 
 The orthogonality engine's blade representation (bitmask + XOR for products) is structurally identical to garust's representation. **[OPEN]**: whether to vendor garust into the compiler as a Rust dependency for the GA computations, or to implement a minimal in-tree blade arithmetic. Recommended: vendor garust once it stabilizes its API; in the meantime, the in-tree implementation is ~50 lines.
+
+### 7.9 Mixed-metric extension (v0.7+) **[INFORMATIVE — locked, not yet implemented]**
+
+This section sketches the v0.7 extension of the orthogonality engine per `DECISIONS.md` Decision #21 and ADR 0002. It is informative for v0.1–v0.6 conformance — the lexer reserves the relevant tokens (per §7.0), but no implementation work happens until v0.7.0-draft. ADR 0002 §5.5 carries the full algebraic exposition; this section is the spec's normative reservation.
+
+**Algebra.** v0.7 replaces Cl(0,0,n) with Cl(p,0,n). Each basis vector carries a *metric tag*:
+
+- `e_q` for q ∈ {1, …, n} are *null* — `e_q² = 0`. Used for private fields (the v0.1 default).
+- `e_~q` for q ∈ {1, …, p} are *non-null* — `e_~q² = +1`. Used for shared fields declared `#shared`.
+
+**Extended orthogonality theorem.** Two automata `A` and `B` are concurrent-safe iff:
+
+1. The null-subspace projection of `behavior(A) ∧ behavior(B)` is non-zero (the existing §7.4 check, applied to the null basis vectors only).
+2. AND for every shared basis vector `e_~q` appearing in both behaviors, the lock-coverage proof obligation is discharged (per §5.5 of ADR 0002): the lock `L` such that `field(e_~q) = guarded by L` is held by both A and B at the time they touch `e_~q`.
+
+**Lock as multivector.** Per ADR 0002 §5.5, each lock `L` is a mixed-grade multivector `lock(L) = pri(L) + e_L`, where `pri(L)` is the lock's priority (an integer in the same priority space as `#interrupt #priority:` declarations per §2.5) and `e_L` is the lock's identity basis vector. The lock-context multivector held by an executing automaton is the wedge of every held lock; acquisition is right-wedge; release is the formal inverse.
+
+**Acquisition validity.** Acquiring a new lock at priority `p_new` while holding a context whose maximum priority is `p_max` is valid iff `p_new > p_max`. Algebraically:
+
+- `e_L ∧ e_M = + e_L ∧ e_M`  if `pri(L) < pri(M)` (canonical: ascending)
+- `e_L ∧ e_M = − e_M ∧ e_L`  if `pri(L) > pri(M)` (anti-canonical: Koszul-flip)
+- `e_L ∧ e_M = ROTOR(L, M)`  if `pri(L) = pri(M)` (rotor tiebreak — see ADR 0002 §5.5.5)
+
+**Rotor tiebreak.** Same-priority locks resolve via a deterministic GA *rotor* parameterised by a canonical structural attribute of each lock — MMIO `#address` for register-block locks; `#rotor: SECTION_OFFSET` clause / link-section position / source-location hash for software locks. The rotor is fixed at compile time; "ring like a roulette without randomness."
+
+**Theorem (priority-monotone deadlock-freedom).** Let `ctx(t)` be the lock-context multivector at time `t` for some hart. Execution is deadlock-free iff `ctx(t) ≠ 0` for all `t`. Wedge-collapse signals a priority inversion or unordered acquisition; the static walk of effect/transition bodies emits `E0521` (or successor code) for any program point where collapse occurs.
+
+**Interrupts and locks unify.** A `#interrupt H #priority: N { … }` is a priority-ordered acquisition under §5.5: when `H` fires, the hart's effective priority rises to `N`; lower-priority interrupts get masked. Same semantics as `#with_lock(L) { … }` where `pri(L) = N`. Under v0.7's algebra, the orthogonality engine handles both with a single mixed-metric pass; §7.3's special-case interrupt-concurrency rules collapse into the one algebra.
+
+**Reentrancy.** Deferred to a future minor decision (likely v0.8). Default non-reentrant: `e_L ∧ e_L = 0` (taking the same lock twice collapses the context). Opt-in reentrant via `#lock #reentrant L` would set `e_L² = pri(L)` (non-null self-square allows the wedge to survive recursive acquisition).
+
+**Implementation reservation.** v0.1–v0.6 implementations:
+
+- MUST treat `AutomatonField::kind` as always `FieldKind::Private`.
+- MUST reject `#shared`, `#lock`, `#with_lock`, `#reads`, `#rotor` token forms with a "reserved for v0.7" diagnostic at parse time.
+- SHOULD design `crates/ortho` data structures to carry a per-basis-vector metric tag from day one, even if v0.1–v0.6 only uses null tags. This avoids a refactor when v0.7 enables the mixed-metric algebra.
 
 ---
 

@@ -216,6 +216,20 @@ may include breaking changes.
 
 ## Spec Changes
 
+### v0.6.0-draft (2026-05-01) — Decision #21: shared automata via mutator multivectors ✓ LOCKED
+
+ADR 0002 accepted. The orthogonality engine's algebra is documented as the
+*restricted form* Cl(0,0,n) for v0.1–v0.6, with the *full form* mixed-metric
+Cl(p,0,n) extension reserved for v0.7+. New §7.0 prologue and §7.9
+extension sketch added to the spec.
+
+- **Algebra:** v0.7+ extends to mixed-metric Cl(p,0,n). Private fields contribute null basis vectors (current behavior); shared fields contribute non-null basis vectors that don't collapse the wedge product. Overlap on a shared basis vector generates a separate proof obligation: lock coverage.
+- **Lock as multivector:** each lock `L` is a mixed-grade multivector `lock(L) = pri(L) + e_L` (scalar priority + identity basis vector). The lock-context multivector held by an executing automaton is the wedge of every held lock.
+- **Acquisition validity is algebraic:** ascending priority is canonical wedge; descending is Koszul-flippable; equal-priority falls through to a deterministic GA *rotor* parameterised by a canonical structural attribute (MMIO `#address` for register-block locks; `#rotor:` clause / link-section position / source-location hash for software locks).
+- **Theorem (sketched):** lock-context multivector never collapses to zero ⟺ execution is deadlock-free. Lock-ordering safety falls out of the algebra; no separate procedural checker.
+- **Interrupts and locks unify:** a `#interrupt #priority: N { … }` is a priority-ordered acquisition; the algebra handles both interrupt and lock concurrency with the same machinery.
+- **Phase-1 scaffolding (lands now):** `crates/ast` adds `FieldKind` enum on `AutomatonField` (one variant `Private`, marked `#[non_exhaustive]`); `crates/lexer` reserves `#shared`, `#lock`, `#with_lock`, `#reads`, `#rotor` tokens; `docs/DECISIONS.md` adds Decision #21 LOCKED entry; `docs/CLIFFORD_SPEC.md` adds §7.0 prologue and §7.9 extension sketch. No engine changes; v0.7 implementation work is gated on Phase 0–4 closing.
+
 ### v0.5.0-draft (2026-04-30) — Decision #19: nominal access types
 
 - `*const T` / `*mut T` retired in favor of `access<T>` / `access const<T>`.
