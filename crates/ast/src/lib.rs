@@ -86,11 +86,14 @@ pub struct Program {
 
 /// A top-level item.
 ///
-/// First-slice variants only (`@fn`, `#automaton`). The full set per §2.1 —
-/// `@type`, `@trait`, `@module`, `#effect` (top-level per Refinement #5a),
-/// `#interrupt`, `#interface`, `#impl`, `#test`, `static`, `const`,
-/// `extern_block`, `use_decl`, `@sequential` attribute — arrives in
-/// subsequent parser slices.
+/// Slice 2 variants cover most of §2.1's shape-only items. Bodies (function
+/// bodies, effect bodies, transition bodies, interface method signatures,
+/// impl method bodies) are deferred to subsequent parser slices that build
+/// out statement/expression parsing.
+///
+/// Still deferred per §2.1: `@type`, `@trait`, `@module`, `static`, `const`,
+/// `extern_block`, `use_decl`. These need type expressions and value
+/// expressions which are slice-3+ work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Item {
@@ -98,30 +101,58 @@ pub enum Item {
     Fn(FnDecl),
     /// An `#automaton` declaration.
     Automaton(AutomatonDecl),
+    /// An `#effect` declaration (top-level per Refinement #5a).
+    Effect(EffectDecl),
+    /// An `#interrupt` declaration. Differs from `#effect` in that the name
+    /// becomes the linker symbol (Decision #10) and `#priority` is required.
+    Interrupt(InterruptDecl),
+    /// An `#interface` declaration (Decision #16).
+    Interface(InterfaceDecl),
+    /// An `#impl Interface for Automaton { … }` block (Decision #16).
+    Impl(ImplDecl),
+    /// A `#test "name" { … }` block (Decision #7).
+    Test(TestDecl),
+    /// An `@sequential(A, B);` non-concurrency attribute (Decision #11).
+    Sequential(SequentialAttr),
 }
 
 impl Item {
     /// Which sigil layer does this item live in?
     ///
     /// Derived from the variant rather than stored, since the layer is fully
-    /// determined by the item kind (no `@fn` is ever in the imperative
-    /// layer; no `#automaton` is ever in the functional layer). Storing the
-    /// layer would invite drift between variant and field.
+    /// determined by the item kind. Storing the layer would invite drift
+    /// between variant and field.
+    ///
+    /// `@sequential(A, B);` is treated as functional-layer for
+    /// classification purposes — the attribute lives in the functional
+    /// layer per its `@` sigil — though it carries no body and serves only
+    /// as input to the GA orthogonality engine (§7.3).
     #[must_use]
     pub fn layer(&self) -> Layer {
         match self {
-            Self::Fn(_) => Layer::Functional,
-            Self::Automaton(_) => Layer::Imperative,
+            Self::Fn(_) | Self::Sequential(_) => Layer::Functional,
+            Self::Automaton(_)
+            | Self::Effect(_)
+            | Self::Interrupt(_)
+            | Self::Interface(_)
+            | Self::Impl(_)
+            | Self::Test(_) => Layer::Imperative,
         }
     }
 
-    /// The source span covering the whole item, from leading sigil to
-    /// closing brace.
+    /// The source span covering the whole item, from leading sigil to its
+    /// terminating token (closing brace or terminating semicolon).
     #[must_use]
     pub fn span(&self) -> Span {
         match self {
             Self::Fn(d) => d.span,
             Self::Automaton(d) => d.span,
+            Self::Effect(d) => d.span,
+            Self::Interrupt(d) => d.span,
+            Self::Interface(d) => d.span,
+            Self::Impl(d) => d.span,
+            Self::Test(d) => d.span,
+            Self::Sequential(d) => d.span,
         }
     }
 }
@@ -150,6 +181,115 @@ pub struct AutomatonDecl {
     /// The automaton's name.
     pub name: String,
     /// Source span covering `#automaton Name { }` end-to-end.
+    pub span: Span,
+}
+
+/// An `#effect name() #mutates: [A, B] { … }` declaration (top-level per
+/// Refinement #5a).
+///
+/// Slice-2 scope: name + `#mutates` automaton list + `#cannot_mutate` (if
+/// present) + span. Empty parameter list, empty body. Parameters, return
+/// type, full effect-meta clauses (`#invariant`, `#atomic`), trait list,
+/// and body content all arrive in subsequent slices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectDecl {
+    /// The effect's name.
+    pub name: String,
+    /// Automaton names listed in `#mutates: [...]`. May be empty for pure
+    /// effects (the spec permits an empty list).
+    pub mutates: Vec<String>,
+    /// Automaton names listed in `#cannot_mutate: [...]`. Optional.
+    pub cannot_mutate: Vec<String>,
+    /// Source span covering `#effect name() #mutates: [...] { }` end-to-end.
+    pub span: Span,
+}
+
+/// An `#interrupt NAME() #mutates: [A] #priority: HIGH { … }` declaration.
+///
+/// The `name` is the linker symbol per Decision #10 — users write the
+/// target-standard interrupt vector name (e.g., `USART1_IRQHandler`).
+/// `#priority` is required for `#interrupt` (per §2.5 notes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterruptDecl {
+    /// Interrupt vector name; becomes the linker symbol (Decision #10).
+    pub name: String,
+    /// Automaton names listed in `#mutates: [...]`.
+    pub mutates: Vec<String>,
+    /// Required `#priority: …` per §2.5 effect_meta requirements for `#interrupt`.
+    pub priority: PriorityLevel,
+    /// Source span covering the full declaration.
+    pub span: Span,
+}
+
+/// `#priority: LOW | MEDIUM | HIGH | <integer>` per §2.5.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PriorityLevel {
+    /// `LOW`
+    Low,
+    /// `MEDIUM`
+    Medium,
+    /// `HIGH`
+    High,
+    /// An explicit integer priority. The raw token text is preserved so
+    /// the type checker can validate the numeric range against the target.
+    Numeric(String),
+}
+
+/// An `#interface Name { … }` declaration (Decision #16).
+///
+/// Slice-2 scope: name + span only. The interface body — a list of effect
+/// signatures `effect name(params) -> ret;` — arrives in slice 3 alongside
+/// parameter and return-type parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceDecl {
+    /// The interface's name.
+    pub name: String,
+    /// Source span covering the full declaration.
+    pub span: Span,
+}
+
+/// An `#impl Interface for Automaton { … }` block (Decision #16).
+///
+/// Slice-2 scope: interface name + automaton name + span. Method bodies
+/// (the `effect name(params) -> ret { … }` items inside the braces) arrive
+/// in slice 3 alongside body parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImplDecl {
+    /// The interface being implemented.
+    pub interface_name: String,
+    /// The automaton implementing the interface.
+    pub automaton_name: String,
+    /// Source span covering the full declaration.
+    pub span: Span,
+}
+
+/// A `#test "description" { … }` block (Decision #7).
+///
+/// Slice-2 scope: description string + span. Test bodies arrive when
+/// statement parsing lands in slice 4. Each test runs in isolation;
+/// automata are reset to their declared initial state before each
+/// invocation (semantic detail enforced at runtime, not at parse).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestDecl {
+    /// Test description from the string literal.
+    pub description: String,
+    /// Source span covering the full declaration.
+    pub span: Span,
+}
+
+/// An `@sequential(AutomatonA, AutomatonB);` top-level attribute (Decision #11).
+///
+/// Asserts to the GA orthogonality engine (§7.3) that the two named
+/// automata never run concurrently. Symmetric: `@sequential(A, B)` and
+/// `@sequential(B, A)` carry the same meaning. The attribute is *trusted*
+/// — the compiler does not verify it, just consumes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SequentialAttr {
+    /// First automaton in the pair.
+    pub a: String,
+    /// Second automaton in the pair.
+    pub b: String,
+    /// Source span covering `@sequential(A, B);` end-to-end.
     pub span: Span,
 }
 

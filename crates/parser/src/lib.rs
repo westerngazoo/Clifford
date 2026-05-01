@@ -54,7 +54,10 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use clifford_ast::{AutomatonDecl, FnDecl, Item, Program};
+use clifford_ast::{
+    AutomatonDecl, EffectDecl, FnDecl, ImplDecl, InterfaceDecl, InterruptDecl, Item,
+    PriorityLevel, Program, SequentialAttr, TestDecl,
+};
 use clifford_lexer::{Span, Token, TokenKind};
 use thiserror::Error;
 
@@ -196,17 +199,31 @@ impl<'t> Parser<'t> {
 
     /// Parse one top-level item, dispatching by the leading sigil-token.
     ///
-    /// First slice handles `@fn` and `#automaton` only; the full §2.1 item
-    /// catalogue (`@type`, `@trait`, `@module`, top-level `#effect`,
-    /// `#interrupt`, `#interface`, `#impl`, `#test`, `static`, `const`,
-    /// `extern_block`, `use_decl`, `@sequential` attribute) lands in
-    /// subsequent slices.
+    /// Slice 2 handles: `@fn`, `#automaton`, `#effect`, `#interrupt`,
+    /// `#interface`, `#impl`, `#test`, and the `@sequential` attribute.
+    /// Still deferred per §2.1: `@type`, `@trait`, `@module`, `static`,
+    /// `const`, `extern_block`, `use_decl` — these need type and value
+    /// expression parsing which is slice-3+ work.
     fn parse_item(&mut self) -> Result<Item, ParseError> {
         let lead = self.peek().clone();
         match lead.kind {
             TokenKind::KwAtFn => self.parse_fn_decl(lead.span.start).map(Item::Fn),
             TokenKind::KwHashAutomaton => {
                 self.parse_automaton_decl(lead.span.start).map(Item::Automaton)
+            }
+            TokenKind::KwHashEffect => {
+                self.parse_effect_decl(lead.span.start).map(Item::Effect)
+            }
+            TokenKind::KwHashInterrupt => {
+                self.parse_interrupt_decl(lead.span.start).map(Item::Interrupt)
+            }
+            TokenKind::KwHashInterface => {
+                self.parse_interface_decl(lead.span.start).map(Item::Interface)
+            }
+            TokenKind::KwHashImpl => self.parse_impl_decl(lead.span.start).map(Item::Impl),
+            TokenKind::KwHashTest => self.parse_test_decl(lead.span.start).map(Item::Test),
+            TokenKind::KwAtSequential => {
+                self.parse_sequential_attr(lead.span.start).map(Item::Sequential)
             }
             other => Err(ParseError::ExpectedItem {
                 found: other,
@@ -247,6 +264,262 @@ impl<'t> Parser<'t> {
             name,
             span: Span::new(start, close.end),
         })
+    }
+
+    /// Parse `#effect name() #mutates: [A, B] { }`.
+    ///
+    /// Slice-2 form. The empty parameter list `()` is required; parameters
+    /// land in slice 3. Body content (statements) lands in slice 4. The
+    /// `#mutates` clause is required (per §2.5 notes for `#effect`); it may
+    /// be empty (`#mutates: []`) for pure effects. `#cannot_mutate` is
+    /// optional. Other effect_meta clauses (`#invariant`, `#atomic`) land
+    /// in subsequent slices.
+    fn parse_effect_decl(&mut self, start: usize) -> Result<EffectDecl, ParseError> {
+        self.advance(); // `#effect`
+        let (name, _) = self.expect_ident("effect name after `#effect`")?;
+        self.expect(TokenKind::LParen, "`(` after effect name")?;
+        self.expect(TokenKind::RParen, "`)` (empty parameter list in this slice)")?;
+
+        let (mutates, cannot_mutate) = self.parse_effect_meta_for_effect()?;
+
+        self.expect(TokenKind::LBrace, "`{` to open effect body")?;
+        let close = self.expect(TokenKind::RBrace, "`}` to close effect body")?;
+        Ok(EffectDecl {
+            name,
+            mutates,
+            cannot_mutate,
+            span: Span::new(start, close.end),
+        })
+    }
+
+    /// Parse `#interrupt NAME() #mutates: [A] #priority: HIGH { }`.
+    ///
+    /// Per §2.5 notes, `#interrupt` requires both `#mutates` and `#priority`.
+    /// The name becomes the linker symbol per Decision #10.
+    fn parse_interrupt_decl(&mut self, start: usize) -> Result<InterruptDecl, ParseError> {
+        self.advance(); // `#interrupt`
+        let (name, _) = self.expect_ident("interrupt vector name after `#interrupt`")?;
+        self.expect(TokenKind::LParen, "`(` after interrupt name")?;
+        self.expect(TokenKind::RParen, "`)` (empty parameter list in this slice)")?;
+
+        let (mutates, priority) = self.parse_effect_meta_for_interrupt(start)?;
+
+        self.expect(TokenKind::LBrace, "`{` to open interrupt body")?;
+        let close = self.expect(TokenKind::RBrace, "`}` to close interrupt body")?;
+        Ok(InterruptDecl {
+            name,
+            mutates,
+            priority,
+            span: Span::new(start, close.end),
+        })
+    }
+
+    /// Parse `#interface Name { }` (Decision #16).
+    ///
+    /// Slice-2 form. Empty body for now; method signatures land in slice 3.
+    fn parse_interface_decl(&mut self, start: usize) -> Result<InterfaceDecl, ParseError> {
+        self.advance(); // `#interface`
+        let (name, _) = self.expect_ident("interface name after `#interface`")?;
+        self.expect(TokenKind::LBrace, "`{` to open interface body")?;
+        let close = self.expect(TokenKind::RBrace, "`}` to close interface body")?;
+        Ok(InterfaceDecl {
+            name,
+            span: Span::new(start, close.end),
+        })
+    }
+
+    /// Parse `#impl Interface for Automaton { }` (Decision #16).
+    ///
+    /// Slice-2 form. Empty body for now; method bodies land in slice 3
+    /// alongside statement/expression parsing. The `for` is the bare
+    /// keyword `for` (not a sigil-form), borrowing the §1.3 `for` keyword
+    /// for its second use position.
+    fn parse_impl_decl(&mut self, start: usize) -> Result<ImplDecl, ParseError> {
+        self.advance(); // `#impl`
+        let (interface_name, _) =
+            self.expect_ident("interface name after `#impl`")?;
+        self.expect(TokenKind::KwFor, "`for` between interface and automaton")?;
+        let (automaton_name, _) =
+            self.expect_ident("automaton name after `for`")?;
+        self.expect(TokenKind::LBrace, "`{` to open impl body")?;
+        let close = self.expect(TokenKind::RBrace, "`}` to close impl body")?;
+        Ok(ImplDecl {
+            interface_name,
+            automaton_name,
+            span: Span::new(start, close.end),
+        })
+    }
+
+    /// Parse `#test "description" { }` (Decision #7).
+    ///
+    /// Slice-2 form. Body content lands in slice 4.
+    fn parse_test_decl(&mut self, start: usize) -> Result<TestDecl, ParseError> {
+        self.advance(); // `#test`
+        let t = self.peek().clone();
+        let description = match t.kind {
+            TokenKind::StringLiteral(s) => {
+                self.advance();
+                s
+            }
+            TokenKind::Eof => {
+                return Err(ParseError::UnexpectedEof {
+                    context: "string-literal description after `#test`",
+                });
+            }
+            other => {
+                return Err(ParseError::Expected {
+                    expected: "string-literal description after `#test`",
+                    found: other,
+                    at: t.span.start,
+                });
+            }
+        };
+        self.expect(TokenKind::LBrace, "`{` to open test body")?;
+        let close = self.expect(TokenKind::RBrace, "`}` to close test body")?;
+        Ok(TestDecl {
+            description,
+            span: Span::new(start, close.end),
+        })
+    }
+
+    /// Parse `@sequential(A, B);` (Decision #11).
+    fn parse_sequential_attr(&mut self, start: usize) -> Result<SequentialAttr, ParseError> {
+        self.advance(); // `@sequential`
+        self.expect(TokenKind::LParen, "`(` after `@sequential`")?;
+        let (a, _) = self.expect_ident("first automaton name in `@sequential(…, …)`")?;
+        self.expect(TokenKind::Comma, "`,` between sequential automaton names")?;
+        let (b, _) = self.expect_ident("second automaton name in `@sequential(…, …)`")?;
+        self.expect(TokenKind::RParen, "`)` to close `@sequential(…)`")?;
+        let close = self.expect(TokenKind::Semi, "`;` to terminate `@sequential` attribute")?;
+        Ok(SequentialAttr {
+            a,
+            b,
+            span: Span::new(start, close.end),
+        })
+    }
+
+    // ─── effect_meta parsing helpers ──────────────────────────────────────
+
+    /// Parse the metadata clauses of an `#effect` declaration (slice-2 set).
+    ///
+    /// Slice-2 supports `#mutates: [...]` (required, possibly empty) and
+    /// `#cannot_mutate: [...]` (optional). Order: `#mutates` must come first
+    /// for now; richer reordering and `#invariant` / `#atomic` come in
+    /// subsequent slices.
+    fn parse_effect_meta_for_effect(
+        &mut self,
+    ) -> Result<(Vec<String>, Vec<String>), ParseError> {
+        self.expect(TokenKind::KwHashMutates, "`#mutates: [...]` clause is required for `#effect`")?;
+        self.expect(TokenKind::Colon, "`:` after `#mutates`")?;
+        let mutates = self.parse_ident_list_in_brackets()?;
+
+        let cannot_mutate = if matches!(self.peek().kind, TokenKind::KwHashCannotMutate) {
+            self.advance(); // `#cannot_mutate`
+            self.expect(TokenKind::Colon, "`:` after `#cannot_mutate`")?;
+            self.parse_ident_list_in_brackets()?
+        } else {
+            Vec::new()
+        };
+
+        Ok((mutates, cannot_mutate))
+    }
+
+    /// Parse the metadata clauses of an `#interrupt` declaration.
+    ///
+    /// `#interrupt` requires both `#mutates` and `#priority` per §2.5.
+    fn parse_effect_meta_for_interrupt(
+        &mut self,
+        decl_start: usize,
+    ) -> Result<(Vec<String>, PriorityLevel), ParseError> {
+        self.expect(
+            TokenKind::KwHashMutates,
+            "`#mutates: [...]` clause is required for `#interrupt`",
+        )?;
+        self.expect(TokenKind::Colon, "`:` after `#mutates`")?;
+        let mutates = self.parse_ident_list_in_brackets()?;
+
+        self.expect(
+            TokenKind::KwHashPriority,
+            "`#priority: …` clause is required for `#interrupt`",
+        )?;
+        self.expect(TokenKind::Colon, "`:` after `#priority`")?;
+        let priority = self.parse_priority_level(decl_start)?;
+        Ok((mutates, priority))
+    }
+
+    /// Parse `[ ident (, ident)* ]` or `[]`.
+    fn parse_ident_list_in_brackets(&mut self) -> Result<Vec<String>, ParseError> {
+        self.expect(TokenKind::LBracket, "`[` to open identifier list")?;
+        let mut idents = Vec::new();
+        loop {
+            match self.peek().kind {
+                TokenKind::RBracket => {
+                    self.advance();
+                    return Ok(idents);
+                }
+                TokenKind::Eof => {
+                    return Err(ParseError::UnexpectedEof {
+                        context: "identifier list",
+                    });
+                }
+                _ => {}
+            }
+            let (name, _) = self.expect_ident("identifier in list")?;
+            idents.push(name);
+            match self.peek().kind {
+                TokenKind::Comma => {
+                    self.advance();
+                }
+                TokenKind::RBracket => {
+                    self.advance();
+                    return Ok(idents);
+                }
+                _ => {
+                    let t = self.peek().clone();
+                    return Err(ParseError::Expected {
+                        expected: "`,` or `]` in identifier list",
+                        found: t.kind,
+                        at: t.span.start,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Parse `LOW | MEDIUM | HIGH | <integer>` per §2.5.
+    fn parse_priority_level(&mut self, decl_start: usize) -> Result<PriorityLevel, ParseError> {
+        let t = self.peek().clone();
+        match t.kind {
+            TokenKind::Ident(ref name) => {
+                let level = match name.as_str() {
+                    "LOW" => PriorityLevel::Low,
+                    "MEDIUM" => PriorityLevel::Medium,
+                    "HIGH" => PriorityLevel::High,
+                    _ => {
+                        return Err(ParseError::Expected {
+                            expected: "`LOW`, `MEDIUM`, `HIGH`, or integer literal as `#priority` value",
+                            found: t.kind,
+                            at: t.span.start,
+                        });
+                    }
+                };
+                self.advance();
+                let _ = decl_start;
+                Ok(level)
+            }
+            TokenKind::IntLiteral(text) => {
+                self.advance();
+                Ok(PriorityLevel::Numeric(text))
+            }
+            TokenKind::Eof => Err(ParseError::UnexpectedEof {
+                context: "`#priority` value",
+            }),
+            other => Err(ParseError::Expected {
+                expected: "`LOW`, `MEDIUM`, `HIGH`, or integer literal as `#priority` value",
+                found: other,
+                at: t.span.start,
+            }),
+        }
     }
 }
 
@@ -407,5 +680,282 @@ mod tests {
         let a = parse_str(src).expect("first parse");
         let b = parse_str(src).expect("second parse");
         assert_eq!(a, b);
+    }
+
+    // ─── Slice 2: extended top-level items ────────────────────────────────
+
+    use clifford_ast::{
+        EffectDecl, ImplDecl, InterfaceDecl, InterruptDecl, PriorityLevel, SequentialAttr,
+        TestDecl,
+    };
+
+    #[test]
+    fn effect_with_empty_mutates() {
+        let p = parse_str("#effect noop() #mutates: [] { }").expect("parse pure-ish #effect");
+        assert_eq!(p.items.len(), 1);
+        match &p.items[0] {
+            Item::Effect(EffectDecl {
+                name,
+                mutates,
+                cannot_mutate,
+                ..
+            }) => {
+                assert_eq!(name, "noop");
+                assert!(mutates.is_empty());
+                assert!(cannot_mutate.is_empty());
+            }
+            other => panic!("expected Effect, got {:?}", other),
+        }
+        assert_eq!(p.items[0].layer(), Layer::Imperative);
+    }
+
+    #[test]
+    fn effect_with_mutates_list() {
+        let p = parse_str("#effect tick() #mutates: [Counter, Logger] { }")
+            .expect("parse #effect tick");
+        match &p.items[0] {
+            Item::Effect(EffectDecl { name, mutates, .. }) => {
+                assert_eq!(name, "tick");
+                assert_eq!(mutates, &vec!["Counter".to_string(), "Logger".to_string()]);
+            }
+            other => panic!("expected Effect, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn effect_with_mutates_and_cannot_mutate() {
+        let p = parse_str(
+            "#effect tick() \
+             #mutates: [Counter, Logger] \
+             #cannot_mutate: [Boot] \
+             { }",
+        )
+        .expect("parse #effect with both clauses");
+        match &p.items[0] {
+            Item::Effect(EffectDecl {
+                mutates,
+                cannot_mutate,
+                ..
+            }) => {
+                assert_eq!(mutates, &vec!["Counter".to_string(), "Logger".to_string()]);
+                assert_eq!(cannot_mutate, &vec!["Boot".to_string()]);
+            }
+            other => panic!("expected Effect, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn effect_requires_mutates() {
+        // Per §2.5 notes, `#effect` requires `#mutates` (may be empty list).
+        let err = parse_str("#effect noop() { }").expect_err("missing #mutates should error");
+        assert!(matches!(
+            err,
+            ParseError::Expected {
+                expected: "`#mutates: [...]` clause is required for `#effect`",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn interrupt_with_priority_high() {
+        let p = parse_str("#interrupt USART1_IRQHandler() #mutates: [UartRx] #priority: HIGH { }")
+            .expect("parse #interrupt");
+        match &p.items[0] {
+            Item::Interrupt(InterruptDecl {
+                name,
+                mutates,
+                priority,
+                ..
+            }) => {
+                assert_eq!(name, "USART1_IRQHandler");
+                assert_eq!(mutates, &vec!["UartRx".to_string()]);
+                assert_eq!(*priority, PriorityLevel::High);
+            }
+            other => panic!("expected Interrupt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn interrupt_with_numeric_priority() {
+        let p = parse_str("#interrupt SysTick_Handler() #mutates: [Sched] #priority: 7 { }")
+            .expect("parse #interrupt with numeric priority");
+        match &p.items[0] {
+            Item::Interrupt(InterruptDecl { priority, .. }) => {
+                assert_eq!(*priority, PriorityLevel::Numeric("7".into()));
+            }
+            other => panic!("expected Interrupt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn interrupt_requires_priority() {
+        let err =
+            parse_str("#interrupt UART_RX() #mutates: [UartRx] { }").expect_err("missing #priority");
+        assert!(matches!(
+            err,
+            ParseError::Expected {
+                expected: "`#priority: …` clause is required for `#interrupt`",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn interrupt_priority_rejects_random_ident() {
+        let err = parse_str(
+            "#interrupt X() #mutates: [A] #priority: SUPER_DUPER_HIGH { }",
+        )
+        .expect_err("random ident is not a valid priority level");
+        assert!(matches!(
+            err,
+            ParseError::Expected {
+                expected: "`LOW`, `MEDIUM`, `HIGH`, or integer literal as `#priority` value",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn interface_decl() {
+        let p = parse_str("#interface Serial { }").expect("parse #interface");
+        match &p.items[0] {
+            Item::Interface(InterfaceDecl { name, .. }) => assert_eq!(name, "Serial"),
+            other => panic!("expected Interface, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn impl_decl() {
+        let p = parse_str("#impl Serial for Usart1 { }").expect("parse #impl");
+        match &p.items[0] {
+            Item::Impl(ImplDecl {
+                interface_name,
+                automaton_name,
+                ..
+            }) => {
+                assert_eq!(interface_name, "Serial");
+                assert_eq!(automaton_name, "Usart1");
+            }
+            other => panic!("expected Impl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn impl_requires_for() {
+        let err = parse_str("#impl Serial Usart1 { }").expect_err("missing `for`");
+        assert!(matches!(
+            err,
+            ParseError::Expected {
+                expected: "`for` between interface and automaton",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_decl_with_description() {
+        let p = parse_str(r#"#test "scheduler picks lowest vruntime" { }"#)
+            .expect("parse #test");
+        match &p.items[0] {
+            Item::Test(TestDecl { description, .. }) => {
+                assert_eq!(description, "scheduler picks lowest vruntime");
+            }
+            other => panic!("expected Test, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_decl_requires_string_description() {
+        let err = parse_str("#test foo { }").expect_err("non-string after #test");
+        assert!(matches!(
+            err,
+            ParseError::Expected {
+                expected: "string-literal description after `#test`",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn sequential_attr() {
+        let p = parse_str("@sequential(Boot, Counter);").expect("parse @sequential");
+        assert_eq!(p.items.len(), 1);
+        match &p.items[0] {
+            Item::Sequential(SequentialAttr { a, b, .. }) => {
+                assert_eq!(a, "Boot");
+                assert_eq!(b, "Counter");
+            }
+            other => panic!("expected Sequential, got {:?}", other),
+        }
+        assert_eq!(p.items[0].layer(), Layer::Functional);
+    }
+
+    #[test]
+    fn sequential_attr_needs_terminating_semi() {
+        let err = parse_str("@sequential(A, B)").expect_err("missing semicolon");
+        // Either UnexpectedEof or Expected — both acceptable here.
+        assert!(matches!(
+            err,
+            ParseError::UnexpectedEof { .. } | ParseError::Expected { .. }
+        ));
+    }
+
+    #[test]
+    fn realistic_blinky_skeleton() {
+        // The shape of `crates/examples/blinky` once it lands. Tests that
+        // all six new top-level forms coexist in a single program.
+        let src = "\
+            #automaton Counter { }\n\
+            #automaton Boot { }\n\
+            #effect tick() #mutates: [Counter] { }\n\
+            #interrupt USART1_IRQHandler() #mutates: [Counter] #priority: HIGH { }\n\
+            #interface Serial { }\n\
+            #impl Serial for Boot { }\n\
+            #test \"sanity\" { }\n\
+            @sequential(Boot, Counter);\n\
+            @fn main() { }\n\
+        ";
+        let p = parse_str(src).expect("parse blinky-shape");
+        assert_eq!(p.items.len(), 9);
+
+        // Spot-check the layer stamps.
+        let layers: Vec<Layer> = p.items.iter().map(|i| i.layer()).collect();
+        assert_eq!(
+            layers,
+            vec![
+                Layer::Imperative,  // #automaton Counter
+                Layer::Imperative,  // #automaton Boot
+                Layer::Imperative,  // #effect
+                Layer::Imperative,  // #interrupt
+                Layer::Imperative,  // #interface
+                Layer::Imperative,  // #impl
+                Layer::Imperative,  // #test
+                Layer::Functional,  // @sequential
+                Layer::Functional,  // @fn main
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_ident_list_is_valid_in_brackets() {
+        // `#mutates: []` is the canonical "pure effect" form.
+        let p = parse_str("#effect noop() #mutates: [] { }").unwrap();
+        assert!(matches!(
+            &p.items[0],
+            Item::Effect(EffectDecl { mutates, .. }) if mutates.is_empty()
+        ));
+    }
+
+    #[test]
+    fn ident_list_with_trailing_no_comma() {
+        // Single ident, no trailing comma.
+        let p = parse_str("#effect e() #mutates: [Solo] { }").unwrap();
+        match &p.items[0] {
+            Item::Effect(EffectDecl { mutates, .. }) => {
+                assert_eq!(mutates, &vec!["Solo".to_string()]);
+            }
+            other => panic!("expected Effect, got {:?}", other),
+        }
     }
 }
