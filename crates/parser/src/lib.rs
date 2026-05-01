@@ -55,9 +55,10 @@
 #![warn(missing_docs)]
 
 use clifford_ast::{
-    AccessType, ArraySize, ArrayType, AutomatonDecl, EffectDecl, FnDecl, FnType, ImplDecl,
-    InterfaceDecl, InterruptDecl, Item, Param, PathType, PriorityLevel, PrimitiveType, Program,
-    RefType, SequentialAttr, SliceType, TestDecl, TraitRef, TupleType, TypeExpr, TypeKind,
+    AccessType, ArraySize, ArrayType, AutomatonDecl, EffectDecl, Field, FnDecl, FnType,
+    GenericParam, ImplDecl, InterfaceDecl, InterruptDecl, Item, Param, PathType, PriorityLevel,
+    PrimitiveType, Program, RefType, SequentialAttr, SliceType, TestDecl, TraitRef, TupleType,
+    TypeBody, TypeDecl, TypeExpr, TypeKind, Variant, VariantData,
 };
 use clifford_lexer::{Span, Token, TokenKind};
 use thiserror::Error;
@@ -209,6 +210,7 @@ impl<'t> Parser<'t> {
         let lead = self.peek().clone();
         match lead.kind {
             TokenKind::KwAtFn => self.parse_fn_decl(lead.span.start).map(Item::Fn),
+            TokenKind::KwAtType => self.parse_type_decl(lead.span.start).map(Item::Type),
             TokenKind::KwHashAutomaton => {
                 self.parse_automaton_decl(lead.span.start).map(Item::Automaton)
             }
@@ -1006,14 +1008,262 @@ impl<'t> Parser<'t> {
 
     /// Parse a trait reference: `Name` or `Name<T1, T2>`.
     fn parse_trait_ref(&mut self) -> Result<TraitRef, ParseError> {
-        let (name, _) = self.expect_ident("trait name in trait list")?;
-        let generic_args = if matches!(self.peek().kind, TokenKind::Lt) {
-            let (args, _) = self.parse_generic_args()?;
-            args
+        let (name, name_span) = self.expect_ident("trait name in trait list")?;
+        let (generic_args, end) = if matches!(self.peek().kind, TokenKind::Lt) {
+            let (args, args_end) = self.parse_generic_args()?;
+            (args, args_end)
+        } else {
+            (Vec::new(), name_span.end)
+        };
+        Ok(TraitRef {
+            name,
+            generic_args,
+            span: Span::new(name_span.start, end),
+        })
+    }
+
+    // ─── @type declarations (§2.3) ────────────────────────────────────────
+
+    /// Parse `@type Name<T, U> = TypeExpr;` (alias) or
+    /// `@type Name<T, U> = | A | B(T) | C { f: T };` (ADT).
+    fn parse_type_decl(&mut self, start: usize) -> Result<TypeDecl, ParseError> {
+        self.advance(); // `@type`
+        let (name, _) = self.expect_ident("type name after `@type`")?;
+        let generic_params = if matches!(self.peek().kind, TokenKind::Lt) {
+            self.parse_generic_params()?
         } else {
             Vec::new()
         };
-        Ok(TraitRef { name, generic_args })
+        self.expect(TokenKind::Eq, "`=` after `@type` name")?;
+        let body = self.parse_type_body()?;
+        let close = self.expect(TokenKind::Semi, "`;` to terminate `@type` declaration")?;
+        Ok(TypeDecl {
+            name,
+            generic_params,
+            body,
+            span: Span::new(start, close.end),
+        })
+    }
+
+    /// Parse the right-hand side of an `@type`: either a single type
+    /// expression (alias) or a sequence of variants separated by `|` (ADT).
+    ///
+    /// Disambiguation strategy: peek the leading token.
+    /// - `|` is an unambiguous ADT signal (canonical form per §2.3).
+    /// - Otherwise, parse as a `TypeExpr` and inspect what follows. If the
+    ///   next token is `;`, it was an alias. If it's `|`, `(`, or `{`, the
+    ///   `TypeExpr` we just parsed should have been a variant header — we
+    ///   rewind the cursor and re-parse as ADT.
+    fn parse_type_body(&mut self) -> Result<TypeBody, ParseError> {
+        if matches!(self.peek().kind, TokenKind::Pipe) {
+            return self.parse_adt_body();
+        }
+        let saved = self.pos;
+        let ty = match self.parse_type() {
+            Ok(t) => t,
+            Err(_) => {
+                // Couldn't parse as a type — rewind and try ADT (the leading
+                // ident might be a unit-only variant name like `Red`).
+                self.pos = saved;
+                return self.parse_adt_body();
+            }
+        };
+        match self.peek().kind {
+            TokenKind::Semi => Ok(TypeBody::Alias(ty)),
+            TokenKind::Pipe | TokenKind::LParen | TokenKind::LBrace => {
+                // It's an ADT; the parsed TypeExpr was actually the first
+                // variant's name (and possibly the start of its data shape).
+                self.pos = saved;
+                self.parse_adt_body()
+            }
+            TokenKind::Eof => Err(ParseError::UnexpectedEof {
+                context: "`@type` body (expected `;` to end alias)",
+            }),
+            _ => {
+                let t = self.peek().clone();
+                Err(ParseError::Expected {
+                    expected: "`;` (end alias) or `|` / `(` / `{` (start ADT variant)",
+                    found: t.kind,
+                    at: t.span.start,
+                })
+            }
+        }
+    }
+
+    /// Parse `(|)? Variant (| Variant)*`.
+    fn parse_adt_body(&mut self) -> Result<TypeBody, ParseError> {
+        if matches!(self.peek().kind, TokenKind::Pipe) {
+            self.advance(); // optional leading `|`
+        }
+        let mut variants = Vec::new();
+        loop {
+            variants.push(self.parse_variant()?);
+            if matches!(self.peek().kind, TokenKind::Pipe) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        Ok(TypeBody::Adt(variants))
+    }
+
+    /// Parse one ADT variant: `Name` | `Name(T1, T2, …)` | `Name { f1: T1, … }`.
+    fn parse_variant(&mut self) -> Result<Variant, ParseError> {
+        let start = self.peek().span.start;
+        let (name, name_span) = self.expect_ident("variant name")?;
+        let (data, end) = match self.peek().kind {
+            TokenKind::LParen => {
+                self.advance(); // `(`
+                let mut elements = Vec::new();
+                if !matches!(self.peek().kind, TokenKind::RParen) {
+                    loop {
+                        elements.push(self.parse_type()?);
+                        match self.peek().kind {
+                            TokenKind::Comma => {
+                                self.advance();
+                                if matches!(self.peek().kind, TokenKind::RParen) {
+                                    break;
+                                }
+                            }
+                            TokenKind::RParen => break,
+                            TokenKind::Eof => {
+                                return Err(ParseError::UnexpectedEof {
+                                    context: "tuple-style variant payload",
+                                });
+                            }
+                            _ => {
+                                let t = self.peek().clone();
+                                return Err(ParseError::Expected {
+                                    expected: "`,` or `)` in tuple-style variant",
+                                    found: t.kind,
+                                    at: t.span.start,
+                                });
+                            }
+                        }
+                    }
+                }
+                let close = self.expect(TokenKind::RParen, "`)` to close tuple-style variant")?;
+                (VariantData::Tuple(elements), close.end)
+            }
+            TokenKind::LBrace => {
+                self.advance(); // `{`
+                let mut fields = Vec::new();
+                if !matches!(self.peek().kind, TokenKind::RBrace) {
+                    loop {
+                        fields.push(self.parse_field()?);
+                        match self.peek().kind {
+                            TokenKind::Comma => {
+                                self.advance();
+                                if matches!(self.peek().kind, TokenKind::RBrace) {
+                                    break;
+                                }
+                            }
+                            TokenKind::RBrace => break,
+                            TokenKind::Eof => {
+                                return Err(ParseError::UnexpectedEof {
+                                    context: "struct-style variant fields",
+                                });
+                            }
+                            _ => {
+                                let t = self.peek().clone();
+                                return Err(ParseError::Expected {
+                                    expected: "`,` or `}` in struct-style variant",
+                                    found: t.kind,
+                                    at: t.span.start,
+                                });
+                            }
+                        }
+                    }
+                }
+                let close = self.expect(TokenKind::RBrace, "`}` to close struct-style variant")?;
+                (VariantData::Struct(fields), close.end)
+            }
+            _ => (VariantData::None, name_span.end),
+        };
+        Ok(Variant {
+            name,
+            data,
+            span: Span::new(start, end),
+        })
+    }
+
+    /// Parse `name: TypeExpr` — used in struct-style variants and (later)
+    /// in `#automaton` field declarations.
+    fn parse_field(&mut self) -> Result<Field, ParseError> {
+        let start = self.peek().span.start;
+        let (name, _) = self.expect_ident("field name")?;
+        self.expect(TokenKind::Colon, "`:` between field name and type")?;
+        let ty = self.parse_type()?;
+        let end = ty.span.end;
+        Ok(Field {
+            name,
+            ty,
+            span: Span::new(start, end),
+        })
+    }
+
+    // ─── Generic parameter declarations (§2.2) ────────────────────────────
+
+    /// Parse `<T, U: Pure + Readable, V>` — generic parameter list.
+    fn parse_generic_params(&mut self) -> Result<Vec<GenericParam>, ParseError> {
+        self.expect(TokenKind::Lt, "`<` to open generic parameter list")?;
+        let mut params = Vec::new();
+        if matches!(self.peek().kind, TokenKind::Gt) {
+            self.advance();
+            return Ok(params);
+        }
+        loop {
+            params.push(self.parse_generic_param()?);
+            match self.peek().kind {
+                TokenKind::Comma => {
+                    self.advance();
+                    if matches!(self.peek().kind, TokenKind::Gt) {
+                        self.advance();
+                        return Ok(params);
+                    }
+                }
+                TokenKind::Gt => {
+                    self.advance();
+                    return Ok(params);
+                }
+                TokenKind::Eof => {
+                    return Err(ParseError::UnexpectedEof {
+                        context: "generic parameter list",
+                    });
+                }
+                _ => {
+                    let t = self.peek().clone();
+                    return Err(ParseError::Expected {
+                        expected: "`,` or `>` in generic parameter list",
+                        found: t.kind,
+                        at: t.span.start,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Parse one generic parameter: `T` or `T: Bound + Bound`.
+    fn parse_generic_param(&mut self) -> Result<GenericParam, ParseError> {
+        let start = self.peek().span.start;
+        let (name, name_span) = self.expect_ident("generic parameter name")?;
+        let (bounds, end) = if matches!(self.peek().kind, TokenKind::Colon) {
+            self.advance();
+            let mut bounds = vec![self.parse_trait_ref()?];
+            while matches!(self.peek().kind, TokenKind::Plus) {
+                self.advance();
+                bounds.push(self.parse_trait_ref()?);
+            }
+            let last_end = bounds.last().expect("just pushed").span.end;
+            (bounds, last_end)
+        } else {
+            (Vec::new(), name_span.end)
+        };
+        Ok(GenericParam {
+            name,
+            bounds,
+            span: Span::new(start, end),
+        })
     }
 }
 
@@ -1753,7 +2003,7 @@ mod tests {
         match ty.kind {
             TypeKind::Fn(FnType { trait_list, .. }) => {
                 assert_eq!(trait_list.len(), 1);
-                let TraitRef { name, generic_args } = &trait_list[0];
+                let TraitRef { name, generic_args, .. } = &trait_list[0];
                 assert_eq!(name, "Iterator");
                 assert_eq!(generic_args.len(), 1);
                 assert_eq!(
@@ -2151,6 +2401,261 @@ mod tests {
                 assert!(return_type.is_some());
             }
             other => panic!("expected Interrupt, got {:?}", other),
+        }
+    }
+
+    // ─── Slice 5: @type aliases and ADTs (§2.3) ──────────────────────────
+
+    use clifford_ast::{GenericParam, TypeBody, TypeDecl, VariantData};
+
+    #[test]
+    fn type_alias_simple() {
+        let p = parse_str("@type ByteAlias = u8;").expect("parse alias");
+        match &p.items[0] {
+            Item::Type(TypeDecl {
+                name,
+                generic_params,
+                body,
+                ..
+            }) => {
+                assert_eq!(name, "ByteAlias");
+                assert!(generic_params.is_empty());
+                match body {
+                    TypeBody::Alias(ty) => {
+                        assert_eq!(ty.kind, TypeKind::Primitive(PrimitiveType::U8));
+                    }
+                    other => panic!("expected Alias, got {:?}", other),
+                }
+            }
+            other => panic!("expected Type, got {:?}", other),
+        }
+        assert_eq!(p.items[0].layer(), Layer::Functional);
+    }
+
+    #[test]
+    fn type_alias_complex() {
+        let p = parse_str("@type Buf = &[u8; 64];").expect("parse complex alias");
+        match &p.items[0] {
+            Item::Type(TypeDecl {
+                body: TypeBody::Alias(ty),
+                ..
+            }) => {
+                assert!(matches!(ty.kind, TypeKind::Ref(_)));
+            }
+            other => panic!("expected Type/Alias, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn type_adt_unit_variants() {
+        let p = parse_str("@type Color = Red | Green | Blue;").expect("parse C-style enum");
+        match &p.items[0] {
+            Item::Type(TypeDecl {
+                body: TypeBody::Adt(variants),
+                ..
+            }) => {
+                let names: Vec<_> = variants.iter().map(|v| v.name.as_str()).collect();
+                assert_eq!(names, vec!["Red", "Green", "Blue"]);
+                for v in variants {
+                    assert!(matches!(v.data, VariantData::None));
+                }
+            }
+            other => panic!("expected Type/Adt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn type_adt_with_leading_pipe() {
+        let p = parse_str("@type Color = | Red | Green | Blue;").expect("parse leading-pipe ADT");
+        match &p.items[0] {
+            Item::Type(TypeDecl {
+                body: TypeBody::Adt(variants),
+                ..
+            }) => assert_eq!(variants.len(), 3),
+            other => panic!("expected Type/Adt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn type_adt_tuple_variants() {
+        let p = parse_str("@type Result = | Ok(u32) | Err(bool);").expect("parse Result-shape");
+        match &p.items[0] {
+            Item::Type(TypeDecl {
+                body: TypeBody::Adt(variants),
+                ..
+            }) => {
+                assert_eq!(variants.len(), 2);
+                match &variants[0].data {
+                    VariantData::Tuple(types) => {
+                        assert_eq!(types.len(), 1);
+                        assert_eq!(types[0].kind, TypeKind::Primitive(PrimitiveType::U32));
+                    }
+                    other => panic!("expected Tuple variant, got {:?}", other),
+                }
+                match &variants[1].data {
+                    VariantData::Tuple(types) => {
+                        assert_eq!(types[0].kind, TypeKind::Primitive(PrimitiveType::Bool));
+                    }
+                    other => panic!("expected Tuple variant, got {:?}", other),
+                }
+            }
+            other => panic!("expected Type/Adt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn type_adt_struct_variants() {
+        let p = parse_str("@type Shape = | Circle { r: f32 } | Square { side: f32 };")
+            .expect("parse struct-style variants");
+        match &p.items[0] {
+            Item::Type(TypeDecl {
+                body: TypeBody::Adt(variants),
+                ..
+            }) => {
+                assert_eq!(variants.len(), 2);
+                match &variants[0].data {
+                    VariantData::Struct(fields) => {
+                        assert_eq!(fields.len(), 1);
+                        assert_eq!(fields[0].name, "r");
+                    }
+                    other => panic!("expected Struct variant, got {:?}", other),
+                }
+            }
+            other => panic!("expected Type/Adt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn type_adt_mixed_variant_kinds() {
+        let p = parse_str(
+            "@type Event = Tick | Tx(u8) | Reading { ch: u8, value: u16 } | Halt;",
+        )
+        .expect("parse mixed-kinds ADT");
+        match &p.items[0] {
+            Item::Type(TypeDecl {
+                body: TypeBody::Adt(variants),
+                ..
+            }) => {
+                assert_eq!(variants.len(), 4);
+                assert!(matches!(variants[0].data, VariantData::None));
+                assert!(matches!(variants[1].data, VariantData::Tuple(_)));
+                assert!(matches!(variants[2].data, VariantData::Struct(_)));
+                assert!(matches!(variants[3].data, VariantData::None));
+            }
+            other => panic!("expected Type/Adt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn type_with_generic_params() {
+        let p = parse_str("@type Result<T, E> = | Ok(T) | Err(E);").expect("parse generic ADT");
+        match &p.items[0] {
+            Item::Type(TypeDecl {
+                generic_params,
+                body: TypeBody::Adt(variants),
+                ..
+            }) => {
+                let names: Vec<_> = generic_params.iter().map(|p| p.name.as_str()).collect();
+                assert_eq!(names, vec!["T", "E"]);
+                for p in generic_params {
+                    assert!(p.bounds.is_empty());
+                }
+                assert_eq!(variants.len(), 2);
+            }
+            other => panic!("expected Type/Adt with generics, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn type_with_bounded_generic_params() {
+        let p = parse_str("@type Wrapper<T: Pure + Readable> = T;")
+            .expect("parse bounded generic alias");
+        match &p.items[0] {
+            Item::Type(TypeDecl { generic_params, .. }) => {
+                assert_eq!(generic_params.len(), 1);
+                let GenericParam { name, bounds, .. } = &generic_params[0];
+                assert_eq!(name, "T");
+                let bound_names: Vec<_> = bounds.iter().map(|b| b.name.as_str()).collect();
+                assert_eq!(bound_names, vec!["Pure", "Readable"]);
+            }
+            other => panic!("expected Type with bounded generic, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn type_alias_must_end_in_semi() {
+        let err = parse_str("@type Foo = u32").expect_err("missing `;`");
+        assert!(matches!(err, ParseError::UnexpectedEof { .. }));
+    }
+
+    #[test]
+    fn type_decl_must_have_eq() {
+        let err = parse_str("@type Foo u32;").expect_err("missing `=`");
+        assert!(matches!(
+            err,
+            ParseError::Expected {
+                expected: "`=` after `@type` name",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn struct_variant_field_requires_colon() {
+        let err = parse_str("@type Foo = Bar { x };").expect_err("field missing colon");
+        assert!(matches!(
+            err,
+            ParseError::Expected {
+                expected: "`:` between field name and type",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn nested_adt_in_alias() {
+        // A type alias whose RHS is itself a path that would look like an
+        // ADT variant if not for the generic args (`Result<u32, bool>`).
+        let p = parse_str("@type IntOrBool = Result<u32, bool>;")
+            .expect("parse alias to generic path");
+        match &p.items[0] {
+            Item::Type(TypeDecl {
+                body: TypeBody::Alias(ty),
+                ..
+            }) => match &ty.kind {
+                TypeKind::Path(PathType {
+                    segments,
+                    generic_args,
+                }) => {
+                    assert_eq!(segments, &vec!["Result".to_string()]);
+                    assert_eq!(generic_args.len(), 2);
+                }
+                other => panic!("expected Path alias, got {:?}", other),
+            },
+            other => panic!("expected Type/Alias, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn variant_with_trailing_comma() {
+        let p = parse_str("@type T = Foo(u8, u16,) | Bar { f: u8, };")
+            .expect("trailing commas allowed");
+        match &p.items[0] {
+            Item::Type(TypeDecl {
+                body: TypeBody::Adt(variants),
+                ..
+            }) => {
+                assert_eq!(variants.len(), 2);
+                match &variants[0].data {
+                    VariantData::Tuple(t) => assert_eq!(t.len(), 2),
+                    _ => panic!(),
+                }
+                match &variants[1].data {
+                    VariantData::Struct(f) => assert_eq!(f.len(), 1),
+                    _ => panic!(),
+                }
+            }
+            _ => panic!(),
         }
     }
 

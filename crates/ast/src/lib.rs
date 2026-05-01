@@ -101,6 +101,8 @@ pub enum Item {
     Fn(FnDecl),
     /// An `#automaton` declaration.
     Automaton(AutomatonDecl),
+    /// An `@type` declaration: type alias or ADT (sum type).
+    Type(TypeDecl),
     /// An `#effect` declaration (top-level per Refinement #5a).
     Effect(EffectDecl),
     /// An `#interrupt` declaration. Differs from `#effect` in that the name
@@ -130,7 +132,7 @@ impl Item {
     #[must_use]
     pub fn layer(&self) -> Layer {
         match self {
-            Self::Fn(_) | Self::Sequential(_) => Layer::Functional,
+            Self::Fn(_) | Self::Type(_) | Self::Sequential(_) => Layer::Functional,
             Self::Automaton(_)
             | Self::Effect(_)
             | Self::Interrupt(_)
@@ -146,6 +148,7 @@ impl Item {
     pub fn span(&self) -> Span {
         match self {
             Self::Fn(d) => d.span,
+            Self::Type(d) => d.span,
             Self::Automaton(d) => d.span,
             Self::Effect(d) => d.span,
             Self::Interrupt(d) => d.span,
@@ -312,6 +315,87 @@ pub struct TestDecl {
     /// Test description from the string literal.
     pub description: String,
     /// Source span covering the full declaration.
+    pub span: Span,
+}
+
+/// An `@type Name<T> = …;` declaration (§2.3).
+///
+/// The body is either a type alias (single `TypeExpr`) or an algebraic data
+/// type (sum-of-variants). Generic parameters are optional (`Vec` is empty
+/// for monomorphic declarations).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeDecl {
+    /// The type's name.
+    pub name: String,
+    /// Generic parameters in declaration order. Empty for non-generic types.
+    pub generic_params: Vec<GenericParam>,
+    /// Either an alias body (`= TypeExpr`) or an ADT body (`= | A | B(T) | C { f: T }`).
+    pub body: TypeBody,
+    /// Source span covering `@type Name<…> = …;` end-to-end.
+    pub span: Span,
+}
+
+/// The right-hand side of an `@type` declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypeBody {
+    /// `@type Foo = u32;` — a type alias.
+    Alias(TypeExpr),
+    /// `@type Foo = | A | B(T) | C { f: T };` — an algebraic data type.
+    /// Always at least one variant; the leading `|` in source is optional
+    /// per §2.3 grammar but the AST does not preserve whether it was present.
+    Adt(Vec<Variant>),
+}
+
+/// A variant in an ADT body (§2.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Variant {
+    /// Variant name.
+    pub name: String,
+    /// Variant data: none (unit-like), tuple-style, or struct-style.
+    pub data: VariantData,
+    /// Source span covering the whole variant (`Name`, `Name(T1, T2)`, or
+    /// `Name { f1: T1, f2: T2 }`).
+    pub span: Span,
+}
+
+/// The data carried by an ADT variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VariantData {
+    /// `Name` — unit-like variant with no payload.
+    None,
+    /// `Name(T1, T2, …)` — tuple-style variant. Always at least one type;
+    /// for zero types use `VariantData::None` (don't write `Name()`).
+    Tuple(Vec<TypeExpr>),
+    /// `Name { f1: T1, f2: T2, … }` — struct-style variant.
+    Struct(Vec<Field>),
+}
+
+/// A named, typed field — used in struct-style ADT variants and (later, when
+/// `#automaton` member parsing lands) in automaton field declarations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Field {
+    /// Field name.
+    pub name: String,
+    /// Field type.
+    pub ty: TypeExpr,
+    /// Source span covering `name: type`.
+    pub span: Span,
+}
+
+/// A generic parameter declaration: `T` or `T: Pure + Readable`.
+///
+/// Per §2.2 the spec form is `ident (':' trait_bound)?` where `trait_bound`
+/// is a sequence of trait references separated by `+`. We use [`TraitRef`]
+/// directly for the bounds rather than the spec's `type_expr` form because
+/// non-trait types in bound position are nonsense; the type checker would
+/// reject them anyway, so the parser rejects them here instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenericParam {
+    /// Parameter name.
+    pub name: String,
+    /// Trait bounds. Empty for unbounded parameters.
+    pub bounds: Vec<TraitRef>,
+    /// Source span covering `name (: bound + bound)?` end-to-end.
     pub span: Span,
 }
 
@@ -507,6 +591,8 @@ pub struct TraitRef {
     /// Generic arguments to the trait, if any (e.g., `Iterator<Item = T>`
     /// would be `Iterator<T>` in v0.1's simpler form).
     pub generic_args: Vec<TypeExpr>,
+    /// Source span covering `Name` or `Name<T1, T2>` end-to-end.
+    pub span: Span,
 }
 
 #[cfg(test)]
