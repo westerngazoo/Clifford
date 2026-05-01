@@ -10,7 +10,11 @@ description = "Type checker for the Clifford compiler. Implements §4 (Type Syst
 
 [dependencies]
 clifford-ast.workspace = true
+clifford-lexer.workspace = true
 clifford-resolve.workspace = true
 thiserror.workspace = true
 
-# dev-deps added back per-PR as needed.
+[dev-dependencies]
+# Tests parse + resolve Clifford source to exercise typing end-to-end.
+clifford-lexer.workspace = true
+clifford-parser.workspace = true

@@ -7,6 +7,50 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Phase 1 type checker slice 1: literal-type inference + primitive expression typing (2026-05-01)
+
+- `clifford-types`: first real implementation. Public entry point
+  `infer(&Program, &Resolution) -> Result<Typing, Vec<TypeError>>`.
+  Walks every `@fn` / `#effect` / `#interrupt` / `#transition` body and
+  assigns a `Type` to each expression node, recording the result in
+  `Typing.types: HashMap<Span, Type>`.
+- New types: `Type` (`Unit` / `Primitive(PrimitiveType)` / `StringSlice` /
+  `Unknown(reason)`), `Typing`, `TypeError`. `Type` carries display,
+  numeric-classification, and unknown-detection helpers.
+- Literal typing with suffix recognition: integer literals default to `i32`
+  but honor `u8` / `u16` / `u32` / `u64` / `usize` / `i8` / `i16` / `i32` /
+  `i64` / `isize` suffixes; hex/binary literals share the integer suffix
+  rules; float literals default to `f64`, honor `f32`. Char/byte/string/
+  bool/null literals get their canonical types.
+- Path resolution to primitive types via the resolver's local-binding info:
+  parameters carry their declared types; `let`-bindings use the annotation
+  if present, otherwise the initializer's inferred type; `let :=` short
+  bindings use the initializer's type.
+- Unary operator typing per §4: `-` on numeric, `!` on bool, `~` on integer,
+  `*` deferred to slice T2 (needs reference types). Type-mismatches emit
+  `E0511`.
+- Binary operator typing per §4: arithmetic (`+ - * / %`) on same numeric
+  type, comparison (`== != < <= > >=`) returning bool with broad operand
+  set, logical (`&& ||`) on bool, bitwise (`& | ^`) on same integer type,
+  shift (`<< >>`) returning lhs type. Mismatches emit `E0510`.
+- `let name: T = expr;` annotation/initializer compatibility checking
+  (E0512); `Unknown` types treated as compatible with anything to avoid
+  cascading errors when an upstream type isn't yet computable.
+- `as` cast trusts the user-asserted target type (validity check is
+  `clifford-check`'s slice 2 work).
+- Narrow unsafe primitives type to their type-argument: `#unchecked_load<T>`,
+  `#volatile_load<T>`, `#unchecked_cast<S, T>` all return `T`.
+- Forward-compat: `Type` enum is not `#[non_exhaustive]` (small closed
+  set), but `Type::Unknown(&'static str)` carries deferred-reason strings
+  so consumers can produce specific diagnostics about *why* a type is
+  unknown rather than treating Unknown as a generic failure.
+- 45 unit tests + 1 doctest covering: every literal kind with default and
+  suffixed forms, path-via-local typing, all unary forms (positive +
+  mismatch), all binary categories (positive + mismatch), cast,
+  let-annotation match/mismatch, unknown-initializer-doesn't-spuriously-
+  error, narrow unsafe primitive return types, multiple-error collection,
+  realistic 2-item program, and Type::display formatting.
+
 ### Added — Phase 1 resolver slice 3: transitions, Self, ProcCall, field validation (2026-05-01)
 
 - `clifford-resolve`: walks `#automaton.transitions[].body` with the
