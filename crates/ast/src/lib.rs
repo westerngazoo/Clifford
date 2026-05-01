@@ -165,11 +165,10 @@ impl Item {
     }
 }
 
-/// An `@fn name(params) -> T $ [TraitList] { … }` declaration.
+/// An `@fn name(params) -> T $ [TraitList] { body }` declaration.
 ///
-/// Slice-4 scope: name, value parameters, optional return type, optional
-/// trait list, span. Generic parameters, where-clause, extern modifier,
-/// and body content arrive in subsequent slices.
+/// Slice-7 wires in real body parsing. Generic parameters, where-clause,
+/// and extern modifier still arrive in subsequent slices.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FnDecl {
     /// The function's name.
@@ -183,7 +182,9 @@ pub struct FnDecl {
     /// `$ [...]` clause appears in source. Per Emergent Rule 2, an empty
     /// trait list at the AST level is interpreted as `[Pure]` by `clifford-types`.
     pub trait_list: Vec<TraitRef>,
-    /// Source span covering `@fn name(params) -> T $ [...] { }` end-to-end.
+    /// Function body — sequence of statements per §2.6.
+    pub body: Block,
+    /// Source span covering `@fn name(params) -> T $ [...] { body }` end-to-end.
     pub span: Span,
 }
 
@@ -237,6 +238,8 @@ pub struct EffectDecl {
     pub mutates: Vec<String>,
     /// Automaton names listed in `#cannot_mutate: [...]`. Optional.
     pub cannot_mutate: Vec<String>,
+    /// Effect body — sequence of statements.
+    pub body: Block,
     /// Source span covering the full declaration end-to-end.
     pub span: Span,
 }
@@ -263,6 +266,8 @@ pub struct InterruptDecl {
     pub mutates: Vec<String>,
     /// Required `#priority: …` per §2.5 effect_meta requirements for `#interrupt`.
     pub priority: PriorityLevel,
+    /// Interrupt handler body — sequence of statements.
+    pub body: Block,
     /// Source span covering the full declaration.
     pub span: Span,
 }
@@ -661,6 +666,412 @@ pub struct TraitRef {
     pub span: Span,
 }
 
+// ─── Expressions and statements (§2.6) ───────────────────────────────────────
+
+/// A value expression.
+///
+/// Implements §2.6 of `CLIFFORD_SPEC.md` — the full expression grammar.
+/// Recursive (expressions contain expressions), so the recursive arms wrap
+/// their children in `Box`. The variant is tagged on `ExprKind`; `Expr`
+/// itself adds the source span shared by every node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Expr {
+    /// What kind of expression this is.
+    pub kind: ExprKind,
+    /// Source span covering the whole expression.
+    pub span: Span,
+}
+
+/// An expression variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExprKind {
+    /// Decimal integer literal (raw text, with optional type suffix).
+    IntLit(String),
+    /// Hex integer literal `0x…`.
+    HexLit(String),
+    /// Binary integer literal `0b…`.
+    BinLit(String),
+    /// Float literal.
+    FloatLit(String),
+    /// `'X'` character literal.
+    CharLit(char),
+    /// `b'X'` byte literal (Decision #19).
+    ByteLit(u8),
+    /// `"…"` string literal.
+    StringLit(String),
+    /// `true` / `false`.
+    BoolLit(bool),
+    /// `null` — context-typed null access literal (Decision #19).
+    Null,
+
+    /// A name or `::`-separated path: `foo`, `Result::Ok`,
+    /// `clifford::core::option`. The parser produces this for both single
+    /// idents and multi-segment paths; the resolver decides whether the
+    /// path resolves to a binding, an automaton state (Refinement #5d
+    /// `Auto::Name`), a constructor, or something else.
+    Path(Vec<String>),
+
+    /// `Auto@state` — read the current state-tag of an automaton
+    /// (Refinement #5d). The parser captures the automaton name; the
+    /// resolver verifies it refers to an in-scope multi-state automaton.
+    StateRead(String),
+
+    /// Parenthesised single expression. Distinguished from a 1-tuple
+    /// (which doesn't exist; use `Tuple(vec![one])` only for ≥ 2 elements).
+    /// Preserved so round-tripping reproduces source.
+    Paren(Box<Expr>),
+
+    /// Tuple expression `(a, b, c)`. Always at least 2 elements; the
+    /// 1-element case is a `Paren`.
+    Tuple(Vec<Expr>),
+
+    /// Array literal `[a, b, c]`.
+    Array(Vec<Expr>),
+
+    /// Array repeat literal `[expr; count]`.
+    ArrayRepeat {
+        /// The repeated value.
+        value: Box<Expr>,
+        /// The number of repetitions; must be a const-evaluable expression
+        /// (the type checker enforces this).
+        count: Box<Expr>,
+    },
+
+    /// `obj.field` — field access (no method call; that's `MethodCall`).
+    FieldAccess {
+        /// The receiver expression.
+        obj: Box<Expr>,
+        /// The field name.
+        field: String,
+    },
+
+    /// `obj[index]` — indexing.
+    Index {
+        /// The collection expression.
+        obj: Box<Expr>,
+        /// The index expression.
+        index: Box<Expr>,
+    },
+
+    /// `f(a, b, …)` — function or callable invocation.
+    Call {
+        /// The callee expression (typically a path).
+        callee: Box<Expr>,
+        /// Argument expressions in source order.
+        args: Vec<Expr>,
+    },
+
+    /// `obj.method(a, b, …)` — method call.
+    MethodCall {
+        /// The receiver expression.
+        obj: Box<Expr>,
+        /// The method name.
+        method: String,
+        /// Argument expressions in source order.
+        args: Vec<Expr>,
+    },
+
+    /// Prefix unary: `-x`, `!x`, `~x`, `*x`.
+    Unary {
+        /// Which prefix operator.
+        op: UnaryOp,
+        /// The operand.
+        operand: Box<Expr>,
+    },
+
+    /// Borrow expression: `&x` (immutable) or `&mut x`. Per Decision #13
+    /// Rule 0, `&mut` of an automaton field is rejected by `clifford-check`,
+    /// not by the parser — we accept it and let the later phase reject.
+    Ref {
+        /// `true` for `&mut x`.
+        mutable: bool,
+        /// The operand being borrowed.
+        operand: Box<Expr>,
+    },
+
+    /// Binary expression: `lhs op rhs`.
+    Binary {
+        /// Which binary operator.
+        op: BinaryOp,
+        /// Left operand.
+        lhs: Box<Expr>,
+        /// Right operand.
+        rhs: Box<Expr>,
+    },
+
+    /// `expr as Type` — cast expression.
+    Cast {
+        /// The value being cast.
+        value: Box<Expr>,
+        /// The target type.
+        ty: TypeExpr,
+    },
+
+    /// `lo..hi` (half-open) or `lo..=hi` (inclusive). For sigma loops
+    /// (Decision #14), both endpoints are typically present; the
+    /// open-ended forms `..hi` / `lo..` / `..` are not yet supported.
+    Range {
+        /// Lower bound.
+        lo: Box<Expr>,
+        /// Upper bound.
+        hi: Box<Expr>,
+        /// `true` for `..=`, `false` for `..`.
+        inclusive: bool,
+    },
+
+    /// `#unchecked_load<T>(p)` — Decision #17 narrow unsafe primitive.
+    UncheckedLoad {
+        /// The element type being loaded.
+        ty: TypeExpr,
+        /// The access pointer expression.
+        ptr: Box<Expr>,
+    },
+
+    /// `#volatile_load<T>(p)` — Decision #17.
+    VolatileLoad {
+        /// The element type being loaded.
+        ty: TypeExpr,
+        /// The access pointer expression.
+        ptr: Box<Expr>,
+    },
+
+    /// `#unchecked_cast<S, T>("reason", value)` — Decision #17 + Refinement #19a.
+    /// The mandatory reason string is preserved on the AST and emitted to the
+    /// audit log by `cliffordc audit --list-unsafe`.
+    UncheckedCast {
+        /// Source type.
+        from_ty: TypeExpr,
+        /// Target type.
+        to_ty: TypeExpr,
+        /// Mandatory non-empty reason string per Refinement #19a.
+        reason: String,
+        /// The value being cast.
+        value: Box<Expr>,
+    },
+
+    /// `#unchecked_offset<T>(p, n)` — Decision #19 pointer arithmetic.
+    UncheckedOffset {
+        /// The element type.
+        ty: TypeExpr,
+        /// The base access pointer.
+        ptr: Box<Expr>,
+        /// The element-count offset (signed).
+        n: Box<Expr>,
+    },
+}
+
+/// Prefix unary operators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnaryOp {
+    /// `-x` arithmetic negation
+    Neg,
+    /// `!x` logical not
+    Not,
+    /// `~x` bitwise not
+    BitNot,
+    /// `*x` dereference (only meaningful on raw pointer-shaped values;
+    /// for narrow primitives use `#unchecked_load` / `#volatile_load`)
+    Deref,
+}
+
+/// Binary operators, grouped by category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BinaryOp {
+    /// `||`
+    Or,
+    /// `&&`
+    And,
+    /// `==`
+    Eq,
+    /// `!=`
+    Ne,
+    /// `<`
+    Lt,
+    /// `<=`
+    Le,
+    /// `>`
+    Gt,
+    /// `>=`
+    Ge,
+    /// `|`
+    BitOr,
+    /// `^`
+    BitXor,
+    /// `&`
+    BitAnd,
+    /// `<<`
+    Shl,
+    /// `>>`
+    Shr,
+    /// `+`
+    Add,
+    /// `-`
+    Sub,
+    /// `*`
+    Mul,
+    /// `/`
+    Div,
+    /// `%`
+    Rem,
+}
+
+// ─── Statements (§2.6) ───────────────────────────────────────────────────────
+
+/// A statement in a block body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stmt {
+    /// What kind of statement this is.
+    pub kind: StmtKind,
+    /// Source span covering the whole statement.
+    pub span: Span,
+}
+
+/// A statement variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StmtKind {
+    /// `let mut? name (: T)? = expr;` — explicit-form binding.
+    Let {
+        /// `true` for `let mut`.
+        mutable: bool,
+        /// Binding name.
+        name: String,
+        /// Optional type annotation.
+        ty: Option<TypeExpr>,
+        /// Initialiser expression.
+        value: Expr,
+    },
+
+    /// `let name := expr;` — short-binding form (Decision #8). Type is
+    /// always inferred; no explicit annotation, no `mut`.
+    LetShort {
+        /// Binding name.
+        name: String,
+        /// Initialiser expression.
+        value: Expr,
+    },
+
+    /// `expr;` — expression statement.
+    Expr(Expr),
+
+    /// `return expr?;`
+    Return(Option<Expr>),
+
+    /// `#mutate Auto { f1 = e1, f2 = e2 };` — bulk-write to automaton fields.
+    Mutate {
+        /// The automaton being mutated.
+        automaton: String,
+        /// Field assignments in source order.
+        assigns: Vec<FieldAssign>,
+    },
+
+    /// `Auto.field <op>= expr;` — single-field mutation sugar (Decision #15).
+    /// Desugars to `Mutate` semantically but preserved as a distinct variant
+    /// so round-tripping reproduces source.
+    MutateShort {
+        /// The automaton being mutated.
+        automaton: String,
+        /// The single field being assigned.
+        field: String,
+        /// Compound assignment operator (`Eq` for plain `=`, others for
+        /// `+=` / `-=` / etc.).
+        op: AssignOp,
+        /// Right-hand side.
+        value: Expr,
+    },
+
+    /// `#> name(args);` — effect-procedure call (Decision #3).
+    /// CallContext (transition vs identity vs generic per Refinement #5b)
+    /// is determined by `clifford-resolve`, not the parser.
+    ProcCall {
+        /// Callee name (single ident; `Interface::method` form for
+        /// generic-context calls per Decision #16 lands in slice 8).
+        name: String,
+        /// Argument expressions.
+        args: Vec<Expr>,
+    },
+
+    /// `#unchecked_store<T>(ptr, value);` — Decision #17 unsafe-store
+    /// primitive (statement form; the load form is an expression).
+    UncheckedStore {
+        /// Element type.
+        ty: TypeExpr,
+        /// Access pointer.
+        ptr: Expr,
+        /// Value being stored.
+        value: Expr,
+    },
+
+    /// `#volatile_store<T>(ptr, value);`
+    VolatileStore {
+        /// Element type.
+        ty: TypeExpr,
+        /// Access pointer.
+        ptr: Expr,
+        /// Value being stored.
+        value: Expr,
+    },
+}
+
+/// One `field = expr` (or `field[index] = expr`) inside a `#mutate Auto { … }`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldAssign {
+    /// Field name.
+    pub field: String,
+    /// Optional index (for `field[i] = expr` forms).
+    pub index: Option<Expr>,
+    /// Right-hand side.
+    pub value: Expr,
+    /// Source span.
+    pub span: Span,
+}
+
+/// Assignment operators for the single-field mutation sugar (Decision #15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AssignOp {
+    /// `=`
+    Eq,
+    /// `+=`
+    PlusEq,
+    /// `-=`
+    MinusEq,
+    /// `*=`
+    StarEq,
+    /// `/=`
+    SlashEq,
+    /// `%=`
+    PercentEq,
+    /// `&=`
+    AmpEq,
+    /// `|=`
+    PipeEq,
+    /// `^=`
+    CaretEq,
+    /// `<<=`
+    ShlEq,
+    /// `>>=`
+    ShrEq,
+}
+
+/// A block of statements.
+///
+/// Per §2.6: `block := '{' stmt* expr? '}'`. The optional trailing
+/// expression is the block's value when it appears in expression position
+/// (e.g., as the body of a function returning a value).
+///
+/// Slice-7 scope: only the leading `stmt*` portion is parsed; the trailing
+/// expression form is treated as `Stmt::Expr(...)` requiring a terminating
+/// `;` for now. Tail-expression-as-block-value lands when control-flow
+/// expressions (`if`, `match`) need it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Block {
+    /// Statements in source order.
+    pub stmts: Vec<Stmt>,
+    /// Source span covering `{ … }`.
+    pub span: Span,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -688,6 +1099,7 @@ mod tests {
             params: Vec::new(),
             return_type: None,
             trait_list: Vec::new(),
+            body: Block::default(),
             span: Span::new(0, 10),
         });
         assert_eq!(f.layer(), Layer::Functional);

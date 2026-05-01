@@ -55,11 +55,11 @@
 #![warn(missing_docs)]
 
 use clifford_ast::{
-    AccessType, ArraySize, ArrayType, AutomatonDecl, EffectDecl, Field, FnDecl, FnType,
-    GenericParam, ImplDecl, InterfaceDecl, InterfaceMethod, InterruptDecl, Item, Param, PathType,
-    PriorityLevel, PrimitiveType, Program, RefType, SequentialAttr, SliceType, TestDecl,
-    TraitDecl, TraitMethod, TraitRef, TupleType, TypeBody, TypeDecl, TypeExpr, TypeKind, Variant,
-    VariantData,
+    AccessType, ArraySize, ArrayType, AssignOp, AutomatonDecl, BinaryOp, Block, EffectDecl, Expr,
+    ExprKind, Field, FieldAssign, FnDecl, FnType, GenericParam, ImplDecl, InterfaceDecl,
+    InterfaceMethod, InterruptDecl, Item, Param, PathType, PriorityLevel, PrimitiveType, Program,
+    RefType, SequentialAttr, SliceType, Stmt, StmtKind, TestDecl, TraitDecl, TraitMethod,
+    TraitRef, TupleType, TypeBody, TypeDecl, TypeExpr, TypeKind, UnaryOp, Variant, VariantData,
 };
 use clifford_lexer::{Span, Token, TokenKind};
 use thiserror::Error;
@@ -133,6 +133,31 @@ pub fn parse(tokens: &[Token]) -> Result<Program, ParseError> {
         _ => Span::default(),
     };
     Ok(Program { span, items })
+}
+
+/// Parse a single expression from a token stream. Useful for REPL-style
+/// invocations and for downstream consumers (the type checker, the
+/// effect-extractor) that want to parse const-position expressions.
+///
+/// Returns the parsed [`Expr`] on success. The token stream must contain
+/// the expression followed by EOF; trailing junk is `E0204`.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] for malformed input or for tokens after the
+/// expression.
+pub fn parse_expression(tokens: &[Token]) -> Result<Expr, ParseError> {
+    let mut p = Parser::new(tokens);
+    let expr = p.parse_expr()?;
+    if !p.at_eof() {
+        let t = p.peek().clone();
+        return Err(ParseError::Expected {
+            expected: "EOF after expression",
+            found: t.kind,
+            at: t.span.start,
+        });
+    }
+    Ok(expr)
 }
 
 // ─── Internal parser ─────────────────────────────────────────────────────────
@@ -237,11 +262,11 @@ impl<'t> Parser<'t> {
         }
     }
 
-    /// Parse `@fn name(params) -> T $ [TraitList] { }`.
+    /// Parse `@fn name(params) -> T $ [TraitList] { body }`.
     ///
-    /// Slice-4 form: value parameters, optional return type, optional
-    /// trait list. Generic parameters, where-clause, extern modifier,
-    /// and body content all arrive in subsequent slices.
+    /// Slice-7 form: full body parsing (statements + expressions per §2.6).
+    /// Generic parameters, where-clause, and extern modifier still arrive
+    /// in subsequent slices.
     fn parse_fn_decl(&mut self, start: usize) -> Result<FnDecl, ParseError> {
         self.advance(); // `@fn`
         let (name, _) = self.expect_ident("function name after `@fn`")?;
@@ -258,14 +283,15 @@ impl<'t> Parser<'t> {
         } else {
             Vec::new()
         };
-        self.expect(TokenKind::LBrace, "`{` to open function body")?;
-        let close = self.expect(TokenKind::RBrace, "`}` to close function body")?;
+        let body = self.parse_block()?;
+        let end = body.span.end;
         Ok(FnDecl {
             name,
             params,
             return_type,
             trait_list,
-            span: Span::new(start, close.end),
+            body,
+            span: Span::new(start, end),
         })
     }
 
@@ -306,15 +332,16 @@ impl<'t> Parser<'t> {
 
         let (mutates, cannot_mutate) = self.parse_effect_meta_for_effect()?;
 
-        self.expect(TokenKind::LBrace, "`{` to open effect body")?;
-        let close = self.expect(TokenKind::RBrace, "`}` to close effect body")?;
+        let body = self.parse_block()?;
+        let end = body.span.end;
         Ok(EffectDecl {
             name,
             params,
             return_type,
             mutates,
             cannot_mutate,
-            span: Span::new(start, close.end),
+            body,
+            span: Span::new(start, end),
         })
     }
 
@@ -335,15 +362,16 @@ impl<'t> Parser<'t> {
 
         let (mutates, priority) = self.parse_effect_meta_for_interrupt(start)?;
 
-        self.expect(TokenKind::LBrace, "`{` to open interrupt body")?;
-        let close = self.expect(TokenKind::RBrace, "`}` to close interrupt body")?;
+        let body = self.parse_block()?;
+        let end = body.span.end;
         Ok(InterruptDecl {
             name,
             params,
             return_type,
             mutates,
             priority,
-            span: Span::new(start, close.end),
+            body,
+            span: Span::new(start, end),
         })
     }
 
@@ -1424,6 +1452,941 @@ impl<'t> Parser<'t> {
             span: Span::new(start, end),
         })
     }
+
+    // ─── Block / statement parsing (§2.6) ─────────────────────────────────
+
+    /// Parse `{ stmt* }` — a function/effect/transition body.
+    fn parse_block(&mut self) -> Result<Block, ParseError> {
+        let open = self.expect(TokenKind::LBrace, "`{` to open block")?;
+        let mut stmts = Vec::new();
+        while !matches!(self.peek().kind, TokenKind::RBrace | TokenKind::Eof) {
+            stmts.push(self.parse_stmt()?);
+        }
+        let close = self.expect(TokenKind::RBrace, "`}` to close block")?;
+        Ok(Block {
+            stmts,
+            span: Span::new(open.start, close.end),
+        })
+    }
+
+    /// Parse a single statement.
+    fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
+        let start = self.peek().span.start;
+        match self.peek().kind {
+            TokenKind::KwLet => self.parse_let_stmt(start),
+            TokenKind::KwReturn => self.parse_return_stmt(start),
+            TokenKind::KwHashMutate => self.parse_mutate_stmt(start),
+            TokenKind::HashGt => self.parse_proc_call_stmt(start),
+            TokenKind::KwHashUncheckedStore => {
+                self.parse_unchecked_store_stmt(start, /*volatile=*/ false)
+            }
+            TokenKind::KwHashVolatileStore => {
+                self.parse_unchecked_store_stmt(start, /*volatile=*/ true)
+            }
+            // Mutation sugar (Decision #15): `Auto.field <op>= expr;` — must
+            // be detected via lookahead. The Auto is an `Ident`, followed by
+            // `.`, an `Ident` (field), then an assignment op.
+            TokenKind::Ident(_) if self.is_mutate_short_stmt() => {
+                self.parse_mutate_short_stmt(start)
+            }
+            _ => self.parse_expr_stmt(start),
+        }
+    }
+
+    /// Lookahead-only: returns true if the current position starts a
+    /// `mutate_short_stmt` per Decision #15 (`Auto.field <op>= expr;`).
+    fn is_mutate_short_stmt(&self) -> bool {
+        // Pattern: Ident . Ident <assign_op>
+        // assign_op: = += -= *= /= %= &= |= ^= <<= >>=
+        if !matches!(self.peek().kind, TokenKind::Ident(_)) {
+            return false;
+        }
+        if !matches!(self.peek_offset(1).kind, TokenKind::Dot) {
+            return false;
+        }
+        if !matches!(self.peek_offset(2).kind, TokenKind::Ident(_)) {
+            return false;
+        }
+        matches!(
+            self.peek_offset(3).kind,
+            TokenKind::Eq
+                | TokenKind::PlusEq
+                | TokenKind::MinusEq
+                | TokenKind::StarEq
+                | TokenKind::SlashEq
+                | TokenKind::PercentEq
+                | TokenKind::AmpEq
+                | TokenKind::PipeEq
+                | TokenKind::CaretEq
+                | TokenKind::ShlEq
+                | TokenKind::ShrEq
+        )
+    }
+
+    /// Look ahead `n` tokens (0 is current). Returns Eof token if past end.
+    fn peek_offset(&self, n: usize) -> &Token {
+        let idx = self.pos + n;
+        if idx < self.tokens.len() {
+            &self.tokens[idx]
+        } else {
+            // Last token is always Eof per the lexer's contract.
+            &self.tokens[self.tokens.len() - 1]
+        }
+    }
+
+    fn parse_let_stmt(&mut self, start: usize) -> Result<Stmt, ParseError> {
+        self.advance(); // `let`
+        // `let mut?` - if mut, must be plain `let mut x: T = expr;` (no `:=`).
+        let mutable = if matches!(self.peek().kind, TokenKind::KwMut) {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        let (name, name_span) = self.expect_ident("binding name after `let`")?;
+
+        // Distinguish `let x := expr;` (LetShort) from `let x = expr;` /
+        // `let x: T = expr;` (Let).
+        if matches!(self.peek().kind, TokenKind::ColonEq) {
+            if mutable {
+                let t = self.peek().clone();
+                return Err(ParseError::Expected {
+                    expected: "explicit `let mut x: T = expr` form (`:=` does not allow `mut`)",
+                    found: t.kind,
+                    at: t.span.start,
+                });
+            }
+            self.advance(); // `:=`
+            let value = self.parse_expr()?;
+            let close = self.expect(TokenKind::Semi, "`;` to terminate let statement")?;
+            return Ok(Stmt {
+                kind: StmtKind::LetShort { name, value },
+                span: Span::new(start, close.end),
+            });
+        }
+
+        let ty = if matches!(self.peek().kind, TokenKind::Colon) {
+            self.advance();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        self.expect(TokenKind::Eq, "`=` after `let` binding name (or type)")?;
+        let value = self.parse_expr()?;
+        let close = self.expect(TokenKind::Semi, "`;` to terminate let statement")?;
+        let _ = name_span;
+        Ok(Stmt {
+            kind: StmtKind::Let {
+                mutable,
+                name,
+                ty,
+                value,
+            },
+            span: Span::new(start, close.end),
+        })
+    }
+
+    fn parse_return_stmt(&mut self, start: usize) -> Result<Stmt, ParseError> {
+        self.advance(); // `return`
+        let value = if matches!(self.peek().kind, TokenKind::Semi) {
+            None
+        } else {
+            Some(self.parse_expr()?)
+        };
+        let close = self.expect(TokenKind::Semi, "`;` to terminate return statement")?;
+        Ok(Stmt {
+            kind: StmtKind::Return(value),
+            span: Span::new(start, close.end),
+        })
+    }
+
+    fn parse_mutate_stmt(&mut self, start: usize) -> Result<Stmt, ParseError> {
+        self.advance(); // `#mutate`
+        let (automaton, _) = self.expect_ident("automaton name after `#mutate`")?;
+        self.expect(TokenKind::LBrace, "`{` to open mutate block")?;
+        let mut assigns = Vec::new();
+        if !matches!(self.peek().kind, TokenKind::RBrace) {
+            loop {
+                assigns.push(self.parse_field_assign()?);
+                match self.peek().kind {
+                    TokenKind::Comma => {
+                        self.advance();
+                        if matches!(self.peek().kind, TokenKind::RBrace) {
+                            break;
+                        }
+                    }
+                    TokenKind::RBrace => break,
+                    TokenKind::Eof => {
+                        return Err(ParseError::UnexpectedEof {
+                            context: "mutate block",
+                        });
+                    }
+                    _ => {
+                        let t = self.peek().clone();
+                        return Err(ParseError::Expected {
+                            expected: "`,` or `}` in `#mutate` block",
+                            found: t.kind,
+                            at: t.span.start,
+                        });
+                    }
+                }
+            }
+        }
+        self.expect(TokenKind::RBrace, "`}` to close mutate block")?;
+        let close = self.expect(TokenKind::Semi, "`;` to terminate `#mutate` statement")?;
+        Ok(Stmt {
+            kind: StmtKind::Mutate { automaton, assigns },
+            span: Span::new(start, close.end),
+        })
+    }
+
+    fn parse_field_assign(&mut self) -> Result<FieldAssign, ParseError> {
+        let start = self.peek().span.start;
+        let (field, _) = self.expect_ident("field name in mutate block")?;
+        let index = if matches!(self.peek().kind, TokenKind::LBracket) {
+            self.advance();
+            let idx = self.parse_expr()?;
+            self.expect(TokenKind::RBracket, "`]` to close field index")?;
+            Some(idx)
+        } else {
+            None
+        };
+        self.expect(TokenKind::Eq, "`=` after field name in `#mutate` block")?;
+        let value = self.parse_expr()?;
+        let end = value.span.end;
+        Ok(FieldAssign {
+            field,
+            index,
+            value,
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_mutate_short_stmt(&mut self, start: usize) -> Result<Stmt, ParseError> {
+        let (automaton, _) = self.expect_ident("automaton name")?;
+        self.expect(TokenKind::Dot, "`.` between automaton and field")?;
+        let (field, _) = self.expect_ident("field name")?;
+        let op_tok = self.peek().clone();
+        let op = match op_tok.kind {
+            TokenKind::Eq => AssignOp::Eq,
+            TokenKind::PlusEq => AssignOp::PlusEq,
+            TokenKind::MinusEq => AssignOp::MinusEq,
+            TokenKind::StarEq => AssignOp::StarEq,
+            TokenKind::SlashEq => AssignOp::SlashEq,
+            TokenKind::PercentEq => AssignOp::PercentEq,
+            TokenKind::AmpEq => AssignOp::AmpEq,
+            TokenKind::PipeEq => AssignOp::PipeEq,
+            TokenKind::CaretEq => AssignOp::CaretEq,
+            TokenKind::ShlEq => AssignOp::ShlEq,
+            TokenKind::ShrEq => AssignOp::ShrEq,
+            other => {
+                return Err(ParseError::Expected {
+                    expected: "assignment operator (=, +=, -=, …)",
+                    found: other,
+                    at: op_tok.span.start,
+                });
+            }
+        };
+        self.advance(); // assignment op
+        let value = self.parse_expr()?;
+        let close = self.expect(TokenKind::Semi, "`;` to terminate mutation-sugar statement")?;
+        Ok(Stmt {
+            kind: StmtKind::MutateShort {
+                automaton,
+                field,
+                op,
+                value,
+            },
+            span: Span::new(start, close.end),
+        })
+    }
+
+    fn parse_proc_call_stmt(&mut self, start: usize) -> Result<Stmt, ParseError> {
+        self.advance(); // `#>`
+        let (name, _) = self.expect_ident("procedure name after `#>`")?;
+        self.expect(TokenKind::LParen, "`(` after procedure name")?;
+        let args = self.parse_arg_list()?;
+        let close = self.expect(TokenKind::Semi, "`;` to terminate `#>` call statement")?;
+        Ok(Stmt {
+            kind: StmtKind::ProcCall { name, args },
+            span: Span::new(start, close.end),
+        })
+    }
+
+    fn parse_unchecked_store_stmt(
+        &mut self,
+        start: usize,
+        volatile: bool,
+    ) -> Result<Stmt, ParseError> {
+        self.advance(); // `#unchecked_store` or `#volatile_store`
+        self.expect(TokenKind::Lt, "`<` after store primitive")?;
+        let ty = self.parse_type()?;
+        self.expect(TokenKind::Gt, "`>` to close store type argument")?;
+        self.expect(TokenKind::LParen, "`(` to open store arguments")?;
+        let ptr = self.parse_expr()?;
+        self.expect(TokenKind::Comma, "`,` between store ptr and value")?;
+        let value = self.parse_expr()?;
+        self.expect(TokenKind::RParen, "`)` to close store arguments")?;
+        let close = self.expect(TokenKind::Semi, "`;` to terminate store statement")?;
+        let kind = if volatile {
+            StmtKind::VolatileStore { ty, ptr, value }
+        } else {
+            StmtKind::UncheckedStore { ty, ptr, value }
+        };
+        Ok(Stmt {
+            kind,
+            span: Span::new(start, close.end),
+        })
+    }
+
+    fn parse_expr_stmt(&mut self, start: usize) -> Result<Stmt, ParseError> {
+        let expr = self.parse_expr()?;
+        let close = self.expect(TokenKind::Semi, "`;` to terminate expression statement")?;
+        Ok(Stmt {
+            kind: StmtKind::Expr(expr),
+            span: Span::new(start, close.end),
+        })
+    }
+
+    fn parse_arg_list(&mut self) -> Result<Vec<Expr>, ParseError> {
+        // `(` already consumed.
+        let mut args = Vec::new();
+        if matches!(self.peek().kind, TokenKind::RParen) {
+            self.advance();
+            return Ok(args);
+        }
+        loop {
+            args.push(self.parse_expr()?);
+            match self.peek().kind {
+                TokenKind::Comma => {
+                    self.advance();
+                    if matches!(self.peek().kind, TokenKind::RParen) {
+                        self.advance();
+                        return Ok(args);
+                    }
+                }
+                TokenKind::RParen => {
+                    self.advance();
+                    return Ok(args);
+                }
+                TokenKind::Eof => {
+                    return Err(ParseError::UnexpectedEof {
+                        context: "argument list",
+                    });
+                }
+                _ => {
+                    let t = self.peek().clone();
+                    return Err(ParseError::Expected {
+                        expected: "`,` or `)` in argument list",
+                        found: t.kind,
+                        at: t.span.start,
+                    });
+                }
+            }
+        }
+    }
+
+    // ─── Expression parser (Pratt; §2.6) ──────────────────────────────────
+
+    /// Parse one expression. Pratt-style with binding-power dispatch.
+    fn parse_expr(&mut self) -> Result<Expr, ParseError> {
+        self.parse_expr_bp(0)
+    }
+
+    /// Pratt main loop: parse atoms / prefix operators, then drive postfix
+    /// and infix operators by binding power.
+    fn parse_expr_bp(&mut self, min_bp: u8) -> Result<Expr, ParseError> {
+        let start = self.peek().span.start;
+        let mut lhs = self.parse_prefix(start)?;
+
+        loop {
+            // Postfix operators: `.field` / `.method(args)` / `[idx]` /
+            // `(args)`. These are higher precedence than any infix, so
+            // they're checked first and don't participate in min_bp.
+            match self.peek().kind {
+                TokenKind::Dot => {
+                    self.advance(); // `.`
+                    let (name, name_span) = self.expect_ident("field or method name after `.`")?;
+                    if matches!(self.peek().kind, TokenKind::LParen) {
+                        self.advance();
+                        let args = self.parse_arg_list()?;
+                        let end = self.tokens[self.pos.saturating_sub(1)].span.end;
+                        lhs = Expr {
+                            span: Span::new(lhs.span.start, end),
+                            kind: ExprKind::MethodCall {
+                                obj: Box::new(lhs),
+                                method: name,
+                                args,
+                            },
+                        };
+                    } else {
+                        lhs = Expr {
+                            span: Span::new(lhs.span.start, name_span.end),
+                            kind: ExprKind::FieldAccess {
+                                obj: Box::new(lhs),
+                                field: name,
+                            },
+                        };
+                    }
+                    continue;
+                }
+                TokenKind::LBracket => {
+                    self.advance(); // `[`
+                    let index = self.parse_expr()?;
+                    let close = self.expect(TokenKind::RBracket, "`]` to close index")?;
+                    lhs = Expr {
+                        span: Span::new(lhs.span.start, close.end),
+                        kind: ExprKind::Index {
+                            obj: Box::new(lhs),
+                            index: Box::new(index),
+                        },
+                    };
+                    continue;
+                }
+                TokenKind::LParen => {
+                    self.advance(); // `(`
+                    let args = self.parse_arg_list()?;
+                    let end = self.tokens[self.pos.saturating_sub(1)].span.end;
+                    lhs = Expr {
+                        span: Span::new(lhs.span.start, end),
+                        kind: ExprKind::Call {
+                            callee: Box::new(lhs),
+                            args,
+                        },
+                    };
+                    continue;
+                }
+                TokenKind::KwAs => {
+                    // `as` cast — high precedence, between unary and multiplicative.
+                    let cast_bp: u8 = 23;
+                    if cast_bp < min_bp {
+                        break;
+                    }
+                    self.advance();
+                    let ty = self.parse_type()?;
+                    let end = ty.span.end;
+                    lhs = Expr {
+                        span: Span::new(lhs.span.start, end),
+                        kind: ExprKind::Cast {
+                            value: Box::new(lhs),
+                            ty,
+                        },
+                    };
+                    continue;
+                }
+                _ => {}
+            }
+
+            // Infix operators with binding-power dispatch.
+            if let Some((l_bp, r_bp, op)) = infix_op(&self.peek().kind) {
+                if l_bp < min_bp {
+                    break;
+                }
+                self.advance(); // operator
+                let rhs = self.parse_expr_bp(r_bp)?;
+                let span = Span::new(lhs.span.start, rhs.span.end);
+                lhs = Expr {
+                    span,
+                    kind: ExprKind::Binary {
+                        op,
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                    },
+                };
+                continue;
+            }
+
+            // Range operator: `a .. b` / `a ..= b`. Lowest precedence.
+            // Matched here because it isn't strictly a typical infix
+            // (Rust treats it as left-associative with very low priority).
+            if matches!(self.peek().kind, TokenKind::DotDot | TokenKind::DotDotEq) {
+                let range_bp: u8 = 1;
+                if range_bp < min_bp {
+                    break;
+                }
+                let inclusive = matches!(self.peek().kind, TokenKind::DotDotEq);
+                self.advance();
+                let rhs = self.parse_expr_bp(range_bp + 1)?;
+                let span = Span::new(lhs.span.start, rhs.span.end);
+                lhs = Expr {
+                    span,
+                    kind: ExprKind::Range {
+                        lo: Box::new(lhs),
+                        hi: Box::new(rhs),
+                        inclusive,
+                    },
+                };
+                continue;
+            }
+
+            break;
+        }
+
+        Ok(lhs)
+    }
+
+    /// Parse an atom or a prefix-operator expression.
+    fn parse_prefix(&mut self, _start: usize) -> Result<Expr, ParseError> {
+        let tok = self.peek().clone();
+        match tok.kind {
+            TokenKind::Minus => self.parse_unary_op(UnaryOp::Neg),
+            TokenKind::Bang => self.parse_unary_op(UnaryOp::Not),
+            TokenKind::Tilde => self.parse_unary_op(UnaryOp::BitNot),
+            TokenKind::Star => self.parse_unary_op(UnaryOp::Deref),
+            TokenKind::Amp => self.parse_borrow_expr(),
+            _ => self.parse_atom(),
+        }
+    }
+
+    fn parse_unary_op(&mut self, op: UnaryOp) -> Result<Expr, ParseError> {
+        let start = self.peek().span.start;
+        self.advance();
+        // Unary operators bind tighter than any infix; recurse with high BP.
+        let operand = self.parse_expr_bp(25)?;
+        let end = operand.span.end;
+        Ok(Expr {
+            span: Span::new(start, end),
+            kind: ExprKind::Unary {
+                op,
+                operand: Box::new(operand),
+            },
+        })
+    }
+
+    fn parse_borrow_expr(&mut self) -> Result<Expr, ParseError> {
+        let start = self.peek().span.start;
+        self.advance(); // `&`
+        let mutable = if matches!(self.peek().kind, TokenKind::KwMut) {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        let operand = self.parse_expr_bp(25)?;
+        let end = operand.span.end;
+        Ok(Expr {
+            span: Span::new(start, end),
+            kind: ExprKind::Ref {
+                mutable,
+                operand: Box::new(operand),
+            },
+        })
+    }
+
+    fn parse_atom(&mut self) -> Result<Expr, ParseError> {
+        let tok = self.peek().clone();
+        let start = tok.span.start;
+        match tok.kind {
+            TokenKind::IntLiteral(s) => {
+                self.advance();
+                Ok(Expr {
+                    kind: ExprKind::IntLit(s),
+                    span: tok.span,
+                })
+            }
+            TokenKind::HexLiteral(s) => {
+                self.advance();
+                Ok(Expr {
+                    kind: ExprKind::HexLit(s),
+                    span: tok.span,
+                })
+            }
+            TokenKind::BinLiteral(s) => {
+                self.advance();
+                Ok(Expr {
+                    kind: ExprKind::BinLit(s),
+                    span: tok.span,
+                })
+            }
+            TokenKind::FloatLiteral(s) => {
+                self.advance();
+                Ok(Expr {
+                    kind: ExprKind::FloatLit(s),
+                    span: tok.span,
+                })
+            }
+            TokenKind::CharLiteral(c) => {
+                self.advance();
+                Ok(Expr {
+                    kind: ExprKind::CharLit(c),
+                    span: tok.span,
+                })
+            }
+            TokenKind::ByteLiteral(b) => {
+                self.advance();
+                Ok(Expr {
+                    kind: ExprKind::ByteLit(b),
+                    span: tok.span,
+                })
+            }
+            TokenKind::StringLiteral(s) => {
+                self.advance();
+                Ok(Expr {
+                    kind: ExprKind::StringLit(s),
+                    span: tok.span,
+                })
+            }
+            TokenKind::KwTrue => {
+                self.advance();
+                Ok(Expr {
+                    kind: ExprKind::BoolLit(true),
+                    span: tok.span,
+                })
+            }
+            TokenKind::KwFalse => {
+                self.advance();
+                Ok(Expr {
+                    kind: ExprKind::BoolLit(false),
+                    span: tok.span,
+                })
+            }
+            TokenKind::KwNull => {
+                self.advance();
+                Ok(Expr {
+                    kind: ExprKind::Null,
+                    span: tok.span,
+                })
+            }
+            TokenKind::Ident(_) | TokenKind::KwSelf | TokenKind::KwSelfType => {
+                self.parse_path_or_state_expr(start)
+            }
+            TokenKind::LParen => self.parse_paren_or_tuple_expr(start),
+            TokenKind::LBracket => self.parse_array_expr(start),
+            TokenKind::KwHashUncheckedLoad => {
+                self.parse_unsafe_load_expr(start, /*volatile=*/ false)
+            }
+            TokenKind::KwHashVolatileLoad => {
+                self.parse_unsafe_load_expr(start, /*volatile=*/ true)
+            }
+            TokenKind::KwHashUncheckedCast => self.parse_unchecked_cast_expr(start),
+            TokenKind::KwHashUncheckedOffset => self.parse_unchecked_offset_expr(start),
+            TokenKind::Eof => Err(ParseError::UnexpectedEof {
+                context: "expression",
+            }),
+            other => Err(ParseError::Expected {
+                expected: "expression",
+                found: other,
+                at: tok.span.start,
+            }),
+        }
+    }
+
+    fn parse_path_or_state_expr(&mut self, start: usize) -> Result<Expr, ParseError> {
+        // Consume the first ident (or KwSelf / KwSelfType).
+        let first_tok = self.peek().clone();
+        let first = match first_tok.kind {
+            TokenKind::Ident(s) => {
+                self.advance();
+                s
+            }
+            TokenKind::KwSelf => {
+                self.advance();
+                "self".to_owned()
+            }
+            TokenKind::KwSelfType => {
+                self.advance();
+                "Self".to_owned()
+            }
+            _ => unreachable!("dispatch ensured Ident / KwSelf / KwSelfType"),
+        };
+        let mut end = first_tok.span.end;
+
+        // `Auto@state` postfix (Refinement #5d)?
+        if matches!(self.peek().kind, TokenKind::KwAtState) {
+            let at_tok = self.peek().clone();
+            self.advance();
+            return Ok(Expr {
+                kind: ExprKind::StateRead(first),
+                span: Span::new(start, at_tok.span.end),
+            });
+        }
+
+        let mut segments = vec![first];
+        while matches!(self.peek().kind, TokenKind::ColonColon) {
+            self.advance();
+            let (seg, seg_span) = self.expect_ident("path segment after `::`")?;
+            segments.push(seg);
+            end = seg_span.end;
+        }
+        Ok(Expr {
+            kind: ExprKind::Path(segments),
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_paren_or_tuple_expr(&mut self, start: usize) -> Result<Expr, ParseError> {
+        self.advance(); // `(`
+        // Empty parens `()` is unit — emitted as an empty Tuple. Real unit
+        // expression handling can come later; for now reject explicitly.
+        if matches!(self.peek().kind, TokenKind::RParen) {
+            let close = self.expect(TokenKind::RParen, "internal RParen")?;
+            return Ok(Expr {
+                kind: ExprKind::Tuple(Vec::new()),
+                span: Span::new(start, close.end),
+            });
+        }
+        let first = self.parse_expr()?;
+        match self.peek().kind {
+            TokenKind::RParen => {
+                let close = self.expect(TokenKind::RParen, "internal RParen")?;
+                Ok(Expr {
+                    kind: ExprKind::Paren(Box::new(first)),
+                    span: Span::new(start, close.end),
+                })
+            }
+            TokenKind::Comma => {
+                self.advance();
+                let mut elements = vec![first];
+                loop {
+                    if matches!(self.peek().kind, TokenKind::RParen) {
+                        break;
+                    }
+                    elements.push(self.parse_expr()?);
+                    match self.peek().kind {
+                        TokenKind::Comma => {
+                            self.advance();
+                        }
+                        TokenKind::RParen => break,
+                        TokenKind::Eof => {
+                            return Err(ParseError::UnexpectedEof {
+                                context: "tuple expression",
+                            });
+                        }
+                        _ => {
+                            let t = self.peek().clone();
+                            return Err(ParseError::Expected {
+                                expected: "`,` or `)` in tuple expression",
+                                found: t.kind,
+                                at: t.span.start,
+                            });
+                        }
+                    }
+                }
+                let close = self.expect(TokenKind::RParen, "`)` to close tuple expression")?;
+                Ok(Expr {
+                    kind: ExprKind::Tuple(elements),
+                    span: Span::new(start, close.end),
+                })
+            }
+            _ => {
+                let t = self.peek().clone();
+                Err(ParseError::Expected {
+                    expected: "`,` or `)` in parenthesised expression",
+                    found: t.kind,
+                    at: t.span.start,
+                })
+            }
+        }
+    }
+
+    fn parse_array_expr(&mut self, start: usize) -> Result<Expr, ParseError> {
+        self.advance(); // `[`
+        if matches!(self.peek().kind, TokenKind::RBracket) {
+            let close = self.expect(TokenKind::RBracket, "internal RBracket")?;
+            return Ok(Expr {
+                kind: ExprKind::Array(Vec::new()),
+                span: Span::new(start, close.end),
+            });
+        }
+        let first = self.parse_expr()?;
+        match self.peek().kind {
+            TokenKind::Semi => {
+                self.advance();
+                let count = self.parse_expr()?;
+                let close = self.expect(TokenKind::RBracket, "`]` to close array-repeat literal")?;
+                Ok(Expr {
+                    kind: ExprKind::ArrayRepeat {
+                        value: Box::new(first),
+                        count: Box::new(count),
+                    },
+                    span: Span::new(start, close.end),
+                })
+            }
+            TokenKind::Comma => {
+                self.advance();
+                let mut elements = vec![first];
+                loop {
+                    if matches!(self.peek().kind, TokenKind::RBracket) {
+                        break;
+                    }
+                    elements.push(self.parse_expr()?);
+                    match self.peek().kind {
+                        TokenKind::Comma => {
+                            self.advance();
+                        }
+                        TokenKind::RBracket => break,
+                        TokenKind::Eof => {
+                            return Err(ParseError::UnexpectedEof {
+                                context: "array literal",
+                            });
+                        }
+                        _ => {
+                            let t = self.peek().clone();
+                            return Err(ParseError::Expected {
+                                expected: "`,` or `]` in array literal",
+                                found: t.kind,
+                                at: t.span.start,
+                            });
+                        }
+                    }
+                }
+                let close = self.expect(TokenKind::RBracket, "`]` to close array literal")?;
+                Ok(Expr {
+                    kind: ExprKind::Array(elements),
+                    span: Span::new(start, close.end),
+                })
+            }
+            TokenKind::RBracket => {
+                let close = self.expect(TokenKind::RBracket, "internal RBracket")?;
+                Ok(Expr {
+                    kind: ExprKind::Array(vec![first]),
+                    span: Span::new(start, close.end),
+                })
+            }
+            _ => {
+                let t = self.peek().clone();
+                Err(ParseError::Expected {
+                    expected: "`,` (more elements), `;` (repeat), or `]` (close)",
+                    found: t.kind,
+                    at: t.span.start,
+                })
+            }
+        }
+    }
+
+    fn parse_unsafe_load_expr(
+        &mut self,
+        start: usize,
+        volatile: bool,
+    ) -> Result<Expr, ParseError> {
+        self.advance(); // primitive keyword
+        self.expect(TokenKind::Lt, "`<` after load primitive")?;
+        let ty = self.parse_type()?;
+        self.expect(TokenKind::Gt, "`>` to close load type argument")?;
+        self.expect(TokenKind::LParen, "`(` to open load arguments")?;
+        let ptr = self.parse_expr()?;
+        let close = self.expect(TokenKind::RParen, "`)` to close load arguments")?;
+        let kind = if volatile {
+            ExprKind::VolatileLoad {
+                ty,
+                ptr: Box::new(ptr),
+            }
+        } else {
+            ExprKind::UncheckedLoad {
+                ty,
+                ptr: Box::new(ptr),
+            }
+        };
+        Ok(Expr {
+            kind,
+            span: Span::new(start, close.end),
+        })
+    }
+
+    fn parse_unchecked_cast_expr(&mut self, start: usize) -> Result<Expr, ParseError> {
+        self.advance(); // `#unchecked_cast`
+        self.expect(TokenKind::Lt, "`<` after `#unchecked_cast`")?;
+        let from_ty = self.parse_type()?;
+        self.expect(TokenKind::Comma, "`,` between cast source and target types")?;
+        let to_ty = self.parse_type()?;
+        self.expect(TokenKind::Gt, "`>` to close cast type arguments")?;
+        self.expect(TokenKind::LParen, "`(` to open cast arguments")?;
+        let reason_tok = self.peek().clone();
+        let reason = match reason_tok.kind {
+            TokenKind::StringLiteral(s) => {
+                self.advance();
+                if s.trim().is_empty() {
+                    return Err(ParseError::Expected {
+                        expected: "non-empty reason string for `#unchecked_cast` (Refinement #19a)",
+                        found: TokenKind::StringLiteral(s),
+                        at: reason_tok.span.start,
+                    });
+                }
+                s
+            }
+            TokenKind::Eof => {
+                return Err(ParseError::UnexpectedEof {
+                    context: "`#unchecked_cast` reason string",
+                });
+            }
+            other => {
+                return Err(ParseError::Expected {
+                    expected: "string-literal reason as first argument to `#unchecked_cast`",
+                    found: other,
+                    at: reason_tok.span.start,
+                });
+            }
+        };
+        self.expect(TokenKind::Comma, "`,` between cast reason and value")?;
+        let value = self.parse_expr()?;
+        let close = self.expect(TokenKind::RParen, "`)` to close cast arguments")?;
+        Ok(Expr {
+            kind: ExprKind::UncheckedCast {
+                from_ty,
+                to_ty,
+                reason,
+                value: Box::new(value),
+            },
+            span: Span::new(start, close.end),
+        })
+    }
+
+    fn parse_unchecked_offset_expr(&mut self, start: usize) -> Result<Expr, ParseError> {
+        self.advance(); // `#unchecked_offset`
+        self.expect(TokenKind::Lt, "`<` after `#unchecked_offset`")?;
+        let ty = self.parse_type()?;
+        self.expect(TokenKind::Gt, "`>` to close offset type argument")?;
+        self.expect(TokenKind::LParen, "`(` to open offset arguments")?;
+        let ptr = self.parse_expr()?;
+        self.expect(TokenKind::Comma, "`,` between offset ptr and count")?;
+        let n = self.parse_expr()?;
+        let close = self.expect(TokenKind::RParen, "`)` to close offset arguments")?;
+        Ok(Expr {
+            kind: ExprKind::UncheckedOffset {
+                ty,
+                ptr: Box::new(ptr),
+                n: Box::new(n),
+            },
+            span: Span::new(start, close.end),
+        })
+    }
+}
+
+/// Map an infix-operator token to `(left_bp, right_bp, BinaryOp)`.
+///
+/// Higher binding power = higher precedence. Left-associative operators
+/// have `right_bp = left_bp + 1`; right-associative would have
+/// `right_bp = left_bp` (we don't have any in v0.1).
+///
+/// Comparisons are non-associative in spec but we treat them as
+/// left-associative at parse time and reject chains like `a < b < c`
+/// in `clifford-types` later.
+fn infix_op(kind: &TokenKind) -> Option<(u8, u8, BinaryOp)> {
+    Some(match kind {
+        // Range is handled separately at bp=1 in parse_expr_bp.
+        TokenKind::PipePipe => (3, 4, BinaryOp::Or),
+        TokenKind::AmpAmp => (5, 6, BinaryOp::And),
+        TokenKind::EqEq => (7, 8, BinaryOp::Eq),
+        TokenKind::BangEq => (7, 8, BinaryOp::Ne),
+        TokenKind::Lt => (7, 8, BinaryOp::Lt),
+        TokenKind::LtEq => (7, 8, BinaryOp::Le),
+        TokenKind::Gt => (7, 8, BinaryOp::Gt),
+        TokenKind::GtEq => (7, 8, BinaryOp::Ge),
+        TokenKind::Pipe => (9, 10, BinaryOp::BitOr),
+        TokenKind::Caret => (11, 12, BinaryOp::BitXor),
+        TokenKind::Amp => (13, 14, BinaryOp::BitAnd),
+        TokenKind::Shl => (15, 16, BinaryOp::Shl),
+        TokenKind::Shr => (15, 16, BinaryOp::Shr),
+        TokenKind::Plus => (17, 18, BinaryOp::Add),
+        TokenKind::Minus => (17, 18, BinaryOp::Sub),
+        TokenKind::Star => (19, 20, BinaryOp::Mul),
+        TokenKind::Slash => (19, 20, BinaryOp::Div),
+        TokenKind::Percent => (19, 20, BinaryOp::Rem),
+        // `as` cast is handled separately at bp=23.
+        // Unary prefix is handled separately at bp=25.
+        // Postfix (./[/() are handled separately, no bp needed.
+        _ => return None,
+    })
 }
 
 /// Map an identifier string to a primitive type, if it is one.
@@ -3054,6 +4017,919 @@ mod tests {
                 assert_eq!(automaton_name, "Usart1");
             }
             other => panic!("expected Impl, got {:?}", other),
+        }
+    }
+
+    // ─── Slice 7: expressions, statements, function bodies (§2.6) ────────
+
+    use clifford_ast::{
+        AssignOp, BinaryOp, Block, Expr, ExprKind, FieldAssign, Stmt, StmtKind, UnaryOp,
+    };
+
+    /// Parse one expression in isolation; trailing junk is an error.
+    fn parse_expr_str(src: &str) -> Result<Expr, ParseError> {
+        let tokens = tokenize(src).expect("tokenize");
+        crate::parse_expression(&tokens)
+    }
+
+    /// Parse a statement by wrapping it in a trivial fn body and pulling it
+    /// out. Keeps test fixtures readable while exercising the full pipeline.
+    fn parse_stmt_str(src: &str) -> Stmt {
+        let wrapped = format!("@fn _t() {{ {src} }}");
+        let p = parse_str(&wrapped).expect("parse stmt-wrapping fn");
+        match &p.items[0] {
+            Item::Fn(decl) => {
+                assert_eq!(decl.body.stmts.len(), 1, "expected exactly one statement");
+                decl.body.stmts[0].clone()
+            }
+            other => panic!("expected Fn, got {:?}", other),
+        }
+    }
+
+    fn parse_body_str(src: &str) -> Block {
+        let wrapped = format!("@fn _t() {{ {src} }}");
+        let p = parse_str(&wrapped).expect("parse body-wrapping fn");
+        match &p.items[0] {
+            Item::Fn(decl) => decl.body.clone(),
+            other => panic!("expected Fn, got {:?}", other),
+        }
+    }
+
+    // ── Atoms ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn expr_int_literal() {
+        let e = parse_expr_str("42").unwrap();
+        assert_eq!(e.kind, ExprKind::IntLit("42".into()));
+    }
+
+    #[test]
+    fn expr_hex_literal() {
+        let e = parse_expr_str("0xDEAD_BEEF").unwrap();
+        assert_eq!(e.kind, ExprKind::HexLit("0xDEAD_BEEF".into()));
+    }
+
+    #[test]
+    fn expr_bin_literal() {
+        let e = parse_expr_str("0b1010_0101").unwrap();
+        assert_eq!(e.kind, ExprKind::BinLit("0b1010_0101".into()));
+    }
+
+    #[test]
+    fn expr_float_literal() {
+        let e = parse_expr_str("3.14").unwrap();
+        assert_eq!(e.kind, ExprKind::FloatLit("3.14".into()));
+    }
+
+    #[test]
+    fn expr_char_literal() {
+        let e = parse_expr_str("'A'").unwrap();
+        assert_eq!(e.kind, ExprKind::CharLit('A'));
+    }
+
+    #[test]
+    fn expr_byte_literal() {
+        let e = parse_expr_str("b'A'").unwrap();
+        assert_eq!(e.kind, ExprKind::ByteLit(b'A'));
+    }
+
+    #[test]
+    fn expr_string_literal() {
+        let e = parse_expr_str(r#""hello""#).unwrap();
+        assert_eq!(e.kind, ExprKind::StringLit("hello".into()));
+    }
+
+    #[test]
+    fn expr_bool_literals() {
+        assert_eq!(parse_expr_str("true").unwrap().kind, ExprKind::BoolLit(true));
+        assert_eq!(parse_expr_str("false").unwrap().kind, ExprKind::BoolLit(false));
+    }
+
+    #[test]
+    fn expr_null_literal() {
+        let e = parse_expr_str("null").unwrap();
+        assert_eq!(e.kind, ExprKind::Null);
+    }
+
+    #[test]
+    fn expr_path_single_ident() {
+        let e = parse_expr_str("counter").unwrap();
+        assert_eq!(e.kind, ExprKind::Path(vec!["counter".into()]));
+    }
+
+    #[test]
+    fn expr_path_multi_segment() {
+        let e = parse_expr_str("clifford::core::option").unwrap();
+        assert_eq!(
+            e.kind,
+            ExprKind::Path(vec!["clifford".into(), "core".into(), "option".into()])
+        );
+    }
+
+    #[test]
+    fn expr_state_read() {
+        let e = parse_expr_str("Counter@state").unwrap();
+        assert_eq!(e.kind, ExprKind::StateRead("Counter".into()));
+    }
+
+    #[test]
+    fn expr_paren_unwraps_single() {
+        let e = parse_expr_str("(42)").unwrap();
+        match e.kind {
+            ExprKind::Paren(inner) => assert_eq!(inner.kind, ExprKind::IntLit("42".into())),
+            other => panic!("expected Paren, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn expr_tuple_two() {
+        let e = parse_expr_str("(1, 2)").unwrap();
+        match e.kind {
+            ExprKind::Tuple(elems) => assert_eq!(elems.len(), 2),
+            other => panic!("expected Tuple, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn expr_array_literal() {
+        let e = parse_expr_str("[1, 2, 3]").unwrap();
+        match e.kind {
+            ExprKind::Array(elems) => assert_eq!(elems.len(), 3),
+            other => panic!("expected Array, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn expr_array_repeat() {
+        let e = parse_expr_str("[0; 64]").unwrap();
+        match e.kind {
+            ExprKind::ArrayRepeat { value, count } => {
+                assert_eq!(value.kind, ExprKind::IntLit("0".into()));
+                assert_eq!(count.kind, ExprKind::IntLit("64".into()));
+            }
+            other => panic!("expected ArrayRepeat, got {:?}", other),
+        }
+    }
+
+    // ── Postfix ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn expr_field_access() {
+        let e = parse_expr_str("foo.bar").unwrap();
+        match e.kind {
+            ExprKind::FieldAccess { obj, field } => {
+                assert!(matches!(obj.kind, ExprKind::Path(_)));
+                assert_eq!(field, "bar");
+            }
+            other => panic!("expected FieldAccess, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn expr_chained_field_access() {
+        let e = parse_expr_str("a.b.c").unwrap();
+        match e.kind {
+            ExprKind::FieldAccess { obj, field } => {
+                assert_eq!(field, "c");
+                assert!(matches!(obj.kind, ExprKind::FieldAccess { .. }));
+            }
+            other => panic!("expected FieldAccess, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn expr_index() {
+        let e = parse_expr_str("buf[i]").unwrap();
+        match e.kind {
+            ExprKind::Index { obj, index } => {
+                assert!(matches!(obj.kind, ExprKind::Path(_)));
+                assert!(matches!(index.kind, ExprKind::Path(_)));
+            }
+            other => panic!("expected Index, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn expr_call_no_args() {
+        let e = parse_expr_str("foo()").unwrap();
+        match e.kind {
+            ExprKind::Call { callee, args } => {
+                assert!(matches!(callee.kind, ExprKind::Path(_)));
+                assert!(args.is_empty());
+            }
+            other => panic!("expected Call, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn expr_call_with_args() {
+        let e = parse_expr_str("add(1, 2)").unwrap();
+        match e.kind {
+            ExprKind::Call { args, .. } => assert_eq!(args.len(), 2),
+            other => panic!("expected Call, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn expr_method_call() {
+        let e = parse_expr_str("obj.method(42)").unwrap();
+        match e.kind {
+            ExprKind::MethodCall { obj, method, args } => {
+                assert!(matches!(obj.kind, ExprKind::Path(_)));
+                assert_eq!(method, "method");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected MethodCall, got {:?}", other),
+        }
+    }
+
+    // ── Unary / borrow ────────────────────────────────────────────────────
+
+    #[test]
+    fn expr_unary_neg() {
+        let e = parse_expr_str("-5").unwrap();
+        match e.kind {
+            ExprKind::Unary { op, operand } => {
+                assert_eq!(op, UnaryOp::Neg);
+                assert_eq!(operand.kind, ExprKind::IntLit("5".into()));
+            }
+            other => panic!("expected Unary, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn expr_unary_not() {
+        let e = parse_expr_str("!flag").unwrap();
+        assert!(matches!(
+            e.kind,
+            ExprKind::Unary { op: UnaryOp::Not, .. }
+        ));
+    }
+
+    #[test]
+    fn expr_unary_bitnot() {
+        let e = parse_expr_str("~mask").unwrap();
+        assert!(matches!(
+            e.kind,
+            ExprKind::Unary { op: UnaryOp::BitNot, .. }
+        ));
+    }
+
+    #[test]
+    fn expr_unary_deref() {
+        let e = parse_expr_str("*p").unwrap();
+        assert!(matches!(
+            e.kind,
+            ExprKind::Unary { op: UnaryOp::Deref, .. }
+        ));
+    }
+
+    #[test]
+    fn expr_borrow_immutable() {
+        let e = parse_expr_str("&x").unwrap();
+        match e.kind {
+            ExprKind::Ref { mutable, .. } => assert!(!mutable),
+            other => panic!("expected Ref, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn expr_borrow_mutable() {
+        let e = parse_expr_str("&mut x").unwrap();
+        match e.kind {
+            ExprKind::Ref { mutable, .. } => assert!(mutable),
+            other => panic!("expected Ref, got {:?}", other),
+        }
+    }
+
+    // ── Binary / precedence ──────────────────────────────────────────────
+
+    #[test]
+    fn expr_add() {
+        let e = parse_expr_str("1 + 2").unwrap();
+        match e.kind {
+            ExprKind::Binary { op, .. } => assert_eq!(op, BinaryOp::Add),
+            other => panic!("expected Binary, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn expr_precedence_mul_over_add() {
+        // `1 + 2 * 3` should parse as `1 + (2 * 3)`.
+        let e = parse_expr_str("1 + 2 * 3").unwrap();
+        match e.kind {
+            ExprKind::Binary { op: BinaryOp::Add, lhs, rhs } => {
+                assert_eq!(lhs.kind, ExprKind::IntLit("1".into()));
+                match rhs.kind {
+                    ExprKind::Binary { op: BinaryOp::Mul, .. } => {}
+                    other => panic!("expected Mul on rhs, got {:?}", other),
+                }
+            }
+            other => panic!("expected top-level Add, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn expr_precedence_left_associative_add() {
+        // `1 + 2 + 3` → `(1 + 2) + 3`.
+        let e = parse_expr_str("1 + 2 + 3").unwrap();
+        match e.kind {
+            ExprKind::Binary { op: BinaryOp::Add, lhs, rhs } => {
+                assert!(matches!(lhs.kind, ExprKind::Binary { op: BinaryOp::Add, .. }));
+                assert_eq!(rhs.kind, ExprKind::IntLit("3".into()));
+            }
+            other => panic!("expected Add, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn expr_precedence_or_lower_than_and() {
+        // `a || b && c` → `a || (b && c)`.
+        let e = parse_expr_str("a || b && c").unwrap();
+        match e.kind {
+            ExprKind::Binary { op: BinaryOp::Or, rhs, .. } => {
+                assert!(matches!(rhs.kind, ExprKind::Binary { op: BinaryOp::And, .. }));
+            }
+            other => panic!("expected Or, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn expr_precedence_compare_below_arith() {
+        // `a + 1 < b * 2` → `(a + 1) < (b * 2)`.
+        let e = parse_expr_str("a + 1 < b * 2").unwrap();
+        match e.kind {
+            ExprKind::Binary { op: BinaryOp::Lt, lhs, rhs } => {
+                assert!(matches!(lhs.kind, ExprKind::Binary { op: BinaryOp::Add, .. }));
+                assert!(matches!(rhs.kind, ExprKind::Binary { op: BinaryOp::Mul, .. }));
+            }
+            other => panic!("expected Lt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn expr_bitwise_precedence() {
+        // `&` binds tighter than `^`, which binds tighter than `|`.
+        // `a | b ^ c & d` → `a | (b ^ (c & d))`.
+        let e = parse_expr_str("a | b ^ c & d").unwrap();
+        match e.kind {
+            ExprKind::Binary { op: BinaryOp::BitOr, rhs, .. } => match rhs.kind {
+                ExprKind::Binary { op: BinaryOp::BitXor, rhs: rhs2, .. } => {
+                    assert!(matches!(
+                        rhs2.kind,
+                        ExprKind::Binary { op: BinaryOp::BitAnd, .. }
+                    ));
+                }
+                other => panic!("expected BitXor under BitOr, got {:?}", other),
+            },
+            other => panic!("expected BitOr at top, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn expr_shift_precedence() {
+        // `a + b << 2` → `(a + b) << 2`? No — `<<` is bp 15/16, `+` is 17/18,
+        // so `+` binds tighter: `(a + b) << 2`.
+        let e = parse_expr_str("a + b << 2").unwrap();
+        match e.kind {
+            ExprKind::Binary { op: BinaryOp::Shl, lhs, .. } => {
+                assert!(matches!(lhs.kind, ExprKind::Binary { op: BinaryOp::Add, .. }));
+            }
+            other => panic!("expected Shl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn expr_paren_overrides_precedence() {
+        // `(1 + 2) * 3` — explicit grouping.
+        let e = parse_expr_str("(1 + 2) * 3").unwrap();
+        match e.kind {
+            ExprKind::Binary { op: BinaryOp::Mul, lhs, .. } => {
+                assert!(matches!(lhs.kind, ExprKind::Paren(_)));
+            }
+            other => panic!("expected Mul, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn expr_unary_then_binary() {
+        // `-a + b` → `(-a) + b`. Unary binds tighter than binary.
+        let e = parse_expr_str("-a + b").unwrap();
+        match e.kind {
+            ExprKind::Binary { op: BinaryOp::Add, lhs, .. } => {
+                assert!(matches!(lhs.kind, ExprKind::Unary { op: UnaryOp::Neg, .. }));
+            }
+            other => panic!("expected Add, got {:?}", other),
+        }
+    }
+
+    // ── Cast and range ───────────────────────────────────────────────────
+
+    #[test]
+    fn expr_cast() {
+        let e = parse_expr_str("x as u32").unwrap();
+        match e.kind {
+            ExprKind::Cast { value, ty } => {
+                assert!(matches!(value.kind, ExprKind::Path(_)));
+                assert_eq!(ty.kind, TypeKind::Primitive(PrimitiveType::U32));
+            }
+            other => panic!("expected Cast, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn expr_range_half_open() {
+        let e = parse_expr_str("0..n").unwrap();
+        match e.kind {
+            ExprKind::Range { inclusive, .. } => assert!(!inclusive),
+            other => panic!("expected Range, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn expr_range_inclusive() {
+        let e = parse_expr_str("0..=10").unwrap();
+        match e.kind {
+            ExprKind::Range { inclusive, .. } => assert!(inclusive),
+            other => panic!("expected Range, got {:?}", other),
+        }
+    }
+
+    // ── Narrow unsafe expressions (Decision #17) ─────────────────────────
+
+    #[test]
+    fn expr_unchecked_load() {
+        let e = parse_expr_str("#unchecked_load<u32>(p)").unwrap();
+        match e.kind {
+            ExprKind::UncheckedLoad { ty, ptr } => {
+                assert_eq!(ty.kind, TypeKind::Primitive(PrimitiveType::U32));
+                assert!(matches!(ptr.kind, ExprKind::Path(_)));
+            }
+            other => panic!("expected UncheckedLoad, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn expr_volatile_load() {
+        let e = parse_expr_str("#volatile_load<u8>(reg)").unwrap();
+        assert!(matches!(e.kind, ExprKind::VolatileLoad { .. }));
+    }
+
+    #[test]
+    fn expr_unchecked_cast_with_reason() {
+        let e =
+            parse_expr_str(r#"#unchecked_cast<u32, i32>("safe per ABI", x)"#).unwrap();
+        match e.kind {
+            ExprKind::UncheckedCast { reason, .. } => {
+                assert_eq!(reason, "safe per ABI");
+            }
+            other => panic!("expected UncheckedCast, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn expr_unchecked_cast_rejects_empty_reason() {
+        // Refinement #19a: reason string must be non-empty.
+        let err = parse_expr_str(r#"#unchecked_cast<u32, i32>("", x)"#).expect_err("empty reason");
+        assert!(matches!(
+            err,
+            ParseError::Expected {
+                expected: "non-empty reason string for `#unchecked_cast` (Refinement #19a)",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn expr_unchecked_cast_rejects_whitespace_reason() {
+        let err = parse_expr_str(r#"#unchecked_cast<u32, i32>("   ", x)"#)
+            .expect_err("whitespace-only reason");
+        assert!(matches!(err, ParseError::Expected { .. }));
+    }
+
+    #[test]
+    fn expr_unchecked_offset() {
+        let e = parse_expr_str("#unchecked_offset<u8>(p, 4)").unwrap();
+        match e.kind {
+            ExprKind::UncheckedOffset { ty, n, .. } => {
+                assert_eq!(ty.kind, TypeKind::Primitive(PrimitiveType::U8));
+                assert_eq!(n.kind, ExprKind::IntLit("4".into()));
+            }
+            other => panic!("expected UncheckedOffset, got {:?}", other),
+        }
+    }
+
+    // ── Statements ───────────────────────────────────────────────────────
+
+    #[test]
+    fn stmt_let_explicit() {
+        let s = parse_stmt_str("let x: u32 = 1;");
+        match s.kind {
+            StmtKind::Let { mutable, name, ty, value } => {
+                assert!(!mutable);
+                assert_eq!(name, "x");
+                assert!(ty.is_some());
+                assert_eq!(value.kind, ExprKind::IntLit("1".into()));
+            }
+            other => panic!("expected Let, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn stmt_let_mut_explicit() {
+        let s = parse_stmt_str("let mut count: u32 = 0;");
+        match s.kind {
+            StmtKind::Let { mutable, .. } => assert!(mutable),
+            other => panic!("expected Let, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn stmt_let_no_type_annotation() {
+        let s = parse_stmt_str("let x = 1;");
+        match s.kind {
+            StmtKind::Let { ty, .. } => assert!(ty.is_none()),
+            other => panic!("expected Let, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn stmt_let_short() {
+        // Decision #8: `let x := expr;` short form.
+        let s = parse_stmt_str("let n := 42;");
+        match s.kind {
+            StmtKind::LetShort { name, value } => {
+                assert_eq!(name, "n");
+                assert_eq!(value.kind, ExprKind::IntLit("42".into()));
+            }
+            other => panic!("expected LetShort, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn stmt_let_short_rejects_mut() {
+        let wrapped = "@fn t() { let mut x := 1; }";
+        let err = parse_str(wrapped).expect_err("`let mut x :=` should be rejected");
+        assert!(matches!(err, ParseError::Expected { .. }));
+    }
+
+    #[test]
+    fn stmt_return_with_value() {
+        let s = parse_stmt_str("return 42;");
+        match s.kind {
+            StmtKind::Return(Some(e)) => {
+                assert_eq!(e.kind, ExprKind::IntLit("42".into()));
+            }
+            other => panic!("expected Return(Some), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn stmt_return_no_value() {
+        let s = parse_stmt_str("return;");
+        assert!(matches!(s.kind, StmtKind::Return(None)));
+    }
+
+    #[test]
+    fn stmt_expr() {
+        let s = parse_stmt_str("foo();");
+        match s.kind {
+            StmtKind::Expr(e) => {
+                assert!(matches!(e.kind, ExprKind::Call { .. }));
+            }
+            other => panic!("expected Expr, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn stmt_mutate_block() {
+        let s = parse_stmt_str("#mutate Counter { value = 1, last = 0 };");
+        match s.kind {
+            StmtKind::Mutate { automaton, assigns } => {
+                assert_eq!(automaton, "Counter");
+                assert_eq!(assigns.len(), 2);
+                let FieldAssign { field, index, value, .. } = &assigns[0];
+                assert_eq!(field, "value");
+                assert!(index.is_none());
+                assert_eq!(value.kind, ExprKind::IntLit("1".into()));
+            }
+            other => panic!("expected Mutate, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn stmt_mutate_with_indexed_field() {
+        let s = parse_stmt_str("#mutate Buf { buf[3] = 0xFF };");
+        match s.kind {
+            StmtKind::Mutate { assigns, .. } => {
+                assert!(assigns[0].index.is_some());
+            }
+            other => panic!("expected Mutate, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn stmt_mutate_short_eq() {
+        // Decision #15: `Auto.field = expr;`
+        let s = parse_stmt_str("Counter.value = 5;");
+        match s.kind {
+            StmtKind::MutateShort { automaton, field, op, value } => {
+                assert_eq!(automaton, "Counter");
+                assert_eq!(field, "value");
+                assert_eq!(op, AssignOp::Eq);
+                assert_eq!(value.kind, ExprKind::IntLit("5".into()));
+            }
+            other => panic!("expected MutateShort, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn stmt_mutate_short_plus_eq() {
+        let s = parse_stmt_str("Counter.value += 1;");
+        match s.kind {
+            StmtKind::MutateShort { op, .. } => assert_eq!(op, AssignOp::PlusEq),
+            other => panic!("expected MutateShort, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn stmt_mutate_short_all_compound_ops() {
+        let cases = [
+            ("Counter.x -= 1;", AssignOp::MinusEq),
+            ("Counter.x *= 2;", AssignOp::StarEq),
+            ("Counter.x /= 2;", AssignOp::SlashEq),
+            ("Counter.x %= 2;", AssignOp::PercentEq),
+            ("Counter.x &= 0xFF;", AssignOp::AmpEq),
+            ("Counter.x |= 1;", AssignOp::PipeEq),
+            ("Counter.x ^= 1;", AssignOp::CaretEq),
+            ("Counter.x <<= 1;", AssignOp::ShlEq),
+            ("Counter.x >>= 1;", AssignOp::ShrEq),
+        ];
+        for (src, expected) in cases {
+            let s = parse_stmt_str(src);
+            match s.kind {
+                StmtKind::MutateShort { op, .. } => {
+                    assert_eq!(op, expected, "src: {src}");
+                }
+                other => panic!("expected MutateShort for {src:?}, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn stmt_proc_call_no_args() {
+        let s = parse_stmt_str("#> tick();");
+        match s.kind {
+            StmtKind::ProcCall { name, args } => {
+                assert_eq!(name, "tick");
+                assert!(args.is_empty());
+            }
+            other => panic!("expected ProcCall, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn stmt_proc_call_with_args() {
+        let s = parse_stmt_str("#> log(1, 2);");
+        match s.kind {
+            StmtKind::ProcCall { name, args } => {
+                assert_eq!(name, "log");
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected ProcCall, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn stmt_unchecked_store() {
+        let s = parse_stmt_str("#unchecked_store<u32>(p, 0xCAFE);");
+        match s.kind {
+            StmtKind::UncheckedStore { ty, .. } => {
+                assert_eq!(ty.kind, TypeKind::Primitive(PrimitiveType::U32));
+            }
+            other => panic!("expected UncheckedStore, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn stmt_volatile_store() {
+        let s = parse_stmt_str("#volatile_store<u8>(reg, 1);");
+        assert!(matches!(s.kind, StmtKind::VolatileStore { .. }));
+    }
+
+    // ── Body / Block wiring ──────────────────────────────────────────────
+
+    #[test]
+    fn empty_body_block_has_no_stmts() {
+        let body = parse_body_str("");
+        assert!(body.stmts.is_empty());
+    }
+
+    #[test]
+    fn body_with_multiple_stmts() {
+        let body = parse_body_str(
+            "let x: u32 = 1;\
+             let y := 2;\
+             #> tick();\
+             return x;",
+        );
+        assert_eq!(body.stmts.len(), 4);
+        assert!(matches!(body.stmts[0].kind, StmtKind::Let { .. }));
+        assert!(matches!(body.stmts[1].kind, StmtKind::LetShort { .. }));
+        assert!(matches!(body.stmts[2].kind, StmtKind::ProcCall { .. }));
+        assert!(matches!(body.stmts[3].kind, StmtKind::Return(_)));
+    }
+
+    #[test]
+    fn fn_body_round_trips_through_decl() {
+        let p = parse_str("@fn add() -> u32 { let x := 1; return x; }").unwrap();
+        match &p.items[0] {
+            Item::Fn(decl) => {
+                assert_eq!(decl.body.stmts.len(), 2);
+            }
+            other => panic!("expected Fn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn effect_body_round_trips_through_decl() {
+        let p = parse_str(
+            "#effect tick() #mutates: [Counter] { Counter.value += 1; }",
+        )
+        .unwrap();
+        match &p.items[0] {
+            Item::Effect(decl) => {
+                assert_eq!(decl.body.stmts.len(), 1);
+                assert!(matches!(decl.body.stmts[0].kind, StmtKind::MutateShort { .. }));
+            }
+            other => panic!("expected Effect, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn interrupt_body_round_trips_through_decl() {
+        let p = parse_str(
+            "#interrupt UART_RX() #mutates: [Logger] #priority: HIGH { #> log(1); }",
+        )
+        .unwrap();
+        match &p.items[0] {
+            Item::Interrupt(decl) => {
+                assert_eq!(decl.body.stmts.len(), 1);
+                assert!(matches!(decl.body.stmts[0].kind, StmtKind::ProcCall { .. }));
+            }
+            other => panic!("expected Interrupt, got {:?}", other),
+        }
+    }
+
+    // ── Realistic combined exercise ──────────────────────────────────────
+
+    #[test]
+    fn realistic_effect_body() {
+        // A realistic `tick` effect: read state, compute, write back.
+        let src = "\
+            #effect tick() #mutates: [Counter] {\n  \
+              let next: u32 = Counter.value + 1;\n  \
+              Counter.value = next;\n  \
+              return;\n\
+            }";
+        let p = parse_str(src).expect("parse realistic tick effect");
+        match &p.items[0] {
+            Item::Effect(decl) => {
+                assert_eq!(decl.body.stmts.len(), 3);
+            }
+            other => panic!("expected Effect, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn body_span_covers_braces() {
+        let src = "@fn t() { let x := 1; }";
+        let p = parse_str(src).unwrap();
+        match &p.items[0] {
+            Item::Fn(decl) => {
+                let open = src.find('{').unwrap();
+                let close = src.rfind('}').unwrap() + 1;
+                assert_eq!(decl.body.span.start, open);
+                assert_eq!(decl.body.span.end, close);
+            }
+            other => panic!("expected Fn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_expression_rejects_trailing_junk() {
+        // The public `parse_expression` entry point should error if tokens
+        // remain after the expression.
+        let err = parse_expr_str("1 + 2 garbage").expect_err("trailing junk");
+        assert!(matches!(
+            err,
+            ParseError::Expected {
+                expected: "EOF after expression",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn slice_7_real_program_blinky_with_bodies() {
+        // A realistic — and now FULLY parseable — Clifford program.
+        // Exercises every Phase-0 surface: automata, effects with bodies,
+        // interrupts with bodies, traits, types, ADTs, generic params,
+        // trait bounds, mutate sugar, narrow unsafe primitives, state reads,
+        // proc-calls, returns, arithmetic, comparisons, casts.
+        let src = "\
+            @type LedState = | Off | On;\n\
+            \n\
+            @trait Tick {\n  \
+              @fn tick(self) -> u32 $ [Pure];\n\
+            }\n\
+            \n\
+            #automaton Counter { }\n\
+            \n\
+            #effect bump() #mutates: [Counter] {\n  \
+              let next: u32 = Counter.value + 1;\n  \
+              Counter.value = next;\n  \
+              return;\n\
+            }\n\
+            \n\
+            #effect read_status() -> u8 #mutates: [] {\n  \
+              let raw := #volatile_load<u8>(status_reg);\n  \
+              return raw & 0xFF;\n\
+            }\n\
+            \n\
+            #interrupt USART1_IRQHandler() #mutates: [Counter] #priority: HIGH {\n  \
+              #> bump();\n  \
+              Counter.last_irq = Counter.value;\n\
+            }\n\
+            \n\
+            #interface Serial {\n  \
+              effect send_byte(b: u8);\n  \
+              effect recv_byte() -> u8;\n\
+            }\n\
+            \n\
+            #impl Serial for Counter { }\n\
+            \n\
+            @sequential(Counter, Counter);\n\
+            \n\
+            @fn cmd_is_help(buf: &[u8], min_len: usize) -> bool $ [Pure] {\n  \
+              let len := min_len + 4;\n  \
+              return buf[0] == b'h' && len > 0;\n\
+            }\n\
+            \n\
+            #effect main() #mutates: [Counter] {\n  \
+              let mut x: u32 = 0;\n  \
+              #> bump();\n  \
+              return;\n\
+            }\n\
+        ";
+        let p = parse_str(src).expect("parse realistic blinky program");
+
+        // 11 top-level items.
+        assert_eq!(p.items.len(), 11);
+
+        // `main` is `#effect` — an imperative entry per the layer rules.
+        // (Per Decision #1 / Emergent Rule 4, `@fn main()` could not contain
+        //  `let mut` or `#> proc()` calls — those are #-layer constructs.)
+        match &p.items[10] {
+            Item::Effect(decl) => {
+                assert_eq!(decl.name, "main");
+                assert_eq!(decl.mutates, vec!["Counter".to_string()]);
+            }
+            other => panic!("expected #effect main at index 10, got {:?}", other),
+        }
+
+        // Spot-check the effect with a real body.
+        match &p.items[3] {
+            Item::Effect(decl) => {
+                assert_eq!(decl.name, "bump");
+                assert_eq!(decl.body.stmts.len(), 3);
+                assert!(matches!(decl.body.stmts[0].kind, StmtKind::Let { .. }));
+                assert!(matches!(decl.body.stmts[1].kind, StmtKind::MutateShort { .. }));
+                assert!(matches!(decl.body.stmts[2].kind, StmtKind::Return(None)));
+            }
+            other => panic!("expected #effect bump at index 3, got {:?}", other),
+        }
+
+        // The interrupt has a real body too.
+        match &p.items[5] {
+            Item::Interrupt(decl) => {
+                assert_eq!(decl.name, "USART1_IRQHandler");
+                assert_eq!(decl.body.stmts.len(), 2);
+                assert!(matches!(decl.body.stmts[0].kind, StmtKind::ProcCall { .. }));
+                assert!(matches!(decl.body.stmts[1].kind, StmtKind::MutateShort { .. }));
+            }
+            other => panic!("expected #interrupt at index 5, got {:?}", other),
+        }
+
+        // The pure helper got its trait list AND its body.
+        match &p.items[9] {
+            Item::Fn(decl) => {
+                assert_eq!(decl.name, "cmd_is_help");
+                assert_eq!(decl.trait_list.len(), 1);
+                assert_eq!(decl.trait_list[0].name, "Pure");
+                assert_eq!(decl.body.stmts.len(), 2);
+            }
+            other => panic!("expected @fn cmd_is_help at index 9, got {:?}", other),
         }
     }
 

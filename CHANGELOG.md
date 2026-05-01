@@ -7,6 +7,36 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Phase 0 parser slice 7: function/effect/interrupt bodies (2026-05-01)
+
+- `clifford-ast`: full `Expr` / `ExprKind` covering §2.6 — literals (int/hex/bin/
+  float/char/byte/string/bool/null), paths, `Auto@state` reads, parenthesised
+  expressions, tuples, array literals, array-repeat literals, postfix
+  `.field` / `.method(args)` / `[index]` / `(args)`, prefix unary
+  (`-`, `!`, `~`, `*`), borrows (`&`, `&mut`), full binary operator set,
+  `as` casts, `..` / `..=` ranges, and the narrow unsafe expressions
+  (`#unchecked_load`, `#volatile_load`, `#unchecked_cast`, `#unchecked_offset`).
+- `clifford-ast`: `Stmt` / `StmtKind` for `let` / `let mut` / `let x := …`,
+  `return`, `#mutate Auto { … }`, `Auto.field <op>= …` (Decision #15 sugar
+  with all 11 compound-assignment operators), `#> proc(args)`, and the
+  unsafe-store primitives.
+- `clifford-ast`: `Block { stmts, span }` wired into `FnDecl`, `EffectDecl`,
+  and `InterruptDecl`.
+- `clifford-parser`: Pratt-style expression parser with binding-power table
+  (range 1, `||` 3/4, `&&` 5/6, comparisons 7/8, bitwise `|` 9/10 / `^` 11/12 /
+  `&` 13/14, shifts 15/16, +/- 17/18, */// 19/20, `as` 23, unary 25);
+  recursive-descent statement parser with multi-token lookahead for the
+  `Auto.field <op>= …` sugar; public `parse_expression` entry point;
+  `parse_block` wired into all three declaration parsers.
+- `clifford-parser`: 72 new tests covering atoms, postfix chains,
+  precedence (mul-over-add, left-associative, comparison-below-arith,
+  bitwise hierarchy, shift-vs-add, paren overrides), unary, borrows,
+  cast, ranges, narrow unsafe primitives (including the non-empty-reason
+  rejection per Refinement #19a), every statement form including all 11
+  compound-assignment operators, body wiring through `@fn` / `#effect` /
+  `#interrupt`, and a realistic 11-item program exercising every Phase-0
+  surface end-to-end.
+
 ### Added — Phase 0 bootstrap (2026-04-30)
 
 - Cargo workspace skeleton at the project root; rust-toolchain pinned to 1.76.0.
