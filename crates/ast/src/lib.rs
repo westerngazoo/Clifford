@@ -157,16 +157,19 @@ impl Item {
     }
 }
 
-/// An `@fn name() { … }` declaration.
+/// An `@fn name() -> T { … }` declaration.
 ///
-/// First-slice scope: name + span only. Generic parameters, value parameters,
-/// return type, trait list (`$ [TraitList]` — Decision #2), where-clause,
-/// extern modifier, and body all arrive in subsequent slices.
+/// Slice-3 scope: name, optional return type, span. Generic parameters,
+/// value parameters, trait list (`$ [TraitList]` — Decision #2),
+/// where-clause, extern modifier, and body all arrive in subsequent slices.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FnDecl {
     /// The function's name.
     pub name: String,
-    /// Source span covering `@fn name() { }` end-to-end.
+    /// Optional return type. `None` means `()` (unit) by spec convention,
+    /// preserved as `None` so round-tripping reproduces source exactly.
+    pub return_type: Option<TypeExpr>,
+    /// Source span covering `@fn name() -> T { }` end-to-end.
     pub span: Span,
 }
 
@@ -293,6 +296,184 @@ pub struct SequentialAttr {
     pub span: Span,
 }
 
+// ─── Type expressions (§2.7) ─────────────────────────────────────────────────
+
+/// A type expression — anywhere a type can appear (function parameters,
+/// return types, struct/automaton field types, ADT variant payloads, type
+/// aliases, etc.).
+///
+/// `TypeExpr` is recursive (types contain types — `&T`, `[T; N]`,
+/// `(T1, T2)`, `@fn(T) -> T`, `access<T>`, `Path<T>`), so the recursive
+/// arms wrap their inner [`TypeExpr`] in `Box` to keep the enum size
+/// finite. Wrapper structs hold the children to keep `TypeKind` flat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeExpr {
+    /// What kind of type this is.
+    pub kind: TypeKind,
+    /// Source span covering the whole type expression.
+    pub span: Span,
+}
+
+/// A type-expression variant. Mirrors §2.7 of `CLIFFORD_SPEC.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TypeKind {
+    /// `()` — the unit type.
+    Unit,
+    /// One of the predeclared primitive types from §4.1.
+    Primitive(PrimitiveType),
+    /// A path-based type: `Counter`, `Result<T, E>`, `clifford::core::Option<T>`.
+    /// Single-segment paths whose name doesn't match a primitive are also
+    /// represented here (the resolver decides at type-check time whether the
+    /// path resolves to a `@type`, an `#automaton`, etc.).
+    Path(PathType),
+    /// `&T` or `&mut T`. References are body-scoped per Decision #13;
+    /// occurrences in return positions or field positions are caught at
+    /// §5.7 (`E0702` / `E0703`).
+    Ref(RefType),
+    /// `access<T>` (read-write) or `access const<T>` (read-only) — Decision #19
+    /// nominal access types. Each `@type` declaration of an access type
+    /// produces a distinct nominal identity even when their underlying
+    /// representation is congruent.
+    Access(AccessType),
+    /// `[T; N]` — fixed-size array, stack-allocated.
+    Array(ArrayType),
+    /// `[T]` — slice (fat pointer: `(ptr, len)`).
+    Slice(SliceType),
+    /// `(T1, T2, …)` — tuple. Per §2.7 grammar requires ≥ 2 elements;
+    /// `(T)` is just a parenthesised type (not a 1-tuple) and `()` is `Unit`.
+    Tuple(TupleType),
+    /// `@fn(T1, T2) -> T3 $ [Trait, …]` — function-pointer type. The trait
+    /// list is part of the type's identity per §2.7 / Decision #2.
+    Fn(FnType),
+}
+
+/// Predeclared primitive types from §4.1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PrimitiveType {
+    /// `u8`
+    U8,
+    /// `u16`
+    U16,
+    /// `u32`
+    U32,
+    /// `u64`
+    U64,
+    /// `usize` (target pointer width)
+    Usize,
+    /// `i8`
+    I8,
+    /// `i16`
+    I16,
+    /// `i32`
+    I32,
+    /// `i64`
+    I64,
+    /// `isize` (target pointer width)
+    Isize,
+    /// `f32`
+    F32,
+    /// `f64`
+    F64,
+    /// `bool` (1 bit logically; stored as 8)
+    Bool,
+    /// `char` (Unicode scalar value; 32-bit)
+    Char,
+}
+
+/// A path-based type with optional generic arguments.
+///
+/// `segments` holds the `::`-separated parts, e.g. `clifford::core::Option`
+/// becomes `["clifford", "core", "Option"]`. The vector is always non-empty.
+/// `generic_args` is empty for non-generic paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathType {
+    /// `::`-separated segments, leftmost first. Always at least one segment.
+    pub segments: Vec<String>,
+    /// `<T1, T2, …>` arguments after the path. Empty for non-generic paths.
+    pub generic_args: Vec<TypeExpr>,
+}
+
+/// A reference type `&T` (immutable) or `&mut T`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefType {
+    /// `true` for `&mut T`, `false` for `&T`.
+    pub mutable: bool,
+    /// The referenced type.
+    pub inner: Box<TypeExpr>,
+}
+
+/// A nominal access type `access<T>` (read-write) or `access const<T>` (Decision #19).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessType {
+    /// `true` for `access const<T>`, `false` for `access<T>`.
+    pub is_const: bool,
+    /// The pointee type.
+    pub inner: Box<TypeExpr>,
+}
+
+/// A fixed-size array type `[T; N]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArrayType {
+    /// Element type.
+    pub element: Box<TypeExpr>,
+    /// Array length.
+    pub size: ArraySize,
+}
+
+/// The size of an array type. v0.1 only supports integer literals here
+/// (`[u8; 64]`); generic-parameter sizes (`[T; N]` where `N` is a const
+/// generic) and full const expressions are deferred to subsequent slices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArraySize {
+    /// Raw integer-literal text from the lexer (e.g. `"64"`, `"1_000"`).
+    /// The type checker validates the numeric value against `usize::MAX`.
+    IntLiteral(String),
+}
+
+/// A slice type `[T]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SliceType {
+    /// Element type.
+    pub element: Box<TypeExpr>,
+}
+
+/// A tuple type `(T1, T2, …)` with ≥ 2 elements.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TupleType {
+    /// Element types in source order. Always at least 2 elements per §2.7.
+    pub elements: Vec<TypeExpr>,
+}
+
+/// A function-pointer type `@fn(T1, T2) -> T3 $ [Trait, …]`.
+///
+/// Per §2.7 / Decision #2, two function-pointer types differing only in
+/// trait list are distinct types. Assigning a `$ [Readable]` `@fn` to a
+/// slot expecting `$ [Pure]` is a type error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FnType {
+    /// Parameter types in declaration order.
+    pub params: Vec<TypeExpr>,
+    /// Return type, or `None` for `@fn(...)` with no `-> T` (which means
+    /// returns `Unit`; preserved as `None` to round-trip exactly).
+    pub return_type: Option<Box<TypeExpr>>,
+    /// `$ [TraitList]` markers attached to the function-pointer type.
+    /// Empty if no `$ [...]` appears.
+    pub trait_list: Vec<TraitRef>,
+}
+
+/// A reference to a trait (in a trait-list, in a generic bound, or in an
+/// `#impl Interface for Automaton` clause).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraitRef {
+    /// Trait name (single segment for now; multi-segment paths arrive when
+    /// the module system lands).
+    pub name: String,
+    /// Generic arguments to the trait, if any (e.g., `Iterator<Item = T>`
+    /// would be `Iterator<T>` in v0.1's simpler form).
+    pub generic_args: Vec<TypeExpr>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,6 +498,7 @@ mod tests {
     fn item_layer_is_derived_from_variant() {
         let f = Item::Fn(FnDecl {
             name: "foo".into(),
+            return_type: None,
             span: Span::new(0, 10),
         });
         assert_eq!(f.layer(), Layer::Functional);
