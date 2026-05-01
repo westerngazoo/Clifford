@@ -56,9 +56,10 @@
 
 use clifford_ast::{
     AccessType, ArraySize, ArrayType, AutomatonDecl, EffectDecl, Field, FnDecl, FnType,
-    GenericParam, ImplDecl, InterfaceDecl, InterruptDecl, Item, Param, PathType, PriorityLevel,
-    PrimitiveType, Program, RefType, SequentialAttr, SliceType, TestDecl, TraitRef, TupleType,
-    TypeBody, TypeDecl, TypeExpr, TypeKind, Variant, VariantData,
+    GenericParam, ImplDecl, InterfaceDecl, InterfaceMethod, InterruptDecl, Item, Param, PathType,
+    PriorityLevel, PrimitiveType, Program, RefType, SequentialAttr, SliceType, TestDecl,
+    TraitDecl, TraitMethod, TraitRef, TupleType, TypeBody, TypeDecl, TypeExpr, TypeKind, Variant,
+    VariantData,
 };
 use clifford_lexer::{Span, Token, TokenKind};
 use thiserror::Error;
@@ -211,6 +212,7 @@ impl<'t> Parser<'t> {
         match lead.kind {
             TokenKind::KwAtFn => self.parse_fn_decl(lead.span.start).map(Item::Fn),
             TokenKind::KwAtType => self.parse_type_decl(lead.span.start).map(Item::Type),
+            TokenKind::KwAtTrait => self.parse_trait_decl(lead.span.start).map(Item::Trait),
             TokenKind::KwHashAutomaton => {
                 self.parse_automaton_decl(lead.span.start).map(Item::Automaton)
             }
@@ -388,6 +390,12 @@ impl<'t> Parser<'t> {
     }
 
     /// Parse a single `mut? name : TypeExpr` parameter.
+    ///
+    /// Special case: a bare `self` (without `: Type`) is accepted as a
+    /// receiver-style parameter and gets a synthesised `Self` type. This
+    /// matches the §4.5 example `@fn init(self) -> Self;`. Users can also
+    /// write the explicit form `self: Self`, `self: &Self`, `self: &mut Self`
+    /// when they need precise control.
     fn parse_param(&mut self) -> Result<Param, ParseError> {
         let start = self.peek().span.start;
         let mutable = if matches!(self.peek().kind, TokenKind::KwMut) {
@@ -396,10 +404,50 @@ impl<'t> Parser<'t> {
         } else {
             false
         };
-        let (name, _) = self.expect_ident("parameter name")?;
-        self.expect(TokenKind::Colon, "`:` between parameter name and type")?;
-        let ty = self.parse_type()?;
-        let end = ty.span.end;
+
+        // Accept `self` (KwSelf) or any `Ident` as parameter name.
+        let lead = self.peek().clone();
+        let (name, name_span) = match lead.kind {
+            TokenKind::Ident(s) => {
+                self.advance();
+                (s, lead.span)
+            }
+            TokenKind::KwSelf => {
+                self.advance();
+                ("self".to_owned(), lead.span)
+            }
+            TokenKind::Eof => {
+                return Err(ParseError::UnexpectedEof {
+                    context: "parameter name",
+                });
+            }
+            other => {
+                return Err(ParseError::Expected {
+                    expected: "parameter name",
+                    found: other,
+                    at: lead.span.start,
+                });
+            }
+        };
+
+        // Type clause: required in general; optional for `self` (defaults
+        // to synthesised `Self` per the §4.5 receiver-shorthand convention).
+        let (ty, end) = if name == "self" && !matches!(self.peek().kind, TokenKind::Colon) {
+            let self_ty = TypeExpr {
+                kind: TypeKind::Path(PathType {
+                    segments: vec!["Self".to_owned()],
+                    generic_args: Vec::new(),
+                }),
+                span: name_span,
+            };
+            (self_ty, name_span.end)
+        } else {
+            self.expect(TokenKind::Colon, "`:` between parameter name and type")?;
+            let ty = self.parse_type()?;
+            let end = ty.span.end;
+            (ty, end)
+        };
+
         Ok(Param {
             mutable,
             name,
@@ -408,16 +456,127 @@ impl<'t> Parser<'t> {
         })
     }
 
-    /// Parse `#interface Name { }` (Decision #16).
+    /// Parse `#interface Name<T> { effect sig; effect sig; }` (Decision #16).
     ///
-    /// Slice-2 form. Empty body for now; method signatures land in slice 3.
+    /// Body contains zero or more effect signatures. Each signature is
+    /// `effect name(params) -> ret;`. The implicit `#mutates: [self]` per
+    /// Decision #16 Rule 1 is restored at name-resolution time, not stored
+    /// in the AST.
     fn parse_interface_decl(&mut self, start: usize) -> Result<InterfaceDecl, ParseError> {
         self.advance(); // `#interface`
         let (name, _) = self.expect_ident("interface name after `#interface`")?;
+        let generic_params = if matches!(self.peek().kind, TokenKind::Lt) {
+            self.parse_generic_params()?
+        } else {
+            Vec::new()
+        };
         self.expect(TokenKind::LBrace, "`{` to open interface body")?;
+        let mut methods = Vec::new();
+        while !matches!(self.peek().kind, TokenKind::RBrace | TokenKind::Eof) {
+            methods.push(self.parse_interface_method()?);
+        }
         let close = self.expect(TokenKind::RBrace, "`}` to close interface body")?;
         Ok(InterfaceDecl {
             name,
+            generic_params,
+            methods,
+            span: Span::new(start, close.end),
+        })
+    }
+
+    /// Parse one `effect name(params) -> ret;` entry inside `#interface`.
+    ///
+    /// `effect` here is a contextual keyword inside an interface body,
+    /// not a sigil-prefixed token; the lexer produces an `Ident("effect")`.
+    /// The parser recognises it specifically in this context.
+    fn parse_interface_method(&mut self) -> Result<InterfaceMethod, ParseError> {
+        let start = self.peek().span.start;
+        // `effect` keyword (contextual; lexed as Ident).
+        let lead = self.peek().clone();
+        match lead.kind {
+            TokenKind::Ident(ref s) if s == "effect" => {
+                self.advance();
+            }
+            TokenKind::Eof => {
+                return Err(ParseError::UnexpectedEof {
+                    context: "interface method (expected `effect`)",
+                });
+            }
+            other => {
+                return Err(ParseError::Expected {
+                    expected: "`effect` keyword to start an interface method signature",
+                    found: other,
+                    at: lead.span.start,
+                });
+            }
+        }
+        let (name, _) = self.expect_ident("method name after `effect`")?;
+        let params = self.parse_param_list()?;
+        let return_type = if matches!(self.peek().kind, TokenKind::Arrow) {
+            self.advance();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        let close = self.expect(TokenKind::Semi, "`;` to terminate interface method signature")?;
+        Ok(InterfaceMethod {
+            name,
+            params,
+            return_type,
+            span: Span::new(start, close.end),
+        })
+    }
+
+    /// Parse `@trait Name<T> { @fn method_sig; @fn method_sig; }` (§4.5).
+    fn parse_trait_decl(&mut self, start: usize) -> Result<TraitDecl, ParseError> {
+        self.advance(); // `@trait`
+        let (name, _) = self.expect_ident("trait name after `@trait`")?;
+        let generic_params = if matches!(self.peek().kind, TokenKind::Lt) {
+            self.parse_generic_params()?
+        } else {
+            Vec::new()
+        };
+        self.expect(TokenKind::LBrace, "`{` to open trait body")?;
+        let mut methods = Vec::new();
+        while !matches!(self.peek().kind, TokenKind::RBrace | TokenKind::Eof) {
+            methods.push(self.parse_trait_method()?);
+        }
+        let close = self.expect(TokenKind::RBrace, "`}` to close trait body")?;
+        Ok(TraitDecl {
+            name,
+            generic_params,
+            methods,
+            span: Span::new(start, close.end),
+        })
+    }
+
+    /// Parse one `@fn name(params) -> ret $ [TraitList];` entry inside `@trait`.
+    fn parse_trait_method(&mut self) -> Result<TraitMethod, ParseError> {
+        let start = self.peek().span.start;
+        self.expect(
+            TokenKind::KwAtFn,
+            "`@fn` to start a trait method signature",
+        )?;
+        let (name, _) = self.expect_ident("method name after `@fn`")?;
+        let params = self.parse_param_list()?;
+        let return_type = if matches!(self.peek().kind, TokenKind::Arrow) {
+            self.advance();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        let trait_list = if matches!(self.peek().kind, TokenKind::Dollar) {
+            let (list, _) = self.parse_trait_list()?;
+            list
+        } else {
+            Vec::new()
+        };
+        let close = self.expect(TokenKind::Semi, "`;` to terminate trait method signature")?;
+        Ok(TraitMethod {
+            name,
+            params,
+            return_type,
+            trait_list,
             span: Span::new(start, close.end),
         })
     }
@@ -1587,10 +1746,19 @@ mod tests {
     }
 
     #[test]
-    fn interface_decl() {
-        let p = parse_str("#interface Serial { }").expect("parse #interface");
+    fn interface_decl_empty() {
+        let p = parse_str("#interface Serial { }").expect("parse empty #interface");
         match &p.items[0] {
-            Item::Interface(InterfaceDecl { name, .. }) => assert_eq!(name, "Serial"),
+            Item::Interface(InterfaceDecl {
+                name,
+                methods,
+                generic_params,
+                ..
+            }) => {
+                assert_eq!(name, "Serial");
+                assert!(methods.is_empty());
+                assert!(generic_params.is_empty());
+            }
             other => panic!("expected Interface, got {:?}", other),
         }
     }
@@ -2656,6 +2824,236 @@ mod tests {
                 }
             }
             _ => panic!(),
+        }
+    }
+
+    // ─── Slice 6: @trait + #interface bodies ─────────────────────────────
+
+    use clifford_ast::{InterfaceMethod, TraitDecl, TraitMethod};
+
+    #[test]
+    fn interface_with_one_method() {
+        let p = parse_str("#interface Serial { effect send_byte(b: u8); }")
+            .expect("parse interface with one method");
+        match &p.items[0] {
+            Item::Interface(InterfaceDecl { methods, .. }) => {
+                assert_eq!(methods.len(), 1);
+                let InterfaceMethod {
+                    name,
+                    params,
+                    return_type,
+                    ..
+                } = &methods[0];
+                assert_eq!(name, "send_byte");
+                assert_eq!(params.len(), 1);
+                assert_eq!(params[0].name, "b");
+                assert!(return_type.is_none());
+            }
+            other => panic!("expected Interface, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn interface_with_multiple_methods() {
+        let src =
+            "#interface Serial {\n  \
+             effect send_byte(b: u8);\n  \
+             effect recv_byte() -> u8;\n  \
+             effect flush() -> bool;\n\
+             }";
+        let p = parse_str(src).expect("parse Serial interface");
+        match &p.items[0] {
+            Item::Interface(InterfaceDecl { methods, .. }) => {
+                assert_eq!(methods.len(), 3);
+                assert_eq!(methods[0].name, "send_byte");
+                assert_eq!(methods[1].name, "recv_byte");
+                assert_eq!(methods[2].name, "flush");
+                // recv_byte has -> u8
+                assert_eq!(
+                    methods[1].return_type.as_ref().unwrap().kind,
+                    TypeKind::Primitive(PrimitiveType::U8)
+                );
+            }
+            other => panic!("expected Interface, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn interface_with_generic_params() {
+        let p = parse_str("#interface Container<T> { effect put(item: T); }")
+            .expect("parse generic interface");
+        match &p.items[0] {
+            Item::Interface(InterfaceDecl {
+                generic_params,
+                methods,
+                ..
+            }) => {
+                assert_eq!(generic_params.len(), 1);
+                assert_eq!(generic_params[0].name, "T");
+                assert_eq!(methods.len(), 1);
+            }
+            other => panic!("expected Interface, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn interface_method_must_start_with_effect_keyword() {
+        let err = parse_str("#interface X { send_byte(b: u8); }")
+            .expect_err("missing `effect` keyword");
+        assert!(matches!(
+            err,
+            ParseError::Expected {
+                expected: "`effect` keyword to start an interface method signature",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn interface_method_requires_terminating_semi() {
+        let err = parse_str("#interface X { effect foo() }").expect_err("missing `;`");
+        assert!(matches!(
+            err,
+            ParseError::Expected {
+                expected: "`;` to terminate interface method signature",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn trait_decl_empty() {
+        let p = parse_str("@trait Marker { }").expect("parse empty trait");
+        match &p.items[0] {
+            Item::Trait(TraitDecl {
+                name,
+                generic_params,
+                methods,
+                ..
+            }) => {
+                assert_eq!(name, "Marker");
+                assert!(generic_params.is_empty());
+                assert!(methods.is_empty());
+            }
+            other => panic!("expected Trait, got {:?}", other),
+        }
+        assert_eq!(p.items[0].layer(), Layer::Functional);
+    }
+
+    #[test]
+    fn trait_with_one_method() {
+        let p = parse_str("@trait Initializable { @fn init(self) -> Self; }")
+            .expect("parse trait with one method");
+        match &p.items[0] {
+            Item::Trait(TraitDecl { methods, .. }) => {
+                assert_eq!(methods.len(), 1);
+                let TraitMethod {
+                    name,
+                    params,
+                    return_type,
+                    trait_list,
+                    ..
+                } = &methods[0];
+                assert_eq!(name, "init");
+                assert_eq!(params.len(), 1);
+                assert_eq!(params[0].name, "self");
+                assert!(return_type.is_some());
+                assert!(trait_list.is_empty());
+            }
+            other => panic!("expected Trait, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn trait_with_method_having_trait_list() {
+        let p = parse_str("@trait Sensor { @fn read() -> u32 $ [Readable]; }")
+            .expect("parse trait with $-marked method");
+        match &p.items[0] {
+            Item::Trait(TraitDecl { methods, .. }) => {
+                assert_eq!(methods.len(), 1);
+                assert_eq!(methods[0].trait_list.len(), 1);
+                assert_eq!(methods[0].trait_list[0].name, "Readable");
+            }
+            other => panic!("expected Trait, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn trait_with_multiple_methods() {
+        let src = "@trait Iterator<T> {\n  \
+                   @fn next(self) -> Option;\n  \
+                   @fn count(self) -> usize $ [Pure];\n\
+                   }";
+        let p = parse_str(src).expect("parse multi-method trait");
+        match &p.items[0] {
+            Item::Trait(TraitDecl {
+                generic_params,
+                methods,
+                ..
+            }) => {
+                assert_eq!(generic_params.len(), 1);
+                assert_eq!(generic_params[0].name, "T");
+                assert_eq!(methods.len(), 2);
+            }
+            other => panic!("expected Trait, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn trait_method_must_start_with_at_fn() {
+        let err = parse_str("@trait X { fn foo(); }").expect_err("missing `@fn`");
+        assert!(matches!(
+            err,
+            ParseError::Expected {
+                expected: "`@fn` to start a trait method signature",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn trait_method_requires_terminating_semi() {
+        let err = parse_str("@trait X { @fn foo() }").expect_err("missing `;`");
+        assert!(matches!(
+            err,
+            ParseError::Expected {
+                expected: "`;` to terminate trait method signature",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn realistic_serial_interface_and_impl_pair() {
+        // The Decision #16 worked example shape. The #impl body is still
+        // empty pending statement parsing in slice 7, but the interface
+        // body is fully populated.
+        let src = "\
+            #interface Serial {\n  \
+              effect send_byte(b: u8);\n  \
+              effect recv_byte() -> u8;\n\
+            }\n\
+            #automaton Usart1 { }\n\
+            #impl Serial for Usart1 { }\n\
+        ";
+        let p = parse_str(src).expect("parse Serial + Usart1 + impl");
+        assert_eq!(p.items.len(), 3);
+        match &p.items[0] {
+            Item::Interface(InterfaceDecl { methods, .. }) => {
+                assert_eq!(methods.len(), 2);
+            }
+            other => panic!("expected Interface first, got {:?}", other),
+        }
+        match &p.items[2] {
+            Item::Impl(ImplDecl {
+                interface_name,
+                automaton_name,
+                ..
+            }) => {
+                assert_eq!(interface_name, "Serial");
+                assert_eq!(automaton_name, "Usart1");
+            }
+            other => panic!("expected Impl, got {:?}", other),
         }
     }
 

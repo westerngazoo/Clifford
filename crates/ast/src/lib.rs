@@ -103,6 +103,8 @@ pub enum Item {
     Automaton(AutomatonDecl),
     /// An `@type` declaration: type alias or ADT (sum type).
     Type(TypeDecl),
+    /// An `@trait Name { method_sigs }` declaration (§4.5).
+    Trait(TraitDecl),
     /// An `#effect` declaration (top-level per Refinement #5a).
     Effect(EffectDecl),
     /// An `#interrupt` declaration. Differs from `#effect` in that the name
@@ -132,7 +134,9 @@ impl Item {
     #[must_use]
     pub fn layer(&self) -> Layer {
         match self {
-            Self::Fn(_) | Self::Type(_) | Self::Sequential(_) => Layer::Functional,
+            Self::Fn(_) | Self::Type(_) | Self::Trait(_) | Self::Sequential(_) => {
+                Layer::Functional
+            }
             Self::Automaton(_)
             | Self::Effect(_)
             | Self::Interrupt(_)
@@ -149,6 +153,7 @@ impl Item {
         match self {
             Self::Fn(d) => d.span,
             Self::Type(d) => d.span,
+            Self::Trait(d) => d.span,
             Self::Automaton(d) => d.span,
             Self::Effect(d) => d.span,
             Self::Interrupt(d) => d.span,
@@ -276,16 +281,77 @@ pub enum PriorityLevel {
     Numeric(String),
 }
 
-/// An `#interface Name { … }` declaration (Decision #16).
+/// An `#interface Name { effect sig; effect sig; }` declaration (Decision #16).
 ///
-/// Slice-2 scope: name + span only. The interface body — a list of effect
-/// signatures `effect name(params) -> ret;` — arrives in slice 3 alongside
-/// parameter and return-type parsing.
+/// Slice-6 scope: name + body of effect signatures (signatures only, no
+/// bodies — those land in `#impl` per Decision #16). Implementation method
+/// bodies are still slice 7 (statement parsing).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterfaceDecl {
     /// The interface's name.
     pub name: String,
+    /// Generic parameters in declaration order. Empty for non-generic
+    /// interfaces (the common case).
+    pub generic_params: Vec<GenericParam>,
+    /// Effect signatures the interface requires. Each `effect name(params)
+    /// -> ret;` is one entry. Empty body interfaces are valid (rare in
+    /// practice; useful as marker traits).
+    pub methods: Vec<InterfaceMethod>,
     /// Source span covering the full declaration.
+    pub span: Span,
+}
+
+/// One `effect name(params) -> ret;` entry inside an `#interface` body.
+///
+/// The implicit `#mutates: [self]` per Decision #16 Rule 1 is not stored
+/// on the AST node — it's restored at `clifford-resolve` / `clifford-effect`
+/// time when the interface is monomorphized against a concrete automaton.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceMethod {
+    /// Method name.
+    pub name: String,
+    /// Value parameters in source order.
+    pub params: Vec<Param>,
+    /// Optional return type. `None` ⇒ unit.
+    pub return_type: Option<TypeExpr>,
+    /// Source span covering the full signature including the trailing `;`.
+    pub span: Span,
+}
+
+/// An `@trait Name { method_sigs }` declaration (§4.5).
+///
+/// Per Decision #2 (hybrid trait scheme), traits declare method signatures;
+/// satisfaction is structural — any `@type` with matching method signatures
+/// satisfies the trait without needing an explicit `impl` block. Optional
+/// explicit `impl Trait for Type` form is reserved for v0.2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraitDecl {
+    /// The trait's name.
+    pub name: String,
+    /// Generic parameters in declaration order. Empty for non-generic
+    /// traits (the common case).
+    pub generic_params: Vec<GenericParam>,
+    /// Method signatures the trait requires.
+    pub methods: Vec<TraitMethod>,
+    /// Source span covering the full declaration.
+    pub span: Span,
+}
+
+/// One `@fn name(params) -> ret $ [TraitList];` entry inside an `@trait` body.
+///
+/// Per §4.5, trait declarations contain only method signatures — no default
+/// bodies in v0.1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraitMethod {
+    /// Method name.
+    pub name: String,
+    /// Value parameters in source order.
+    pub params: Vec<Param>,
+    /// Optional return type.
+    pub return_type: Option<TypeExpr>,
+    /// `$ [TraitList]` markers attached to the method signature.
+    pub trait_list: Vec<TraitRef>,
+    /// Source span covering the full signature including the trailing `;`.
     pub span: Span,
 }
 
