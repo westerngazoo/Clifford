@@ -7,6 +7,41 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Phase 1 check slice 1: §5.5 sigil-layer boundary checking (2026-05-01)
+
+The first language invariant Clifford actually enforces. After this PR,
+the sigil layering that's been the language's signature property is no
+longer a convention — the compiler rejects layer-crossing programs.
+
+- `clifford-check`: public entry point `check(&Program, &Resolution) -> Result<(), Vec<CheckError>>`.
+  Walks every `@fn` body and rejects any `#`-construct it finds.
+- New `CheckError` variants:
+  - `E0101 ImperativeInFunctional` — fired for `#mutate`, `Auto.field <op>= …`,
+    `#> proc()`, `#unchecked_store`, `#volatile_store`, `#unchecked_load`,
+    `#volatile_load`, `#unchecked_cast`, `#unchecked_offset`, `Auto@state`,
+    automaton-field reads (`Counter.value`), and bare automaton references
+    (`let _c := Counter`).
+  - `E0102 CrossBoundaryCall` — fired when an `@fn` body calls a top-level
+    `#effect` or `#interrupt` via regular call syntax. Carries the callee
+    name and kind for the diagnostic.
+- `#`-layer items (`#effect`, `#interrupt`, `#automaton.transitions`) are
+  not walked by §5.5 — imperative constructs are legal there. §5.4
+  mutability checking, §5.6 trait-list verification, §5.7 reference
+  provenance, and §5.8 sigma bounds will walk them in subsequent slices.
+- Errors accumulate (not fail-fast) so a single pass surfaces every
+  layer violation in a body.
+- Forward-compat: walker uses `_ => {}` arms over `Stmt`/`ExprKind` so new
+  variants default to "no rule" behavior. New `#`-constructs added to
+  the language need an explicit arm here.
+- 25 new unit tests + 1 doctest covering: empty/clean programs, `@fn → @fn`
+  calls (allowed), `#`-layer items (not walked), every statement-form
+  `#`-construct (Mutate / MutateShort / ProcCall / unsafe stores) in `@fn`,
+  every expression-form `#`-construct (unsafe loads, casts, offsets,
+  StateRead, automaton-field reads, bare automaton refs) in `@fn`,
+  cross-boundary calls to `#effect` and `#interrupt`, multiple-violation
+  collection, nested `#`-form inside arithmetic, and a realistic clean
+  program. **Total clifford-check: 25 unit + 1 doctest.**
+
 ### Added — Phase 1 type checker slice 3: structured-type expressions (2026-05-01)
 
 - `clifford-types`: extends `Type` with `Array { element, size }`,

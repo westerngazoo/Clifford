@@ -10,5 +10,11 @@ description = "Mutability, sigil-boundary, trait-list, and reference-provenance 
 
 [dependencies]
 clifford-ast.workspace = true
+clifford-lexer.workspace = true
+clifford-resolve.workspace = true
 clifford-types.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+clifford-lexer.workspace = true
+clifford-parser.workspace = true
