@@ -1278,9 +1278,11 @@ All sixteen decisions and six emergent rules are locked (with #12 designed but d
 - `#valid_in: [State, ...]` clause on effects (v0.2)
 - `dyn Interface` runtime dispatch (v0.2)
 - Read-write race detection at field granularity (v0.2 if v0.1 dogfooding shows real bugs)
+- **Sigma parallel decomposition** (`sigma … parallel { … }`): SIMD or task-parallel iteration. Recorded 2026-05-02. Requires the engine to verify per-iteration body independence, emit appropriate codegen (SIMD lanes / task spawn), and integrate with §7 orthogonality (do parallel iterations of one loop count as concurrent automata for race-detection?). Candidate for a future minor decision *if and when* a real use case surfaces; the door is reserved by keeping `parallel` out of the user identifier namespace. Library combinators built on plain `sigma` (sum, fold, count, find, etc.) are *not* future-decision material — those are stdlib code, not language extensions.
+- **§5.4 mutability scope clarification**: the current spec text reads as "every `mut` binding requires a mutation context", which would forbid local accumulator variables in `@fn` bodies (e.g. `let mut total = 0u32; sigma i in 0..n { total = total + arr[i]; }`). The intent of Decision #1 is to keep `#`-effects out of `@fn`, not to forbid stack-local mutation that's invisible to the caller. Refinement candidate: scope the rule to "`mut` bindings whose type contains a reference into mutable shared state require a mutation context"; ordinary local-variable mutation is permitted in any function body. Decision #13 Rule 0 already prevents the leakage case (no `&mut` to automaton fields). Recorded 2026-05-02; pending explicit refinement before `clifford-check` slice S2 implements §5.4.
 
 ---
 
 **Approved by:** Goose
-**Dates:** Decisions #1–#4 approved April 29, 2026; Decisions #5–#16 (incl. Refinements #5a–d) approved April 30, 2026.
+**Dates:** Decisions #1–#4 approved April 29, 2026; Decisions #5–#16 (incl. Refinements #5a–d) approved April 30, 2026; Decisions #17–#20 approved April 30, 2026; Decision #21 approved May 1, 2026 (locked design direction; v0.7 implementation).
 **Next Step:** Propagate Decisions #6–#16 through `CLIFFORD_SPEC.md` (§1, §2, §4, §5, §6, §7, §8, §10, §12, §13, new §5.7/§5.8 sub-sections, new error code blocks). After that, Cargo workspace and Phase 1 implementation.
