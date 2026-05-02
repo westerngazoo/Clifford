@@ -1,0 +1,26 @@
+# mdBook configuration for The Clifford Compendium.
+#
+# Build:  mdbook build book/   (outputs to book/book/)
+# Serve:  mdbook serve book/   (live reload at http://localhost:3000)
+#
+# Install mdBook:  cargo install mdbook
+
+[book]
+title = "The Clifford Compendium"
+authors = ["Gustavo Delgadillo"]
+description = "A narrative companion to the Clifford language: design rationale, mathematical foundations, and an annotated bibliography of every literature reference informing the compiler."
+language = "en"
+multilingual = false
+src = "src"
+
+[output.html]
+default-theme = "ayu"
+preferred-dark-theme = "ayu"
+git-repository-url = "https://github.com/westerngazoo/Clifford"
+git-repository-icon = "fa-github"
+edit-url-template = "https://github.com/westerngazoo/Clifford/edit/main/book/{path}"
+no-section-label = false
+
+[output.html.fold]
+enable = true
+level = 2
