@@ -34,25 +34,32 @@
 //!
 //! ## Implementation status
 //!
-//! **Slice 1 (this PR):** §6.1 category construction. Public entry point
-//! [`extract_categories`] walks every `#automaton` and produces an
-//! [`AutomatonCategory`] per automaton — its state set, its transitions
-//! as morphisms, and the implicit identity at every state. Validates that
-//! every `#transition Source -> Target` references a state that exists in
-//! the automaton's `#states` declaration (`E0430`). Monoid automata
-//! (no `#states` clause) get a synthetic `[Ready]` state per Decision #5
-//! Rule 4. Reachability / stuck-state / deadlock-SCC warnings, mutation
-//! profile extraction, proc-call resolution + classification, state-tag
-//! update points, and interrupt-overlap sets all arrive in subsequent
-//! slices.
+//! **Slice 1:** §6.1 category construction — [`extract_categories`].
+//!
+//! **Slice 2 (this PR):** §6.2 mutation profile extraction —
+//! [`extract_mutation_profiles`]. For every `#effect` / `#interrupt` /
+//! `#transition`, computes the set of `(automaton, field)` pairs the
+//! callable writes — *transitively* through `#> proc()` calls per
+//! Decision #3. Validates that each callable's actual mutation-set is a
+//! subset of its declared `#mutates` clause (`E0410`) and disjoint from
+//! its `#cannot_mutate` clause (`E0411`). The output is what
+//! `crates/ortho` consumes (per §7.2) — it's the per-effect "what fields
+//! does this thing write" set that the GA orthogonality check operates
+//! on. §6.3 proc-call resolution + CallContext propagation,
+//! §6.4 state-tag update points, §6.5 invariant verification,
+//! §6.6 atomic-annotation lowering hints, and Refinement #5e
+//! interrupt-overlap sets all arrive in subsequent slices.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 use std::collections::{HashMap, HashSet};
 
-use clifford_ast::{AutomatonDecl, Item, Program, TransitionDecl};
+use clifford_ast::{
+    AutomatonDecl, Block, FieldAssign, Item, Program, Stmt, StmtKind, TransitionDecl,
+};
 use clifford_lexer::Span;
+use clifford_resolve::{BindingRef, CallContext, Resolution};
 use thiserror::Error;
 
 /// Errors produced during effect / FSM extraction.
@@ -125,6 +132,30 @@ pub enum EffectError {
         original_at: usize,
         /// Byte offset of the duplicate.
         duplicate_at: usize,
+    },
+
+    /// An effect or interrupt mutates an automaton not listed in its
+    /// `#mutates: [...]` clause (transitively through `#> proc()` calls).
+    #[error("E0410: effect `{callable}` mutates undeclared automaton `{automaton}` (at byte {at})")]
+    EffectMutatesUndeclaredAutomaton {
+        /// The effect / interrupt name.
+        callable: String,
+        /// The undeclared automaton name.
+        automaton: String,
+        /// Byte offset of the callable's declaration.
+        at: usize,
+    },
+
+    /// An effect or interrupt mutates an automaton listed in its
+    /// `#cannot_mutate: [...]` clause (transitively through `#> proc()` calls).
+    #[error("E0411: effect `{callable}` mutates excluded automaton `{automaton}` (at byte {at})")]
+    EffectMutatesExcludedAutomaton {
+        /// The effect / interrupt name.
+        callable: String,
+        /// The excluded automaton name.
+        automaton: String,
+        /// Byte offset of the callable's declaration.
+        at: usize,
     },
 }
 
@@ -436,16 +467,458 @@ fn validate_transition_destination(
     }
 }
 
+// ─── Slice 2: mutation profile extraction (§6.2) ────────────────────────────
+
+/// Identifier of a callable thing in the program.
+///
+/// Effects and interrupts are top-level (named uniquely in the symbol
+/// table). Transitions live inside automata; their identity needs both
+/// the enclosing automaton's name and the transition name to be unique.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CallableId {
+    /// A top-level `#effect`.
+    Effect(String),
+    /// A top-level `#interrupt`.
+    Interrupt(String),
+    /// A `#transition` inside an `#automaton`.
+    Transition {
+        /// The enclosing automaton's name.
+        automaton: String,
+        /// The transition's name.
+        name: String,
+    },
+}
+
+impl CallableId {
+    /// Display name for diagnostics — the callable's identifier without
+    /// the kind prefix.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Effect(n) | Self::Interrupt(n) => n.as_str(),
+            Self::Transition { name, .. } => name.as_str(),
+        }
+    }
+}
+
+/// One `(automaton, field)` write reference. The unit of the per-effect
+/// mutation profile and the input to the §7 GA orthogonality engine's
+/// behavior-multivector construction.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FieldRef {
+    /// The automaton owning the field.
+    pub automaton: String,
+    /// The field name.
+    pub field: String,
+}
+
+/// The mutation profile of one callable.
+///
+/// `actual_writes` is the set of `(automaton, field)` pairs the callable
+/// writes — including writes propagated transitively through `#> proc()`
+/// calls per Decision #3. This is what `crates/ortho` consumes.
+///
+/// `actual_automata` is the set of automaton names appearing in
+/// `actual_writes`; pre-computed for the §6.2 subset / disjointness
+/// checks against the declared `#mutates` and `#cannot_mutate` clauses.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MutationProfile {
+    /// Every `(automaton, field)` pair the callable writes (direct +
+    /// transitive through proc-calls).
+    pub actual_writes: HashSet<FieldRef>,
+    /// Every automaton name appearing in `actual_writes`. Derived
+    /// upstream and cached here for fast subset / disjointness checks.
+    pub actual_automata: HashSet<String>,
+}
+
+/// The collection of all per-callable mutation profiles produced by
+/// [`extract_mutation_profiles`].
+///
+/// Indexed by [`CallableId`]. Effects, interrupts, and transitions all
+/// appear in the same map.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MutationProfiles {
+    profiles: HashMap<CallableId, MutationProfile>,
+}
+
+impl MutationProfiles {
+    /// Look up the mutation profile for a callable.
+    #[must_use]
+    pub fn lookup(&self, id: &CallableId) -> Option<&MutationProfile> {
+        self.profiles.get(id)
+    }
+
+    /// Iterate over every (id, profile) pair. Order is unspecified.
+    pub fn all(&self) -> impl Iterator<Item = (&CallableId, &MutationProfile)> {
+        self.profiles.iter()
+    }
+
+    /// Number of callables recorded.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.profiles.len()
+    }
+
+    /// True if no callables were recorded.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.profiles.is_empty()
+    }
+}
+
+/// Extract the mutation profile of every callable in the program.
+///
+/// Per §6.2:
+///
+/// 1. For each `#effect`, `#interrupt`, and `#transition`: walk the body
+///    and collect every direct `(automaton, field)` write. Direct writes
+///    come from `#mutate Auto { field = expr }` and `Auto.field <op>= expr`
+///    statements.
+/// 2. For each `#> proc()` call site: union the callee's *transitive*
+///    mutation profile into the caller's profile. The transitive closure
+///    is computed via fixed-point iteration (worklist).
+/// 3. For each `#effect` and `#interrupt`: validate that
+///    `actual_automata ⊆ declared_mutates` (`E0410`) and
+///    `actual_automata ∩ declared_cannot_mutate = ∅` (`E0411`).
+///    Transitions are not validated here (they implicitly mutate their
+///    enclosing automaton; cross-automaton transition writes are caught
+///    elsewhere).
+///
+/// Cycles in the proc-call graph are detected defensively (the worklist
+/// terminates) but not yet rejected as `E0422` — that's slice E3 work
+/// alongside full proc-call resolution and CallContext propagation.
+///
+/// # Errors
+///
+/// Returns `Err(Vec<EffectError>)` when any subset / disjointness check
+/// fails. The error vector is non-empty and ordered by source position.
+/// On success, returns `Ok(MutationProfiles)` with one entry per
+/// callable in the program.
+pub fn extract_mutation_profiles(
+    program: &Program,
+    resolution: &Resolution,
+) -> Result<MutationProfiles, Vec<EffectError>> {
+    // Phase 1: collect direct writes + direct proc-calls per callable.
+    let direct = collect_direct_profiles(program, resolution);
+
+    // Phase 2: compute transitive closure via worklist.
+    let profiles = transitively_close(&direct);
+
+    // Phase 3: validate against declared #mutates / #cannot_mutate.
+    let mut errors: Vec<EffectError> = Vec::new();
+    for item in &program.items {
+        match item {
+            Item::Effect(decl) => {
+                let id = CallableId::Effect(decl.name.clone());
+                if let Some(profile) = profiles.get(&id) {
+                    validate_declared_mutates(
+                        &decl.name,
+                        decl.span,
+                        &decl.mutates,
+                        &decl.cannot_mutate,
+                        profile,
+                        &mut errors,
+                    );
+                }
+            }
+            Item::Interrupt(decl) => {
+                let id = CallableId::Interrupt(decl.name.clone());
+                if let Some(profile) = profiles.get(&id) {
+                    validate_declared_mutates(
+                        &decl.name,
+                        decl.span,
+                        &decl.mutates,
+                        &[],
+                        profile,
+                        &mut errors,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(MutationProfiles { profiles })
+    } else {
+        Err(errors)
+    }
+}
+
+/// Internal: per-callable record of direct writes and direct proc-call
+/// targets. The transitive-closure pass runs over this to produce the
+/// final [`MutationProfile`]s.
+#[derive(Debug, Clone, Default)]
+struct DirectProfile {
+    writes: HashSet<FieldRef>,
+    proc_calls: HashSet<CallableId>,
+}
+
+fn collect_direct_profiles(
+    program: &Program,
+    resolution: &Resolution,
+) -> HashMap<CallableId, DirectProfile> {
+    let mut map: HashMap<CallableId, DirectProfile> = HashMap::new();
+
+    for item in &program.items {
+        match item {
+            Item::Effect(decl) => {
+                let id = CallableId::Effect(decl.name.clone());
+                let profile = walk_body_for_direct(&decl.body, resolution);
+                map.insert(id, profile);
+            }
+            Item::Interrupt(decl) => {
+                let id = CallableId::Interrupt(decl.name.clone());
+                let profile = walk_body_for_direct(&decl.body, resolution);
+                map.insert(id, profile);
+            }
+            Item::Automaton(decl) => {
+                for trans in &decl.transitions {
+                    let id = CallableId::Transition {
+                        automaton: decl.name.clone(),
+                        name: trans.name.clone(),
+                    };
+                    let profile = walk_transition_for_direct(decl, trans, resolution);
+                    map.insert(id, profile);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    map
+}
+
+fn walk_body_for_direct(body: &Block, resolution: &Resolution) -> DirectProfile {
+    let mut profile = DirectProfile::default();
+    walk_stmts(&body.stmts, resolution, &mut profile);
+    profile
+}
+
+fn walk_transition_for_direct(
+    _automaton: &AutomatonDecl,
+    trans: &TransitionDecl,
+    resolution: &Resolution,
+) -> DirectProfile {
+    let mut profile = DirectProfile::default();
+    walk_stmts(&trans.body.stmts, resolution, &mut profile);
+    profile
+}
+
+fn walk_stmts(stmts: &[Stmt], resolution: &Resolution, out: &mut DirectProfile) {
+    for stmt in stmts {
+        match &stmt.kind {
+            StmtKind::Mutate { automaton, assigns } => {
+                for FieldAssign { field, .. } in assigns {
+                    out.writes.insert(FieldRef {
+                        automaton: automaton.clone(),
+                        field: field.clone(),
+                    });
+                }
+            }
+            StmtKind::MutateShort {
+                automaton, field, ..
+            } => {
+                out.writes.insert(FieldRef {
+                    automaton: automaton.clone(),
+                    field: field.clone(),
+                });
+            }
+            StmtKind::ProcCall { name, .. } => {
+                // The resolver tagged the call site with a Proc binding
+                // carrying CallContext. Resolve to the right CallableId.
+                if let Some(BindingRef::Proc { name: pn, ctx, .. }) =
+                    resolution.lookup(stmt.span)
+                {
+                    let id = match ctx {
+                        CallContext::Identity => CallableId::Effect(pn.clone()),
+                        CallContext::Transition => {
+                            // For Transition-context calls, we don't yet
+                            // know the enclosing automaton from the
+                            // binding alone; the transitive-closure pass
+                            // resolves this by trying every automaton.
+                            // For now, we record the name without
+                            // automaton qualification and let the
+                            // closure pass disambiguate.
+                            //
+                            // A cleaner future approach: enrich
+                            // BindingRef::Proc with the resolved
+                            // automaton name (Resolver R3 has the info;
+                            // it's just not exposed yet).
+                            CallableId::Transition {
+                                automaton: String::new(),
+                                name: name.clone(),
+                            }
+                        }
+                    };
+                    out.proc_calls.insert(id);
+                } else {
+                    // Unresolved proc-call. The resolver would have
+                    // emitted E0404; we silently ignore here so we don't
+                    // double-report.
+                }
+            }
+            // Recurse into expression-bearing statements where bodies
+            // can't appear today, but where a future construct (e.g.
+            // `if`/`match` blocks) would warrant recursion. For now,
+            // these statements have no nested write sites.
+            StmtKind::Let { .. }
+            | StmtKind::LetShort { .. }
+            | StmtKind::Expr(_)
+            | StmtKind::Return(_)
+            | StmtKind::UncheckedStore { .. }
+            | StmtKind::VolatileStore { .. } => {}
+            // Forward-compat for new statement kinds.
+            _ => {}
+        }
+    }
+}
+
+/// Compute the transitive closure of writes through the proc-call graph.
+///
+/// Worklist algorithm: starts each callable with its direct writes,
+/// repeatedly unions in callees' writes until no profile changes.
+/// Terminates because the union over a finite field-set is monotonic
+/// and bounded.
+///
+/// Cycles in the proc-call graph (e.g. effect A calls B calls A) are
+/// handled defensively: each iteration only unions in writes already
+/// known, so the fixed point is reached without infinite recursion.
+fn transitively_close(
+    direct: &HashMap<CallableId, DirectProfile>,
+) -> HashMap<CallableId, MutationProfile> {
+    // Initialise: each callable starts with its direct writes.
+    let mut profiles: HashMap<CallableId, MutationProfile> = direct
+        .iter()
+        .map(|(id, dp)| {
+            let actual_automata: HashSet<String> =
+                dp.writes.iter().map(|fr| fr.automaton.clone()).collect();
+            (
+                id.clone(),
+                MutationProfile {
+                    actual_writes: dp.writes.clone(),
+                    actual_automata,
+                },
+            )
+        })
+        .collect();
+
+    // Build a name-to-callable index for Transition resolution. Per the
+    // walker, Transition callees are recorded with `automaton: ""`. Map
+    // each transition name to the set of fully-qualified CallableIds it
+    // could refer to (typically one; ambiguity is rare and would be
+    // E0422 territory).
+    let trans_index: HashMap<String, Vec<CallableId>> = {
+        let mut m: HashMap<String, Vec<CallableId>> = HashMap::new();
+        for id in direct.keys() {
+            if let CallableId::Transition { name, .. } = id {
+                m.entry(name.clone()).or_default().push(id.clone());
+            }
+        }
+        m
+    };
+
+    // Fixed-point iteration. Bounded by total number of
+    // (callable, field) pairs in the program.
+    loop {
+        let mut changed = false;
+        for (caller_id, dp) in direct {
+            let mut additions: HashSet<FieldRef> = HashSet::new();
+            for callee_id in &dp.proc_calls {
+                let resolved_callees: Vec<CallableId> = match callee_id {
+                    CallableId::Effect(_) | CallableId::Interrupt(_) => {
+                        vec![callee_id.clone()]
+                    }
+                    CallableId::Transition { automaton, name } if automaton.is_empty() => {
+                        // Resolve via the trans_index.
+                        trans_index.get(name).cloned().unwrap_or_default()
+                    }
+                    CallableId::Transition { .. } => vec![callee_id.clone()],
+                };
+                for resolved in resolved_callees {
+                    if let Some(callee_profile) = profiles.get(&resolved) {
+                        for fr in &callee_profile.actual_writes {
+                            if !profiles
+                                .get(caller_id)
+                                .map(|p| p.actual_writes.contains(fr))
+                                .unwrap_or(false)
+                            {
+                                additions.insert(fr.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            if !additions.is_empty() {
+                if let Some(p) = profiles.get_mut(caller_id) {
+                    for fr in additions {
+                        p.actual_automata.insert(fr.automaton.clone());
+                        p.actual_writes.insert(fr);
+                    }
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    profiles
+}
+
+fn validate_declared_mutates(
+    callable_name: &str,
+    callable_span: Span,
+    declared_mutates: &[String],
+    declared_cannot_mutate: &[String],
+    profile: &MutationProfile,
+    errors: &mut Vec<EffectError>,
+) {
+    let declared_set: HashSet<&str> = declared_mutates.iter().map(String::as_str).collect();
+    let excluded_set: HashSet<&str> =
+        declared_cannot_mutate.iter().map(String::as_str).collect();
+
+    // E0410: every actually-mutated automaton must be in declared_mutates.
+    let mut sorted_actual: Vec<&str> =
+        profile.actual_automata.iter().map(String::as_str).collect();
+    sorted_actual.sort_unstable();
+    for auto in sorted_actual {
+        if !declared_set.contains(auto) {
+            errors.push(EffectError::EffectMutatesUndeclaredAutomaton {
+                callable: callable_name.to_owned(),
+                automaton: auto.to_owned(),
+                at: callable_span.start,
+            });
+        }
+        if excluded_set.contains(auto) {
+            errors.push(EffectError::EffectMutatesExcludedAutomaton {
+                callable: callable_name.to_owned(),
+                automaton: auto.to_owned(),
+                at: callable_span.start,
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clifford_lexer::tokenize;
     use clifford_parser::parse;
+    use clifford_resolve::resolve;
 
     fn extract_str(src: &str) -> Result<Categories, Vec<EffectError>> {
         let tokens = tokenize(src).expect("tokenize");
         let program = parse(&tokens).expect("parse");
         extract_categories(&program)
+    }
+
+    fn profiles_str(src: &str) -> Result<MutationProfiles, Vec<EffectError>> {
+        let tokens = tokenize(src).expect("tokenize");
+        let program = parse(&tokens).expect("parse");
+        let resolution = resolve(&program).expect("resolve");
+        extract_mutation_profiles(&program, &resolution)
     }
 
     // ── Empty / no-automatons ────────────────────────────────────────────
@@ -668,5 +1141,316 @@ mod tests {
         assert_eq!(cat.transitions[0].destination.as_deref(), Some("Counting"));
         assert!(cat.transitions[1].destination.is_none());
         assert_eq!(cat.transitions[2].destination.as_deref(), Some("Halted"));
+    }
+
+    // ─── Slice 2: mutation profile extraction ────────────────────────────
+
+    fn make_field(automaton: &str, field: &str) -> FieldRef {
+        FieldRef {
+            automaton: automaton.to_owned(),
+            field: field.to_owned(),
+        }
+    }
+
+    // ── Empty / no-effects baseline ──────────────────────────────────────
+
+    #[test]
+    fn empty_program_has_empty_profiles() {
+        let p = profiles_str("").unwrap();
+        assert!(p.is_empty());
+    }
+
+    #[test]
+    fn program_without_effects_has_empty_profiles() {
+        let p = profiles_str("@fn helper() { }").unwrap();
+        assert!(p.is_empty());
+    }
+
+    // ── Direct writes via MutateShort ────────────────────────────────────
+
+    #[test]
+    fn mutate_short_collected_as_direct_write() {
+        let p = profiles_str(
+            "#automaton Counter { value: u32; } \
+             #effect bump() #mutates: [Counter] { Counter.value = 1u32; }",
+        )
+        .unwrap();
+        let id = CallableId::Effect("bump".to_owned());
+        let profile = p.lookup(&id).expect("bump profile");
+        assert!(profile.actual_writes.contains(&make_field("Counter", "value")));
+        assert!(profile.actual_automata.contains("Counter"));
+    }
+
+    // ── Direct writes via canonical Mutate { … } ─────────────────────────
+
+    #[test]
+    fn mutate_canonical_collected() {
+        let p = profiles_str(
+            "#automaton Counter { value: u32; flags: u8; } \
+             #effect set_both() #mutates: [Counter] { \
+               #mutate Counter { value = 1u32, flags = 0u8 }; \
+             }",
+        )
+        .unwrap();
+        let id = CallableId::Effect("set_both".to_owned());
+        let profile = p.lookup(&id).expect("set_both profile");
+        assert!(profile.actual_writes.contains(&make_field("Counter", "value")));
+        assert!(profile.actual_writes.contains(&make_field("Counter", "flags")));
+    }
+
+    // ── Interrupts use the same machinery ────────────────────────────────
+
+    #[test]
+    fn interrupt_writes_collected() {
+        let p = profiles_str(
+            "#automaton Counter { value: u32; } \
+             #interrupt UART_RX() #mutates: [Counter] #priority: HIGH { \
+               Counter.value = Counter.value + 1u32; \
+             }",
+        )
+        .unwrap();
+        let id = CallableId::Interrupt("UART_RX".to_owned());
+        let profile = p.lookup(&id).expect("UART_RX profile");
+        assert!(profile.actual_writes.contains(&make_field("Counter", "value")));
+    }
+
+    // ── Transitions ──────────────────────────────────────────────────────
+
+    #[test]
+    fn transition_writes_collected() {
+        let p = profiles_str(
+            "#automaton Counter { value: u32; \
+             #transition tick { Counter.value = Counter.value + 1u32; } \
+             }",
+        )
+        .unwrap();
+        let id = CallableId::Transition {
+            automaton: "Counter".to_owned(),
+            name: "tick".to_owned(),
+        };
+        let profile = p.lookup(&id).expect("tick profile");
+        assert!(profile.actual_writes.contains(&make_field("Counter", "value")));
+    }
+
+    // ── Transitive proc-call closure ─────────────────────────────────────
+
+    #[test]
+    fn proc_call_to_effect_propagates_writes() {
+        // bump() calls inner() via #>; inner() writes Counter.value;
+        // bump() should inherit that write transitively.
+        let p = profiles_str(
+            "#automaton Counter { value: u32; } \
+             #effect inner() #mutates: [Counter] { Counter.value = 1u32; } \
+             #effect bump() #mutates: [Counter] { #> inner(); }",
+        )
+        .unwrap();
+        let bump_id = CallableId::Effect("bump".to_owned());
+        let profile = p.lookup(&bump_id).expect("bump profile");
+        assert!(
+            profile
+                .actual_writes
+                .contains(&make_field("Counter", "value")),
+            "bump should transitively pick up Counter.value write from inner"
+        );
+    }
+
+    #[test]
+    fn proc_call_to_transition_propagates_writes() {
+        let p = profiles_str(
+            "#automaton Counter { value: u32; \
+             #transition tick { Counter.value = Counter.value + 1u32; } \
+             } \
+             #effect bumper() #mutates: [Counter] { #> tick(); }",
+        )
+        .unwrap();
+        let bumper_id = CallableId::Effect("bumper".to_owned());
+        let profile = p.lookup(&bumper_id).expect("bumper profile");
+        assert!(
+            profile
+                .actual_writes
+                .contains(&make_field("Counter", "value")),
+            "bumper should transitively pick up Counter.value write from tick"
+        );
+    }
+
+    #[test]
+    fn deep_proc_call_chain_propagates_all_writes() {
+        // a() calls b(); b() calls c(); c() writes Counter.value.
+        // a() should end up with that write transitively.
+        let p = profiles_str(
+            "#automaton Counter { value: u32; } \
+             #effect c() #mutates: [Counter] { Counter.value = 0u32; } \
+             #effect b() #mutates: [Counter] { #> c(); } \
+             #effect a() #mutates: [Counter] { #> b(); }",
+        )
+        .unwrap();
+        let a_id = CallableId::Effect("a".to_owned());
+        let profile = p.lookup(&a_id).expect("a profile");
+        assert!(
+            profile
+                .actual_writes
+                .contains(&make_field("Counter", "value")),
+            "a should transitively reach Counter.value through b -> c"
+        );
+    }
+
+    // ── Validation: E0410 ────────────────────────────────────────────────
+
+    #[test]
+    fn effect_writing_undeclared_automaton_is_e0410() {
+        // bump() #mutates: [] but writes Counter.value -- E0410.
+        let errors = profiles_str(
+            "#automaton Counter { value: u32; } \
+             #effect bump() #mutates: [] { Counter.value = 1u32; }",
+        )
+        .unwrap_err();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            EffectError::EffectMutatesUndeclaredAutomaton {
+                ref callable,
+                ref automaton,
+                ..
+            } if callable == "bump" && automaton == "Counter"
+        )));
+    }
+
+    #[test]
+    fn transitive_undeclared_mutate_is_e0410() {
+        // bump() #mutates: [] but calls inner() which writes Counter.value.
+        // E0410 should fire even though bump() has no direct write.
+        let errors = profiles_str(
+            "#automaton Counter { value: u32; } \
+             #effect inner() #mutates: [Counter] { Counter.value = 1u32; } \
+             #effect bump() #mutates: [] { #> inner(); }",
+        )
+        .unwrap_err();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            EffectError::EffectMutatesUndeclaredAutomaton {
+                ref callable,
+                ..
+            } if callable == "bump"
+        )));
+    }
+
+    // ── Validation: E0411 ────────────────────────────────────────────────
+
+    #[test]
+    fn effect_writing_excluded_automaton_is_e0411() {
+        let errors = profiles_str(
+            "#automaton Counter { value: u32; } \
+             #effect bump() #mutates: [Counter] #cannot_mutate: [Counter] { \
+               Counter.value = 1u32; \
+             }",
+        )
+        .unwrap_err();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            EffectError::EffectMutatesExcludedAutomaton {
+                ref callable,
+                ref automaton,
+                ..
+            } if callable == "bump" && automaton == "Counter"
+        )));
+    }
+
+    // ── Negative: declared mutation OK ───────────────────────────────────
+
+    #[test]
+    fn correctly_declared_mutate_is_clean() {
+        let p = profiles_str(
+            "#automaton Counter { value: u32; } \
+             #effect bump() #mutates: [Counter] { Counter.value = 1u32; }",
+        );
+        assert!(p.is_ok(), "got errors: {:?}", p);
+    }
+
+    // ── Multi-automaton effect ───────────────────────────────────────────
+
+    #[test]
+    fn effect_writing_two_automatons_validated_correctly() {
+        let p = profiles_str(
+            "#automaton A { x: u32; } \
+             #automaton B { y: u32; } \
+             #effect both() #mutates: [A, B] { A.x = 1u32; B.y = 2u32; }",
+        );
+        assert!(p.is_ok(), "got errors: {:?}", p);
+        let id = CallableId::Effect("both".to_owned());
+        let profile = p.unwrap().lookup(&id).cloned().expect("both profile");
+        assert_eq!(profile.actual_automata.len(), 2);
+        assert!(profile.actual_automata.contains("A"));
+        assert!(profile.actual_automata.contains("B"));
+    }
+
+    // ── Realistic combined exercise ──────────────────────────────────────
+
+    #[test]
+    fn realistic_program_profiles_correctly() {
+        let src = "\
+            #automaton Counter {\n  \
+              value: u32;\n  \
+              #transition tick { Counter.value = Counter.value + 1u32; }\n\
+            }\n\
+            #effect bump() #mutates: [Counter] {\n  \
+              #> tick();\n\
+            }\n\
+            #effect double() #mutates: [Counter] {\n  \
+              #> bump();\n  \
+              #> bump();\n\
+            }\n\
+        ";
+        let p = profiles_str(src).expect("profile extraction");
+
+        // tick directly writes Counter.value.
+        let tick_id = CallableId::Transition {
+            automaton: "Counter".to_owned(),
+            name: "tick".to_owned(),
+        };
+        assert!(p
+            .lookup(&tick_id)
+            .unwrap()
+            .actual_writes
+            .contains(&make_field("Counter", "value")));
+
+        // bump transitively reaches Counter.value via tick.
+        let bump_id = CallableId::Effect("bump".to_owned());
+        assert!(p
+            .lookup(&bump_id)
+            .unwrap()
+            .actual_writes
+            .contains(&make_field("Counter", "value")));
+
+        // double transitively reaches Counter.value via bump → tick.
+        let double_id = CallableId::Effect("double".to_owned());
+        assert!(p
+            .lookup(&double_id)
+            .unwrap()
+            .actual_writes
+            .contains(&make_field("Counter", "value")));
+    }
+
+    // ── Mutual recursion (cycle) terminates ──────────────────────────────
+
+    #[test]
+    fn mutual_recursion_terminates() {
+        // a() calls b() calls a(). The transitive closure must terminate;
+        // each gets the other's writes once.
+        let src = "#automaton Counter { value: u32; } \
+                   #effect a() #mutates: [Counter] { Counter.value = 1u32; #> b(); } \
+                   #effect b() #mutates: [Counter] { #> a(); }";
+        let p = profiles_str(src).expect("should not infinite-loop");
+        let a_id = CallableId::Effect("a".to_owned());
+        let b_id = CallableId::Effect("b".to_owned());
+        // a directly writes Counter.value; b inherits it from a.
+        assert!(p
+            .lookup(&a_id)
+            .unwrap()
+            .actual_writes
+            .contains(&make_field("Counter", "value")));
+        assert!(p
+            .lookup(&b_id)
+            .unwrap()
+            .actual_writes
+            .contains(&make_field("Counter", "value")));
     }
 }

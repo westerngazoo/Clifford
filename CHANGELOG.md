@@ -7,6 +7,47 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Phase 2 effect slice E2: §6.2 mutation profile extraction (2026-05-02)
+
+The bridge piece the GA orthogonality engine actually consumes. After
+this slice, every `#effect` / `#interrupt` / `#transition` carries a
+fully-resolved `(automaton, field)` write set — direct + transitive
+through `#> proc()` calls per Decision #3.
+
+- `clifford-effect`: public entry point `extract_mutation_profiles(&Program, &Resolution)
+  -> Result<MutationProfiles, Vec<EffectError>>`. Walks every callable,
+  collects direct writes, then computes the transitive closure through
+  proc-calls via fixed-point iteration.
+- New types: `CallableId` (`Effect(name)` / `Interrupt(name)` /
+  `Transition { automaton, name }`), `FieldRef { automaton, field }`,
+  `MutationProfile { actual_writes, actual_automata }`, `MutationProfiles`
+  (the artifact, indexed by `CallableId`).
+- Direct writes collected from `#mutate Auto { field = expr }` (canonical
+  form) and `Auto.field <op>= expr` (Decision #15 sugar).
+- Transitive writes propagated through `#> proc()` calls using the
+  resolver's `BindingRef::Proc { ctx, ... }`. `CallContext::Identity`
+  resolves to `CallableId::Effect`; `CallContext::Transition` resolves
+  via a per-name index of all transitions across all automata.
+- Cycles in the proc-call graph (mutual recursion) are handled
+  defensively: the worklist algorithm reaches a fixed point because the
+  union over a finite field-set is monotonic and bounded. Explicit
+  E0422 cycle rejection is deferred to slice E3.
+- New errors: `E0410 EffectMutatesUndeclaredAutomaton` (effect/interrupt
+  writes an automaton not in its `#mutates` clause; transitive),
+  `E0411 EffectMutatesExcludedAutomaton` (writes an automaton in its
+  `#cannot_mutate` clause).
+- Transition mutation profiles are computed but not validated — transitions
+  implicitly mutate their enclosing automaton; the cross-automaton
+  transition-write check (a different rule than effect/interrupt) lives
+  in a future slice.
+- 16 new tests + every E1 test still green: empty programs, MutateShort
+  collection, canonical Mutate collection, interrupt mutation,
+  transition mutation, proc-call to effect propagation, proc-call to
+  transition propagation, deep proc-call chain (a → b → c), undeclared
+  automaton (direct + transitive), excluded automaton, multi-automaton
+  effect, mutual recursion termination, realistic 3-callable program
+  with full transitive analysis. **Total clifford-effect: 29 unit + 1 doctest.**
+
 ### Added — Phase 2 effect slice E1: §6.1 category construction (2026-05-02)
 
 First piece of the GA-engine bridge. After this slice, the compiler
