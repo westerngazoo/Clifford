@@ -11,4 +11,10 @@ description = "Effect & FSM extraction. Implements §6 of CLIFFORD_SPEC.md and t
 [dependencies]
 clifford-ast.workspace = true
 clifford-check.workspace = true
+clifford-lexer.workspace = true
+clifford-resolve.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+clifford-lexer.workspace = true
+clifford-parser.workspace = true
