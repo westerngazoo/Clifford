@@ -7,6 +7,57 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Phase 3 ortho slice O1: GA orthogonality engine, Cl(0,0,n) bitmask check (2026-05-02)
+
+**The headline slice.** After this lands, Clifford does the thing it
+claims to do: compile-time race detection via geometric algebra.
+
+- `clifford-ortho`: full v0.1 pipeline. Public entry
+  `check_orthogonality(&Program, &MutationProfiles) -> Result<OrthoReport, OrthoError>`.
+- New types:
+  - `BasisAssignment` — bidirectional `(automaton, field) ↔ bit-position`
+    map; deterministic ordering (sorted by automaton then field) per
+    CLAUDE.md §3.5 reproducibility requirement.
+  - `Blade { bits: u64 }` — the bitmask wedge of basis vectors. `grade()`
+    returns the population count.
+  - `CallableBehavior { blade }` — per-callable behavior multivector
+    (§7.2). One blade per callable, the wedge of all `(automaton, field)`
+    pairs the callable writes transitively.
+  - `ConcurrencyMatrix` — pairs of callables that can_concur per §7.3's
+    sound-conservative heuristic.
+  - `OrthoReport` — the artifact: basis + behaviors + concurrency
+    matrix + errors. Returned even on success so downstream consumers
+    can inspect the engine's internal state.
+- New errors:
+  - `E0520 OrthogonalityViolation` — two concurrent callables write a
+    shared field. Diagnostic names both callables AND the shared
+    `(automaton, field)` pairs by source identifier per Emergent Rule 1
+    (never raw `e_n` indices).
+  - `E0530 TooManyBasisVectors` — program exceeds the 64-field
+    `MAX_BASIS_VECTORS_V1` cap (will lift via wide-blade `Vec<u64>` in v0.2).
+- §7.4 algorithm: per-pair `outer_product(blade_a, blade_b)`; `None`
+  (collapse to zero) → race detected.
+- §7.3 concurrency inference: every pair of `#effect`s, `#interrupt`s,
+  and effect-interrupt combinations is treated as concurrent unless
+  excluded by `@sequential(A, B)`. Strict v0.1 rule: a pair is excluded
+  only when each side touches *exactly one* of {A, B} and they touch
+  different sides — preventing `@sequential` from masking races through
+  third automata.
+- §7.5 diagnostic: shared fields decoded back to source `(automaton.field)`
+  notation; pre-formatted display string ready for renderer.
+- 18 unit tests + 2 doctests covering: outer_product invariant; empty
+  program; single effect (no concurrency); two effects on same field
+  (E0520, both pairing orderings checked); two effects on disjoint
+  fields (clean); effects on different automata (clean); interrupt vs
+  effect race (E0520); transitive write through proc-call caught (the
+  thing E2 enables); `@sequential` exclusion of clean pairs;
+  `@sequential` does NOT mask cross-touching races (the disambiguator);
+  multiple races collected (3-effect, 3-pair); realistic clean program
+  (sample/actuate/log on 3 disjoint automata); basis assignment
+  determinism across runs; basis assignment sorted order; behavior
+  blade grade equals field count; capacity check.
+- **Total clifford-ortho: 18 unit + 2 doctest passed.**
+
 ### Added — Phase 2 effect slice E2: §6.2 mutation profile extraction (2026-05-02)
 
 The bridge piece the GA orthogonality engine actually consumes. After
