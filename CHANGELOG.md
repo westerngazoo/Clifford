@@ -7,6 +7,35 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Spec refinement — Refinement #1a: local-stack mutation in any layer (2026-05-02)
+
+Clarifies that the §5.5 / Decision #1 layer-boundary rule does not forbid
+local mutable bindings (`let mut x: T = e; x = e';`) in `@fn` bodies, so
+long as `T` does not contain any reference into mutable shared state
+(Decision #13 Rule 0 prevents that case at the type level).
+
+Without this clarification, the bog-standard local-accumulator pattern
+(`let mut total = 0u32; sigma i in 0..n { total = total + arr[i]; }`)
+would have been illegal in `@fn` bodies, forcing every reduce-shaped
+algorithm into recursion or out of `@fn` entirely.
+
+- `docs/CLIFFORD_SPEC.md` §5.4 updated with the refined wording.
+- `docs/DECISIONS.md` adds Refinement #1a (locked 2026-05-02) under
+  Decision #1.
+- No code changes — `clifford-check` slice S2 (which implements §5.4)
+  hasn't shipped yet, so the refined rule lands before any over-restrictive
+  code locks the wrong semantics in.
+
+### Open future-considerations recorded (2026-05-02)
+
+- **Sigma parallel decomposition** (`sigma … parallel { … }`): SIMD or
+  task-parallel iteration. Recorded in `DECISIONS.md` open-list as a
+  candidate for future minor decision *if and when* a real use case
+  surfaces. The `parallel` keyword is reserved by being kept out of the
+  user identifier namespace; no implementation work happens until a
+  decision locks it. Library combinators (sum, fold, etc.) clarified as
+  stdlib code, not language extensions.
+
 ### Added — Phase 1 check slice 1: §5.5 sigil-layer boundary checking (2026-05-01)
 
 The first language invariant Clifford actually enforces. After this PR,

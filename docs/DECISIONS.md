@@ -73,6 +73,26 @@
 - Type system can enforce purity via sigil context
 - Error messages are unambiguous: "mutation (#) not allowed in functional (@) scope"
 
+### Refinement #1a: Local-Stack Mutation Permitted in Any Layer ✓ LOCKED (2026-05-02)
+
+**Question:** Does the §5.5 / Decision #1 layer-boundary rule forbid local mutable bindings in `@fn` bodies?
+
+**Answer:** No. **Local-stack mutation is permitted in any function body, including `@fn`.** The boundary rule keeps `#`-effects (mutation of shared automaton/register state, side effects on hardware, calls into the imperative layer) out of `@fn` — it does *not* forbid stack-local mutation that's invisible to the caller.
+
+**Rule (refined):** A `let mut x: T = e;` binding plus subsequent `x = e';` assignments is permitted regardless of layer, *provided* `T` does not contain any reference into mutable shared state (no `&mut Auto.field`, no `&Auto.field`, no `access<T>` rooted in shared state).
+
+The leakage case (a `mut` binding holding a reference *to* shared state) is closed by Decision #13 Rule 0 at the type level: `&mut Auto.field` is `E0700` and cannot be constructed; therefore no `mut` binding can smuggle out write authority to shared state.
+
+**Why this matters:** without this refinement, the bog-standard local-accumulator pattern (`let mut total = 0u32; sigma i in 0..n { total = total + arr[i]; }`) would be illegal in `@fn` bodies. That would force every reduce-shaped algorithm into recursion (cumbersome) or out of `@fn` (which means it can't be marked `$ [Pure]`, which means it can't be called from other `@fn`s, which is a usability cliff).
+
+The refinement preserves the *semantic* notion of purity (referential transparency, no caller-visible side effects) by recognizing that local mutation inside a function call's stack frame doesn't violate it.
+
+**Implications:**
+- `CLIFFORD_SPEC.md` §5.4 updated with the refined wording.
+- `clifford-check` slice S2 (when it ships) implements the refined rule, not the original.
+- Decision #13's reference-provenance machinery does the heavy lifting for the leakage case; §5.4 just defers to it.
+- `$ [Pure]` annotation remains semantically correct on functions whose bodies use only local-stack mutation.
+
 ---
 
 ## Decision #2: Hybrid Trait System with Signature Markers ✓ LOCKED
@@ -1279,7 +1299,6 @@ All sixteen decisions and six emergent rules are locked (with #12 designed but d
 - `dyn Interface` runtime dispatch (v0.2)
 - Read-write race detection at field granularity (v0.2 if v0.1 dogfooding shows real bugs)
 - **Sigma parallel decomposition** (`sigma … parallel { … }`): SIMD or task-parallel iteration. Recorded 2026-05-02. Requires the engine to verify per-iteration body independence, emit appropriate codegen (SIMD lanes / task spawn), and integrate with §7 orthogonality (do parallel iterations of one loop count as concurrent automata for race-detection?). Candidate for a future minor decision *if and when* a real use case surfaces; the door is reserved by keeping `parallel` out of the user identifier namespace. Library combinators built on plain `sigma` (sum, fold, count, find, etc.) are *not* future-decision material — those are stdlib code, not language extensions.
-- **§5.4 mutability scope clarification**: the current spec text reads as "every `mut` binding requires a mutation context", which would forbid local accumulator variables in `@fn` bodies (e.g. `let mut total = 0u32; sigma i in 0..n { total = total + arr[i]; }`). The intent of Decision #1 is to keep `#`-effects out of `@fn`, not to forbid stack-local mutation that's invisible to the caller. Refinement candidate: scope the rule to "`mut` bindings whose type contains a reference into mutable shared state require a mutation context"; ordinary local-variable mutation is permitted in any function body. Decision #13 Rule 0 already prevents the leakage case (no `&mut` to automaton fields). Recorded 2026-05-02; pending explicit refinement before `clifford-check` slice S2 implements §5.4.
 
 ---
 

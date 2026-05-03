@@ -707,11 +707,13 @@ fn satisfies(ty: Type, tr: Trait) -> bool {
 
 After type checking, walk the AST and verify:
 
-- Every assignment `x = e`, `x.field = e`, `x[i] = e` occurs inside a mutation context (§4.6); otherwise emit `E0301`.
-- Every `mut` binding is reachable only inside a mutation context.
+- **Local-only mutation is permitted in any function body, including `@fn`.** A `let mut x: T = e;` binding plus subsequent assignments `x = e';` are allowed regardless of layer, *provided* `T` does not contain any reference into mutable shared state (no `&mut Auto.field`, no `&Auto.field`, no `access<T>` rooted in an automaton or register-block field). Decision #13 Rule 0 (`E0700`) prevents the leakage case at the type level: `&mut Auto.field` cannot be constructed, so a `mut` binding cannot accidentally smuggle out write authority to shared state. Local mutation is invisible to the caller; the function's purity is preserved.
+- **Cross-boundary mutation requires a mutation context.** Every assignment `x = e`, `x.field = e`, `x[i] = e` where the *target* (or any subexpression of the target's path) names a reference into mutable shared state (an automaton field, a register-block field, an access pointer rooted in shared state) occurs inside a mutation context (§4.6); otherwise emit `E0301`. Equivalently: bare local-stack mutation is fine, but mutating *through* a reference into shared state is `#`-layer territory.
 - Every `#mutate A { ... }` statement (canonical form) and `Auto.field <op>= expr;` sugar (Decision #15) appears inside an `#effect`, `#interrupt`, `#transition`, or `#impl` method body whose `#mutates` clause names automaton `A`; otherwise emit `E0302: write to undeclared automaton`.
 - Every assignment inside `#mutate A { f = expr }` targets a real field `f` of automaton `A`; otherwise emit `E0303: unknown automaton field`.
 - Every field listed in a `#cannot_mutate` clause is *not* written by any `#mutate` in the body.
+
+**Refinement note (locked 2026-05-02):** earlier draft text of §5.4 read as "every `mut` binding requires a mutation context", which would have forbidden the bog-standard local-accumulator pattern in `@fn` bodies (e.g. `let mut total = 0u32; sigma i in 0..n { total = total + arr[i]; }`). The intent of Decision #1 is to keep `#`-effects out of `@fn` (mutation of shared state, side effects on hardware, calls into the imperative layer) — *not* to forbid stack-local mutation that's invisible to callers. The refined wording above carves out the local case explicitly. See also `docs/DECISIONS.md` Refinement #1a.
 
 ### 5.5 Sigil-Layer Boundary Checking
 
