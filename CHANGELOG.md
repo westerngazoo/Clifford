@@ -7,6 +7,40 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Phase 2 effect slice E1: §6.1 category construction (2026-05-02)
+
+First piece of the GA-engine bridge. After this slice, the compiler
+produces a per-automaton categorical structure (the `C_A` of Appendix B)
+that downstream phases (`crates/ortho`, `crates/codegen`) consume.
+
+- `clifford-effect`: public entry point `extract_categories(&Program)
+  -> Result<Categories, Vec<EffectError>>`. Walks every `#automaton` and
+  produces an `AutomatonCategory` per declaration.
+- New types: `Categories` (the artifact), `AutomatonCategory` (per-automaton
+  state set + transitions + initial state), `StateInfo`, `TransitionInfo`,
+  `EffectError` (reserves E04xx and E06xx ranges per the spec).
+- For monoid automata (no `#states` clause per Decision #5 Rule 4), gets a
+  synthetic `[Ready]` state automatically.
+- For multi-state automata, validates every `#transition T -> Target`'s
+  `Target` is in the declared `#states` (`E0430 UnknownState`). Monoid
+  automata reject any transition with an explicit destination
+  (`E0431 MonoidTransitionWithDestination`).
+- Detects duplicate state names (`E0433`) and duplicate transition names
+  (`E0432`) within the same automaton; first-wins for the table.
+- Errors accumulate (not fail-fast); a single pass surfaces every
+  validation failure.
+- 13 unit tests + 1 doctest covering: empty programs, monoid automata
+  (with and without destinationless transitions), monoid + destination
+  rejection, multi-state state recording, valid destinations, unknown
+  destination rejection, duplicate-transition rejection, multi-error
+  collection, multi-automaton extraction, item_index correctness, and
+  a realistic 3-state Counter automaton.
+- What's deferred to slice E2+: §6.2 mutation profile extraction
+  (per-effect `actual_writes` set, transitive through `#> proc()` calls),
+  §6.3 proc-call resolution and CallContext propagation, §6.4 state-tag
+  update points, §6.5 invariant verification, §6.6 atomic-annotation
+  lowering hints, and the Refinement #5e interrupt-overlap set.
+
 ### Added — Phase 1 check slice 1: §5.5 sigil-layer boundary checking (2026-05-01)
 
 The first language invariant Clifford actually enforces. After this PR,
