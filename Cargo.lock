@@ -21,6 +21,9 @@ name = "clifford-check"
 version = "0.1.0"
 dependencies = [
  "clifford-ast",
+ "clifford-lexer",
+ "clifford-parser",
+ "clifford-resolve",
  "clifford-types",
  "thiserror",
 ]
@@ -58,6 +61,9 @@ version = "0.1.0"
 dependencies = [
  "clifford-ast",
  "clifford-check",
+ "clifford-lexer",
+ "clifford-parser",
+ "clifford-resolve",
  "thiserror",
 ]
 
@@ -91,6 +97,7 @@ version = "0.1.0"
 dependencies = [
  "clifford-ast",
  "clifford-lexer",
+ "clifford-parser",
  "thiserror",
 ]
 
@@ -106,6 +113,8 @@ name = "clifford-types"
 version = "0.1.0"
 dependencies = [
  "clifford-ast",
+ "clifford-lexer",
+ "clifford-parser",
  "clifford-resolve",
  "thiserror",
 ]

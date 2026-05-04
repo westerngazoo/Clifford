@@ -7,6 +7,40 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Type Checker — Slice T4a: nominal types from Path-position type expressions (2026-05-01)
+
+First semantic resolution of `Path`-form type expressions in the type
+checker. `clifford-types` previously translated `TypeKind::Path` to
+`Type::Unknown`; T4a introduces a new `Type::Nominal { path, args }`
+variant and translates path-position types into it verbatim.
+
+- New `Type::Nominal { path: Vec<String>, args: Vec<Type> }` variant
+  on `crates/types/src/lib.rs::Type`. Path is recorded as the source-
+  order segments (e.g. `["clifford", "core", "Option"]`); generic
+  arguments translate recursively. `display()` renders as `Foo`,
+  `Result<u32, bool>`, `clifford::core::Option<u8>`.
+- `type_from_type_expr()` now translates `TypeKind::Path(pt)` to
+  `Type::Nominal { path: pt.segments.clone(), args: pt.generic_args
+  .iter().map(type_from_type_expr).collect() }`.
+- Two `Type::Nominal` values with different paths are distinct (per
+  Decision #19's nominal-access identity rule, extended to all top-
+  level type-bearing declarations).
+
+What slice T4a deliberately does **not** do, kept for T4b+: verifying
+the path resolves to an actual top-level declaration; following `@type`
+aliases to the underlying type for equality / unification (so today
+`let _x: MyAlias = 0u32;` where `@type MyAlias = u32;` emits E0512 —
+the `Nominal MyAlias` ≠ `Primitive u32` mismatch is correct under
+T4a's assumptions); ADT-variant resolution for multi-segment paths
+like `Result::Ok`.
+
+Tests: 10 new unit tests exercising display (simple / multi-segment /
+generic / nested-generic), distinct identity, parameter-position type
+carry-through into expression typing, let-annotation E0512 with the
+nominal name in the diagnostic, generic-arg recursive translation,
+empty-args verbatim translation. Workspace remains green (all 502+
+tests passing across 19 crates).
+
 ### Spec — Decisions #22-#25: cleaner pure/imperative boundary (2026-05-03)
 
 A coordinated set of four design decisions sharpening Clifford's pure /
