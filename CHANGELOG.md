@@ -7,6 +7,35 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Phase 2 effect slice E4: Refinement #5e interrupt-overlap set R(A) (2026-05-04)
+
+- `clifford-effect`: new public entry `compute_interrupt_overlap(&MutationProfiles)
+  -> InterruptOverlap`. For each `#automaton A`, computes R(A) = the
+  set of `#interrupt` declarations that mutate A transitively (per
+  their `#mutates` clause expanded through `#> proc()` calls — using
+  E2's already-computed transitive `actual_automata` set).
+- New types: `InterruptOverlap` (the artifact). API: `interrupts_for(name)`
+  returns `&HashSet<String>` of overlapping interrupt names (always a
+  set, empty when no overlap — uses `OnceLock` for the cached empty
+  set); `is_overlapped(name)` convenience for the codegen-question
+  "do I need critical-section wrapping?"; `all()` / `len()` /
+  `is_empty()` standard collection methods.
+- Drives `clifford-codegen`'s §8.4 transition-atomicity wrapping
+  decision: any transition of an automaton with non-empty R(A) needs
+  CLI/STI on Cortex-M (or `csrrci sie` on RISC-V) so an interrupt
+  doesn't preempt mid-transition and observe a torn state.
+- Useful for `cliffordc audit` "interrupts affecting this automaton"
+  reports and for `@sequential(A, B)` overrides per Decision #11.
+- Reuses E2's transitive closure machinery — no re-walking of the call
+  graph. Slice is essentially "invert the existing interrupt → automatons
+  relation."
+- 9 new tests + 1 doctest: empty program, no interrupts, single
+  interrupt over single automaton, two interrupts on same automaton,
+  one interrupt across two automatons, transitive overlap through
+  proc-call, effects-alone don't create overlap, realistic IRQ +
+  consumer (Wari shape), lookup for non-existent automaton, all()
+  iterator. **Total clifford-effect: 51 unit + 3 doctest tests.**
+
 ### Added — Phase 2 effect slice E3: §6.3 proc-call graph + cycle detection (2026-05-03)
 
 - `clifford-effect`: new public entry `extract_call_graph(&Program, &Resolution)

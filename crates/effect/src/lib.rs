@@ -38,20 +38,19 @@
 //!
 //! **Slice 2:** §6.2 mutation profile extraction — [`extract_mutation_profiles`].
 //!
-//! **Slice 3 (this PR):** §6.3 proc-call graph + cycle detection —
-//! [`extract_call_graph`]. Builds the directed graph of `#> proc()`
-//! edges (caller → callee) that the spec calls out as a first-class
-//! artifact for downstream phases. Detects cycles and rejects them
-//! with `E0422 ProcCallCycle`, naming every callable on the cycle so
-//! the diagnostic guides the user to the loop. Per §6.3 step 6,
-//! cycles are rejected unless explicitly marked recursive — and v0.1
-//! has no recursion-marker syntax, so all cycles are rejected.
-//! §6.3 step 4 (CallContext classification) is already covered by the
-//! resolver's `BindingRef::Proc`; this slice formalises the call
-//! graph itself. §6.4 state-tag update points, §6.5 invariant
-//! verification, §6.6 atomic-annotation lowering hints, and
-//! Refinement #5e interrupt-overlap sets all arrive in subsequent
-//! slices.
+//! **Slice 3:** §6.3 proc-call graph + cycle detection —
+//! [`extract_call_graph`].
+//!
+//! **Slice 4 (this PR):** Refinement #5e interrupt-overlap set —
+//! [`compute_interrupt_overlap`]. For each `#automaton A`, computes
+//! `R(A)` = the set of `#interrupt` declarations that mutate `A`
+//! transitively (per their `#mutates` clause expanded through `#>`
+//! proc-calls). Drives `clifford-codegen`'s §8.4 transition-atomicity
+//! wrapping decision: any `#transition` of `A` that runs in user code
+//! must be wrapped in a critical section (CLI/STI on Cortex-M; SIE
+//! disable on RISC-V) iff `R(A)` is non-empty for that automaton.
+//! §6.4 state-tag update points, §6.5 invariant verification, and
+//! §6.6 atomic-annotation lowering hints arrive in subsequent slices.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -1222,6 +1221,129 @@ fn canonicalise_cycle(cycle: &[CallableId]) -> Vec<CallableId> {
     out
 }
 
+// ─── Slice 4: Refinement #5e interrupt-overlap set ──────────────────────────
+
+/// For each `#automaton A`, the set of `#interrupt` declarations that mutate
+/// `A` transitively.
+///
+/// Per Refinement #5e, this set drives `clifford-codegen`'s §8.4 decision
+/// about whether each `#transition` of `A` needs critical-section wrapping:
+///
+/// - If `R(A)` is non-empty for an automaton `A`, every transition of `A`
+///   that runs in user code must be wrapped in a critical section
+///   (CLI/STI on Cortex-M; `csrrci sie` on RISC-V) so that an interrupt
+///   doesn't preempt mid-transition and observe a torn state.
+/// - If `R(A)` is empty (no interrupt touches `A`), no wrapping is needed
+///   and the transition compiles to plain straight-line code.
+///
+/// The set is also useful for `cliffordc audit`'s "interrupts that affect
+/// this automaton" report and for the `@sequential(A, B)` overrides per
+/// Decision #11.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InterruptOverlap {
+    /// Map: automaton-name → set of interrupt names that mutate it
+    /// (transitively per `#mutates` + proc-call closure).
+    map: HashMap<String, HashSet<String>>,
+}
+
+impl InterruptOverlap {
+    /// Look up R(A) for an automaton — the set of interrupt names that
+    /// mutate `A` transitively. Returns an empty set (not `None`) when
+    /// no interrupt touches `A`; consumers can use `is_empty()` to test.
+    #[must_use]
+    pub fn interrupts_for(&self, automaton: &str) -> &HashSet<String> {
+        // Use a cached static empty set — saves an allocation in the
+        // common "no interrupt touches this automaton" lookup path.
+        static EMPTY: std::sync::OnceLock<HashSet<String>> = std::sync::OnceLock::new();
+        self.map
+            .get(automaton)
+            .unwrap_or_else(|| EMPTY.get_or_init(HashSet::new))
+    }
+
+    /// True if any interrupt mutates this automaton transitively.
+    /// Convenience for the common "do I need critical-section wrapping?"
+    /// test the codegen does for each automaton's transitions.
+    #[must_use]
+    pub fn is_overlapped(&self, automaton: &str) -> bool {
+        self.map
+            .get(automaton)
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Iterate over `(automaton, interrupts)` pairs where the automaton
+    /// has at least one overlapping interrupt.
+    pub fn all(&self) -> impl Iterator<Item = (&String, &HashSet<String>)> {
+        self.map.iter()
+    }
+
+    /// Number of automatons with at least one overlapping interrupt.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// True if no automaton has any overlapping interrupt.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+}
+
+/// Compute the interrupt-overlap set R(A) for every automaton in the program.
+///
+/// Algorithm:
+///
+/// 1. From the [`MutationProfiles`], extract the transitive
+///    `actual_automata` set for every `#interrupt` callable.
+/// 2. Invert the relation: for each automaton `A` named in any interrupt's
+///    `actual_automata`, record the interrupt's name in `R(A)`.
+/// 3. Return the resulting per-automaton set.
+///
+/// Because [`MutationProfiles`] already captures transitive closure
+/// through `#> proc()` calls (per slice E2), this slice does not have to
+/// re-walk the call graph — it just inverts the existing relation.
+///
+/// # Examples
+///
+/// ```
+/// use clifford_lexer::tokenize;
+/// use clifford_parser::parse;
+/// use clifford_resolve::resolve;
+/// use clifford_effect::{extract_mutation_profiles, compute_interrupt_overlap};
+///
+/// let src = "\
+///   #automaton Counter { value: u32; }\n\
+///   #interrupt UART_RX() #mutates: [Counter] #priority: HIGH {\n  \
+///     Counter.value = 1u32;\n  \
+///   }\n\
+/// ";
+/// let tokens = tokenize(src).unwrap();
+/// let program = parse(&tokens).unwrap();
+/// let resolution = resolve(&program).unwrap();
+/// let profiles = extract_mutation_profiles(&program, &resolution).unwrap();
+/// let overlap = compute_interrupt_overlap(&profiles);
+///
+/// assert!(overlap.is_overlapped("Counter"));
+/// assert!(overlap.interrupts_for("Counter").contains("UART_RX"));
+/// ```
+#[must_use]
+pub fn compute_interrupt_overlap(profiles: &MutationProfiles) -> InterruptOverlap {
+    let mut map: HashMap<String, HashSet<String>> = HashMap::new();
+    for (id, profile) in profiles.all() {
+        let interrupt_name = match id {
+            CallableId::Interrupt(n) => n.clone(),
+            _ => continue,
+        };
+        for auto_name in &profile.actual_automata {
+            map.entry(auto_name.clone())
+                .or_default()
+                .insert(interrupt_name.clone());
+        }
+    }
+    InterruptOverlap { map }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1976,5 +2098,170 @@ mod tests {
              #effect zap()  #mutates: [Counter] { #> reset(); }",
         );
         assert!(g.is_ok(), "should be clean: {:?}", g);
+    }
+
+    // ─── Slice 4: interrupt-overlap set R(A) ─────────────────────────────
+
+    fn overlap_str(src: &str) -> InterruptOverlap {
+        let tokens = tokenize(src).expect("tokenize");
+        let program = parse(&tokens).expect("parse");
+        let resolution = resolve(&program).expect("resolve");
+        let profiles = extract_mutation_profiles(&program, &resolution).expect("profiles");
+        compute_interrupt_overlap(&profiles)
+    }
+
+    // ── No interrupts → empty overlap ────────────────────────────────────
+
+    #[test]
+    fn empty_program_has_empty_overlap() {
+        let o = overlap_str("");
+        assert!(o.is_empty());
+    }
+
+    #[test]
+    fn no_interrupts_means_no_overlap() {
+        let o = overlap_str(
+            "#automaton C { v: u32; } \
+             #effect e() #mutates: [C] { C.v = 1u32; }",
+        );
+        assert!(o.is_empty());
+        assert!(!o.is_overlapped("C"));
+        assert!(o.interrupts_for("C").is_empty());
+    }
+
+    // ── Direct interrupt → automaton overlap ────────────────────────────
+
+    #[test]
+    fn single_interrupt_one_automaton_overlap() {
+        let o = overlap_str(
+            "#automaton Counter { value: u32; } \
+             #interrupt UART_RX() #mutates: [Counter] #priority: HIGH { \
+               Counter.value = 1u32; \
+             }",
+        );
+        assert!(o.is_overlapped("Counter"));
+        assert!(o.interrupts_for("Counter").contains("UART_RX"));
+        assert_eq!(o.interrupts_for("Counter").len(), 1);
+    }
+
+    // ── Multiple interrupts, same automaton ──────────────────────────────
+
+    #[test]
+    fn two_interrupts_same_automaton_both_overlap() {
+        let o = overlap_str(
+            "#automaton Counter { value: u32; } \
+             #interrupt UART_RX() #mutates: [Counter] #priority: HIGH { \
+               Counter.value = 1u32; \
+             } \
+             #interrupt TIMER() #mutates: [Counter] #priority: LOW { \
+               Counter.value = Counter.value + 1u32; \
+             }",
+        );
+        let interrupts = o.interrupts_for("Counter");
+        assert_eq!(interrupts.len(), 2);
+        assert!(interrupts.contains("UART_RX"));
+        assert!(interrupts.contains("TIMER"));
+    }
+
+    // ── One interrupt, multiple automatons ──────────────────────────────
+
+    #[test]
+    fn one_interrupt_two_automatons_both_overlap() {
+        let o = overlap_str(
+            "#automaton A { x: u32; } \
+             #automaton B { y: u32; } \
+             #interrupt SHARED() #mutates: [A, B] #priority: HIGH { \
+               A.x = 1u32; B.y = 2u32; \
+             }",
+        );
+        assert!(o.is_overlapped("A"));
+        assert!(o.is_overlapped("B"));
+        assert!(o.interrupts_for("A").contains("SHARED"));
+        assert!(o.interrupts_for("B").contains("SHARED"));
+    }
+
+    // ── Transitive: interrupt → effect → automaton ──────────────────────
+
+    #[test]
+    fn transitive_interrupt_overlap_through_proc_call() {
+        // The interrupt directly mutates [], but calls inner() which
+        // mutates Counter. Per E2's transitive closure, the interrupt's
+        // actual_automata includes Counter. Therefore Counter is in R(A).
+        let o = overlap_str(
+            "#automaton Counter { value: u32; } \
+             #effect inner() #mutates: [Counter] { Counter.value = 1u32; } \
+             #interrupt OUTER() #mutates: [Counter] #priority: HIGH { \
+               #> inner(); \
+             }",
+        );
+        assert!(o.is_overlapped("Counter"));
+        assert!(o.interrupts_for("Counter").contains("OUTER"));
+    }
+
+    // ── Effects don't show up in R(A) ────────────────────────────────────
+
+    #[test]
+    fn effects_alone_dont_create_overlap() {
+        // Three effects, no interrupts — R(A) is empty regardless of
+        // how many effects mutate the automaton.
+        let o = overlap_str(
+            "#automaton Counter { value: u32; } \
+             #effect a() #mutates: [Counter] { Counter.value = 1u32; } \
+             #effect b() #mutates: [Counter] { Counter.value = 2u32; } \
+             #effect c() #mutates: [Counter] { Counter.value = 3u32; }",
+        );
+        assert!(o.is_empty(), "effects shouldn't create overlap");
+    }
+
+    // ── Realistic firmware: IRQ + main-loop effect ───────────────────────
+
+    #[test]
+    fn realistic_irq_plus_consumer() {
+        // The Wari-shape pattern: UART_RX_IRQ produces; consume_byte
+        // consumes. Both touch UartRx → R(UartRx) = {UART_RX_IRQ}.
+        let o = overlap_str(
+            "#automaton UartRx { data: u8; head: usize; tail: usize; } \
+             #interrupt UART_RX_IRQ() #mutates: [UartRx] #priority: HIGH { \
+               UartRx.head = UartRx.head + 1usize; \
+             } \
+             #effect consume_byte() #mutates: [UartRx] { \
+               UartRx.tail = UartRx.tail + 1usize; \
+             }",
+        );
+        assert!(o.is_overlapped("UartRx"));
+        assert_eq!(o.interrupts_for("UartRx").len(), 1);
+        assert!(o.interrupts_for("UartRx").contains("UART_RX_IRQ"));
+    }
+
+    // ── Lookup for non-existent automaton ───────────────────────────────
+
+    #[test]
+    fn lookup_for_nonexistent_automaton_returns_empty() {
+        let o = overlap_str(
+            "#automaton C { v: u32; } \
+             #interrupt I() #mutates: [C] #priority: HIGH { C.v = 1u32; }",
+        );
+        // Querying for an automaton that doesn't exist returns the empty set.
+        assert!(o.interrupts_for("Nonexistent").is_empty());
+        assert!(!o.is_overlapped("Nonexistent"));
+    }
+
+    // ── all() iterator ───────────────────────────────────────────────────
+
+    #[test]
+    fn all_iterator_returns_every_overlapped_automaton() {
+        let o = overlap_str(
+            "#automaton A { x: u32; } \
+             #automaton B { y: u32; } \
+             #automaton C { z: u32; } \
+             #interrupt I1() #mutates: [A] #priority: HIGH { A.x = 1u32; } \
+             #interrupt I2() #mutates: [B] #priority: LOW { B.y = 1u32; }",
+        );
+        // A and B are overlapped; C is not.
+        let names: HashSet<&String> = o.all().map(|(name, _)| name).collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.iter().any(|n| n.as_str() == "A"));
+        assert!(names.iter().any(|n| n.as_str() == "B"));
+        assert!(!names.iter().any(|n| n.as_str() == "C"));
     }
 }
