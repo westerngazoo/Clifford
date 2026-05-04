@@ -7,6 +7,31 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Phase 2 effect slice E3: §6.3 proc-call graph + cycle detection (2026-05-03)
+
+- `clifford-effect`: new public entry `extract_call_graph(&Program, &Resolution)
+  -> Result<ProcCallGraph, Vec<EffectError>>`. Builds the directed
+  call graph (caller → callee) from every `#> proc()` site and rejects
+  any cycles per spec §6.3 step 6.
+- New types: `ProcCallGraph` (the artifact, with `callees(id)` lookup
+  and iteration), `EffectError::ProcCallCycle { cycle, cycle_display }`.
+- Cycle detection: DFS with three-color marking (white / gray / black);
+  cycles canonicalised by rotating to lex-smallest member so the same
+  cycle is reported once regardless of DFS entry point.
+- New error: `E0422 ProcCallCycle` — cycle members listed in traversal
+  order, plus a pre-rendered display string (e.g. `` `a` → `b` → `c` → `a` ``).
+  Multiple disjoint cycles produce multiple errors.
+- Hand-rolled graph data structure: `HashMap<CallableId, HashSet<CallableId>>`.
+  No external graph library — keeps deps minimal per CLAUDE.md, the
+  algorithms are textbook DFS/SCC, and `petgraph` would be premature
+  commitment.
+- 12 new tests + 1 doctest: empty program, no-edge cleanup, linear
+  chains (2 + 3), self-loop (E0422), mutual recursion (E0422),
+  3-cycle (E0422), two disjoint cycles (two E0422s), transition
+  self-call cycle, diamond DAG clean, canonicalisation idempotence,
+  realistic Wari-style program clean. **Total clifford-effect: 41 unit
+  + 2 doctest tests.**
+
 ### Added — Phase 2 effect slice E2: §6.2 mutation profile extraction (2026-05-02)
 
 The bridge piece the GA orthogonality engine actually consumes. After
