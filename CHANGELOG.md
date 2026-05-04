@@ -7,6 +7,53 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Spec — Decisions #22-#25: cleaner pure/imperative boundary (2026-05-03)
+
+A coordinated set of four design decisions sharpening Clifford's pure /
+imperative split. **Decisions #22 and #25 lock now** (designs are
+mechanical); **Decisions #23 and #24 record the direction with ADRs
+forthcoming**.
+
+- **Decision #22 — Kinds of Imperative.** Extend `$ [TraitList]` markers
+  from `@fn` to `#effect` / `#interrupt` / `#transition` declarations.
+  Predeclared traits classify mutation kind: `Hardware`, `Realtime`,
+  `Acquire` / `Release` / `SeqCst` (memory ordering), `LockingDiscipline`,
+  `PureState`, `Encapsulated`. The orthogonality engine ignores them;
+  codegen / `cliffordc audit` / certification consume them. Locked.
+- **Decision #25 — `#hidden` Encapsulation.** Re-introduce `#hidden` as
+  a per-field modifier on automaton fields, with the algebraic
+  interpretation: a hidden field's basis vector cannot appear in any
+  callable's `actual_writes` outside the owning automaton's surface.
+  Encapsulation is "the bit isn't there for outsiders to refer to" —
+  trivial orthogonality by construction. No engine machinery; ~50 LoC
+  parser + resolver. Locked.
+- **Decision #23 — Tighten `@fn` toward Haskell-clean.** Direction
+  agreed: total by default, effect rows in signatures, refinement types
+  in argument positions, local mutation per Refinement #1a remains
+  permitted (ST-monad-equivalent). DESIGN-IN-PROGRESS — needs an ADR
+  surveying Idris totality, Liquid Haskell refinements, Koka effect rows.
+  Targeted ADR: `docs/adr/0003-haskell-clean-fn-discipline.md`.
+- **Decision #24 — `@snapshot` Boundary Operator.** Direction agreed:
+  introduce `@snapshot Auto.field` as the only way to read mutable
+  automaton state into pure-side analysis. The boundary crossing
+  becomes syntactically visible. DESIGN-IN-PROGRESS — needs an ADR
+  resolving the expression-vs-statement question, copy-by-value vs
+  ref-to-snapshot, interaction with `#shared` (Decision #21), and
+  backward compatibility with the existing snapshot-by-convention
+  pattern in book Ch. 39. Targeted ADR:
+  `docs/adr/0004-snapshot-boundary-operator.md`.
+
+The four taken together commit Clifford to the framing the architect
+articulated: pure side becomes Haskell-clean (Decisions #23 + #1a);
+imperative side becomes a legible "dark side" with explicit kinds
+(Decision #22), explicit encapsulation (Decision #25), and an explicit
+boundary-crossing operator (Decision #24).
+
+This PR is pure documentation — `DECISIONS.md` updated with the four
+entries, the matrix table extended, and the date footer rewritten.
+No code changes; no spec amendments yet (those land per-decision as
+ADRs lock and implementation begins).
+
 ### Spec — §7.0.1 Safety Pillars + book Ch. 39 SPSC ring buffer (2026-05-03)
 
 Pins the v0.1 GA orthogonality engine's contract — what's guaranteed,
