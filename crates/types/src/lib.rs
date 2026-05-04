@@ -48,8 +48,8 @@
 use std::collections::HashMap;
 
 use clifford_ast::{
-    AutomatonDecl, BinaryOp, Block, EffectDecl, Expr, ExprKind, FnDecl, InterruptDecl, Item,
-    Param, PrimitiveType, Program, Stmt, StmtKind, TransitionDecl, TypeExpr, TypeKind, UnaryOp,
+    AutomatonDecl, BinaryOp, Block, EffectDecl, Expr, ExprKind, FnDecl, InterruptDecl, Item, Param,
+    PrimitiveType, Program, Stmt, StmtKind, TransitionDecl, TypeExpr, TypeKind, UnaryOp,
 };
 use clifford_lexer::Span;
 use clifford_resolve::{BindingRef, Resolution, Symbol, SymbolKind};
@@ -92,7 +92,9 @@ pub enum TypeError {
 
     /// A `let name: T = expr;` statement's annotated type `T` does not
     /// match the inferred type of `expr`.
-    #[error("E0512: `let {name}: {declared}` does not match initializer type {actual} (at byte {at})")]
+    #[error(
+        "E0512: `let {name}: {declared}` does not match initializer type {actual} (at byte {at})"
+    )]
     LetTypeMismatch {
         /// The bound name.
         name: String,
@@ -126,7 +128,9 @@ pub enum TypeError {
     },
 
     /// A function call has the wrong number of arguments.
-    #[error("E0514: call to `{callee}` expected {expected} argument(s), got {actual} (at byte {at})")]
+    #[error(
+        "E0514: call to `{callee}` expected {expected} argument(s), got {actual} (at byte {at})"
+    )]
     CallArityMismatch {
         /// Callee name.
         callee: String,
@@ -174,11 +178,13 @@ pub enum TypeError {
 /// segments, etc.); `Type` is the *semantic* form (canonical, comparable,
 /// produced by the type checker once names have been resolved).
 ///
-/// Slice-3 scope: [`Type::Unit`], [`Type::Primitive`], [`Type::Ref`],
+/// Slice-4a scope: [`Type::Unit`], [`Type::Primitive`], [`Type::Ref`],
 /// [`Type::Array`], [`Type::Slice`], [`Type::Tuple`], [`Type::Range`],
-/// [`Type::StringSlice`], and [`Type::Unknown`]. Function-pointer types,
-/// nominal types (paths to `@type` declarations), ADT variants, and access
-/// types are slice T4+.
+/// [`Type::Nominal`] (paths to `@type` declarations and other top-level
+/// type-bearing items), [`Type::StringSlice`], and [`Type::Unknown`].
+/// Function-pointer types, ADT-variant constructors (multi-segment paths
+/// like `Result::Ok`), generic instantiation with HM unification, trait
+/// satisfaction, and access types are slice T4b+.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     /// `()` — the unit type.
@@ -227,6 +233,34 @@ pub enum Type {
     /// for type-equality purposes; downstream consumers can treat them as
     /// the same type via [`Type::display`].
     StringSlice,
+    /// A nominal type — a path that refers to a top-level type-bearing
+    /// declaration (`@type`, `@trait`, `#automaton`, `#interface`).
+    ///
+    /// Per Decision #19's nominal-access machinery and §4 generally,
+    /// nominal types have *distinct identity* even when their underlying
+    /// representation is congruent: `@type Foo = u32; @type Bar = u32;`
+    /// produces two distinct nominal types `Foo` and `Bar` that the
+    /// engine treats as different even though both represent `u32`
+    /// underneath.
+    ///
+    /// `path` is the canonical multi-segment path (e.g. `["clifford",
+    /// "core", "Option"]` for the standard library's `Option`); for
+    /// single-segment local references, the `path` has one entry.
+    /// `args` is the list of generic type arguments (empty for
+    /// non-generic types).
+    ///
+    /// Slice-4a records the path and args verbatim. Slice T4b+ adds:
+    /// (a) verifying the path resolves to an actual top-level type
+    /// declaration, (b) following `@type` aliases to the underlying
+    /// type for equality / unification, (c) ADT variant resolution
+    /// for multi-segment paths like `Result::Ok`.
+    Nominal {
+        /// The path to the type, in source order (always at least one segment).
+        path: Vec<String>,
+        /// Generic type arguments, in declaration order. Empty for
+        /// non-generic types like `Counter` or `bool`.
+        args: Vec<Type>,
+    },
     /// The type checker could not yet compute this expression's type.
     /// Carries a brief reason string for diagnostics.
     Unknown(&'static str),
@@ -254,6 +288,15 @@ impl Type {
                 format!("{}{dots}{}", element.display(), element.display())
             }
             Self::StringSlice => "&[u8]".to_owned(),
+            Self::Nominal { path, args } => {
+                let path_str = path.join("::");
+                if args.is_empty() {
+                    path_str
+                } else {
+                    let arg_strs: Vec<String> = args.iter().map(Self::display).collect();
+                    format!("{path_str}<{}>", arg_strs.join(", "))
+                }
+            }
             Self::Unknown(reason) => format!("<unknown: {reason}>"),
         }
     }
@@ -281,7 +324,10 @@ impl Type {
     /// True if this is one of the floating-point primitive types.
     #[must_use]
     pub fn is_float(&self) -> bool {
-        matches!(self, Self::Primitive(PrimitiveType::F32 | PrimitiveType::F64))
+        matches!(
+            self,
+            Self::Primitive(PrimitiveType::F32 | PrimitiveType::F64)
+        )
     }
 
     /// True if this is `bool`.
@@ -386,7 +432,9 @@ pub fn infer(program: &Program, resolution: &Resolution) -> Result<Typing, Vec<T
     }
 
     if walker.errors.is_empty() {
-        Ok(Typing { types: walker.types })
+        Ok(Typing {
+            types: walker.types,
+        })
     } else {
         Err(walker.errors)
     }
@@ -407,13 +455,22 @@ fn build_signatures(program: &Program) -> HashMap<String, Signature> {
     for item in &program.items {
         match item {
             Item::Fn(decl) => {
-                map.insert(decl.name.clone(), signature_from_params(&decl.params, decl.return_type.as_ref()));
+                map.insert(
+                    decl.name.clone(),
+                    signature_from_params(&decl.params, decl.return_type.as_ref()),
+                );
             }
             Item::Effect(decl) => {
-                map.insert(decl.name.clone(), signature_from_params(&decl.params, decl.return_type.as_ref()));
+                map.insert(
+                    decl.name.clone(),
+                    signature_from_params(&decl.params, decl.return_type.as_ref()),
+                );
             }
             Item::Interrupt(decl) => {
-                map.insert(decl.name.clone(), signature_from_params(&decl.params, decl.return_type.as_ref()));
+                map.insert(
+                    decl.name.clone(),
+                    signature_from_params(&decl.params, decl.return_type.as_ref()),
+                );
             }
             _ => {}
         }
@@ -424,9 +481,7 @@ fn build_signatures(program: &Program) -> HashMap<String, Signature> {
 fn signature_from_params(params: &[Param], return_type: Option<&TypeExpr>) -> Signature {
     Signature {
         params: params.iter().map(|p| type_from_type_expr(&p.ty)).collect(),
-        return_type: return_type
-            .map(type_from_type_expr)
-            .unwrap_or(Type::Unit),
+        return_type: return_type.map(type_from_type_expr).unwrap_or(Type::Unit),
     }
 }
 
@@ -874,9 +929,7 @@ impl<'a> Inferer<'a> {
         let limit = sig.params.len().min(arg_types.len());
         for (i, actual) in arg_types.iter().take(limit).enumerate() {
             let expected = &sig.params[i];
-            if !expected.is_unknown()
-                && !actual.is_unknown()
-                && !types_compatible(expected, actual)
+            if !expected.is_unknown() && !actual.is_unknown() && !types_compatible(expected, actual)
             {
                 self.errors.push(TypeError::CallArgMismatch {
                     callee: name.to_owned(),
@@ -918,9 +971,7 @@ impl<'a> Inferer<'a> {
         let element = match receiver {
             Type::Array { element, .. } | Type::Slice { element } => Some((**element).clone()),
             Type::Ref { inner, .. } => match inner.as_ref() {
-                Type::Array { element, .. } | Type::Slice { element } => {
-                    Some((**element).clone())
-                }
+                Type::Array { element, .. } | Type::Slice { element } => Some((**element).clone()),
                 _ => None,
             },
             Type::StringSlice => Some(Type::Primitive(PrimitiveType::U8)),
@@ -943,8 +994,7 @@ impl<'a> Inferer<'a> {
     /// all); slice 2 looks up the field's declared type via the resolver's
     /// `BindingRef::AutomatonField` recorded under the FieldAccess's span.
     fn field_access_type(&self, span: Span, field: &str) -> Type {
-        let Some(BindingRef::AutomatonField { automaton, .. }) =
-            self.resolution.lookup(span)
+        let Some(BindingRef::AutomatonField { automaton, .. }) = self.resolution.lookup(span)
         else {
             return Type::Unknown("field-access on non-automaton receiver is slice T3 work");
         };
@@ -1061,7 +1111,12 @@ impl<'a> Inferer<'a> {
                     mismatch(op_name, self)
                 }
             }
-            BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
+            BinaryOp::Eq
+            | BinaryOp::Ne
+            | BinaryOp::Lt
+            | BinaryOp::Le
+            | BinaryOp::Gt
+            | BinaryOp::Ge => {
                 let op_name = match op {
                     BinaryOp::Eq => "==",
                     BinaryOp::Ne => "!=",
@@ -1083,7 +1138,11 @@ impl<'a> Inferer<'a> {
                 }
             }
             BinaryOp::And | BinaryOp::Or => {
-                let op_name = if matches!(op, BinaryOp::And) { "&&" } else { "||" };
+                let op_name = if matches!(op, BinaryOp::And) {
+                    "&&"
+                } else {
+                    "||"
+                };
                 if lhs.is_bool() && rhs.is_bool() {
                     Type::Primitive(PrimitiveType::Bool)
                 } else {
@@ -1104,7 +1163,11 @@ impl<'a> Inferer<'a> {
                 }
             }
             BinaryOp::Shl | BinaryOp::Shr => {
-                let op_name = if matches!(op, BinaryOp::Shl) { "<<" } else { ">>" };
+                let op_name = if matches!(op, BinaryOp::Shl) {
+                    "<<"
+                } else {
+                    ">>"
+                };
                 if lhs.is_integer() && rhs.is_integer() {
                     lhs.clone()
                 } else {
@@ -1129,10 +1192,12 @@ fn types_compatible(declared: &Type, actual: &Type) -> bool {
 
 /// Translate a syntactic [`TypeExpr`] into a semantic [`Type`].
 ///
-/// Slice-1 scope: only `Unit` and `Primitive(...)` shapes resolve cleanly.
-/// References, slices, arrays, tuples, function types, paths, and access
-/// types all return [`Type::Unknown`] for now — those land in slice T2+
-/// alongside their use cases.
+/// Slice T4a scope: `Unit`, `Primitive`, `Ref`, `Array`, `Slice`, `Tuple`,
+/// and `Path` (as [`Type::Nominal`]) resolve to their semantic counterparts.
+/// `access<T>` and `@fn` pointer types remain [`Type::Unknown`] until slice
+/// T4b+. Slice T4a translates `Path` verbatim (recording segments and
+/// generic args); resolution of the path against the program's top-level
+/// declarations is deferred to slice T4b.
 fn type_from_type_expr(t: &TypeExpr) -> Type {
     use clifford_ast::ArraySize;
     match &t.kind {
@@ -1153,7 +1218,10 @@ fn type_from_type_expr(t: &TypeExpr) -> Type {
             element: Box::new(type_from_type_expr(&st.element)),
         },
         TypeKind::Tuple(tt) => Type::Tuple(tt.elements.iter().map(type_from_type_expr).collect()),
-        TypeKind::Path(_) => Type::Unknown("nominal-path type lookup is slice T4 work"),
+        TypeKind::Path(pt) => Type::Nominal {
+            path: pt.segments.clone(),
+            args: pt.generic_args.iter().map(type_from_type_expr).collect(),
+        },
         TypeKind::Access(_) => Type::Unknown("access<T> type is slice T4 work"),
         TypeKind::Fn(_) => Type::Unknown("@fn pointer type is slice T4 work"),
         // `TypeKind` is `#[non_exhaustive]`. New variants default to Unknown;
@@ -1385,10 +1453,9 @@ mod tests {
     #[test]
     fn neg_on_bool_is_e0511() {
         let errors = infer_str("@fn f() { let _x := -true; }").unwrap_err();
-        assert!(errors.iter().any(|e| matches!(
-            e,
-            TypeError::UnaryTypeMismatch { op: "-", .. }
-        )));
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, TypeError::UnaryTypeMismatch { op: "-", .. })));
     }
 
     #[test]
@@ -1402,10 +1469,9 @@ mod tests {
     #[test]
     fn not_on_integer_is_e0511() {
         let errors = infer_str("@fn f() { let _x := !42i32; }").unwrap_err();
-        assert!(errors.iter().any(|e| matches!(
-            e,
-            TypeError::UnaryTypeMismatch { op: "!", .. }
-        )));
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, TypeError::UnaryTypeMismatch { op: "!", .. })));
     }
 
     #[test]
@@ -1419,10 +1485,9 @@ mod tests {
     #[test]
     fn bitnot_on_bool_is_e0511() {
         let errors = infer_str("@fn f() { let _x := ~true; }").unwrap_err();
-        assert!(errors.iter().any(|e| matches!(
-            e,
-            TypeError::UnaryTypeMismatch { op: "~", .. }
-        )));
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, TypeError::UnaryTypeMismatch { op: "~", .. })));
     }
 
     // ── Binary arithmetic ────────────────────────────────────────────────
@@ -1438,19 +1503,17 @@ mod tests {
     #[test]
     fn arithmetic_mismatch_is_e0510() {
         let errors = infer_str("@fn f() { let _x := 1u32 + 2u64; }").unwrap_err();
-        assert!(errors.iter().any(|e| matches!(
-            e,
-            TypeError::BinaryTypeMismatch { op: "+", .. }
-        )));
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, TypeError::BinaryTypeMismatch { op: "+", .. })));
     }
 
     #[test]
     fn arithmetic_on_bool_is_e0510() {
         let errors = infer_str("@fn f() { let _x := true + false; }").unwrap_err();
-        assert!(errors.iter().any(|e| matches!(
-            e,
-            TypeError::BinaryTypeMismatch { op: "+", .. }
-        )));
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, TypeError::BinaryTypeMismatch { op: "+", .. })));
     }
 
     #[test]
@@ -1474,10 +1537,9 @@ mod tests {
     #[test]
     fn comparison_mismatch_is_e0510() {
         let errors = infer_str("@fn f() { let _x := 1u32 < 2u64; }").unwrap_err();
-        assert!(errors.iter().any(|e| matches!(
-            e,
-            TypeError::BinaryTypeMismatch { op: "<", .. }
-        )));
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, TypeError::BinaryTypeMismatch { op: "<", .. })));
     }
 
     #[test]
@@ -1501,10 +1563,9 @@ mod tests {
     #[test]
     fn logical_and_on_integer_is_e0510() {
         let errors = infer_str("@fn f() { let _x := 1u32 && 2u32; }").unwrap_err();
-        assert!(errors.iter().any(|e| matches!(
-            e,
-            TypeError::BinaryTypeMismatch { op: "&&", .. }
-        )));
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, TypeError::BinaryTypeMismatch { op: "&&", .. })));
     }
 
     // ── Bitwise operators ────────────────────────────────────────────────
@@ -1520,10 +1581,9 @@ mod tests {
     #[test]
     fn bitwise_xor_on_mismatched_integers_is_e0510() {
         let errors = infer_str("@fn f() { let _x := 1u8 ^ 2u32; }").unwrap_err();
-        assert!(errors.iter().any(|e| matches!(
-            e,
-            TypeError::BinaryTypeMismatch { op: "^", .. }
-        )));
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, TypeError::BinaryTypeMismatch { op: "^", .. })));
     }
 
     // ── Shifts ───────────────────────────────────────────────────────────
@@ -1539,10 +1599,9 @@ mod tests {
     #[test]
     fn shift_with_non_integer_lhs_is_e0510() {
         let errors = infer_str("@fn f() { let _x := true << 2; }").unwrap_err();
-        assert!(errors.iter().any(|e| matches!(
-            e,
-            TypeError::BinaryTypeMismatch { op: "<<", .. }
-        )));
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, TypeError::BinaryTypeMismatch { op: "<<", .. })));
     }
 
     // ── Cast ─────────────────────────────────────────────────────────────
@@ -1591,10 +1650,9 @@ mod tests {
 
     #[test]
     fn unchecked_load_returns_type_argument() {
-        let typing = infer_str(
-            "#effect e(p: u32) #mutates: [] { let _x := #unchecked_load<u8>(p); }",
-        )
-        .unwrap();
+        let typing =
+            infer_str("#effect e(p: u32) #mutates: [] { let _x := #unchecked_load<u8>(p); }")
+                .unwrap();
         assert!(types_in(&typing)
             .into_iter()
             .any(|t| matches!(t, Type::Primitive(PrimitiveType::U8))));
@@ -1602,10 +1660,9 @@ mod tests {
 
     #[test]
     fn volatile_load_returns_type_argument() {
-        let typing = infer_str(
-            "#effect e(p: u32) #mutates: [] { let _x := #volatile_load<u32>(p); }",
-        )
-        .unwrap();
+        let typing =
+            infer_str("#effect e(p: u32) #mutates: [] { let _x := #volatile_load<u32>(p); }")
+                .unwrap();
         assert!(types_in(&typing)
             .into_iter()
             .any(|t| matches!(t, Type::Primitive(PrimitiveType::U32))));
@@ -1626,8 +1683,7 @@ mod tests {
 
     #[test]
     fn multiple_errors_collected_in_one_pass() {
-        let errors =
-            infer_str("@fn f() { let _x := -true; let _y := 1u32 + 2u8; }").unwrap_err();
+        let errors = infer_str("@fn f() { let _x := -true; let _y := 1u32 + 2u8; }").unwrap_err();
         assert!(errors.len() >= 2);
         assert!(errors
             .iter()
@@ -1800,9 +1856,7 @@ mod tests {
     fn call_to_local_is_unknown_not_error() {
         // Calling a parameter (typed as Unknown for callable-ness in slice 2)
         // should produce Unknown, not a spurious error.
-        let res = infer_str(
-            "@fn caller() { let helper := 0u32; let _y := helper(); }",
-        );
+        let res = infer_str("@fn caller() { let helper := 0u32; let _y := helper(); }");
         // No errors expected — we don't know what `helper` is callable as
         // but it's not a top-level fn so we skip arg checking.
         assert!(res.is_ok(), "got errors: {:?}", res);
@@ -1977,8 +2031,8 @@ mod tests {
 
     #[test]
     fn index_into_array_yields_element() {
-        let typing = infer_str("@fn f() -> u32 { let a := [1u32, 2u32, 3u32]; return a[0u32]; }")
-            .unwrap();
+        let typing =
+            infer_str("@fn f() -> u32 { let a := [1u32, 2u32, 3u32]; return a[0u32]; }").unwrap();
         // The `a[0u32]` index returns u32.
         let u32_count = typing
             .types
@@ -1998,16 +2052,14 @@ mod tests {
 
     #[test]
     fn index_into_ref_slice_auto_derefs() {
-        let typing =
-            infer_str("@fn f(buf: &[u8]) -> u8 { return buf[0u32]; }").unwrap();
+        let typing = infer_str("@fn f(buf: &[u8]) -> u8 { return buf[0u32]; }").unwrap();
         let saw_u8 = first_of(&typing, |t| matches!(t, Type::Primitive(PrimitiveType::U8)));
         assert!(saw_u8.is_some());
     }
 
     #[test]
     fn index_with_non_integer_is_e0517() {
-        let errors =
-            infer_str("@fn f(buf: &[u8]) -> u8 { return buf[true]; }").unwrap_err();
+        let errors = infer_str("@fn f(buf: &[u8]) -> u8 { return buf[true]; }").unwrap_err();
         assert!(errors
             .iter()
             .any(|e| matches!(e, TypeError::IndexNotInteger { .. })));
@@ -2015,8 +2067,7 @@ mod tests {
 
     #[test]
     fn index_into_non_indexable_is_e0516() {
-        let errors =
-            infer_str("@fn f() -> u32 { let x := 42u32; return x[0u32]; }").unwrap_err();
+        let errors = infer_str("@fn f() -> u32 { let x := 42u32; return x[0u32]; }").unwrap_err();
         assert!(errors
             .iter()
             .any(|e| matches!(e, TypeError::IndexNonIndexable { .. })));
@@ -2040,7 +2091,13 @@ mod tests {
     fn range_inclusive_yields_inclusive_range_type() {
         let typing = infer_str("@fn f() { let _r := 0u32 ..= 10u32; }").unwrap();
         let saw_range = first_of(&typing, |t| {
-            matches!(t, Type::Range { inclusive: true, .. })
+            matches!(
+                t,
+                Type::Range {
+                    inclusive: true,
+                    ..
+                }
+            )
         });
         assert!(saw_range.is_some());
     }
@@ -2049,10 +2106,9 @@ mod tests {
     fn range_with_mismatched_bounds_is_e0510() {
         // We reuse BinaryTypeMismatch for range mismatch (op `..` / `..=`).
         let errors = infer_str("@fn f() { let _r := 0u32 .. 10u8; }").unwrap_err();
-        assert!(errors.iter().any(|e| matches!(
-            e,
-            TypeError::BinaryTypeMismatch { op: "..", .. }
-        )));
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, TypeError::BinaryTypeMismatch { op: "..", .. })));
     }
 
     // ── Combined: array + index in a real signature ──────────────────────
@@ -2087,5 +2143,187 @@ mod tests {
             .filter(|t| matches!(t, Type::Primitive(PrimitiveType::U32)))
             .count();
         assert!(u32_count >= 4, "got {u32_count}");
+    }
+
+    // ─── Slice T4a: nominal types from path-position type expressions ────
+
+    #[test]
+    fn nominal_display_simple() {
+        let t = Type::Nominal {
+            path: vec!["Counter".to_owned()],
+            args: vec![],
+        };
+        assert_eq!(t.display(), "Counter");
+    }
+
+    #[test]
+    fn nominal_display_multi_segment() {
+        let t = Type::Nominal {
+            path: vec![
+                "clifford".to_owned(),
+                "core".to_owned(),
+                "Option".to_owned(),
+            ],
+            args: vec![],
+        };
+        assert_eq!(t.display(), "clifford::core::Option");
+    }
+
+    #[test]
+    fn nominal_display_with_one_generic_arg() {
+        let t = Type::Nominal {
+            path: vec!["Option".to_owned()],
+            args: vec![Type::Primitive(PrimitiveType::U32)],
+        };
+        assert_eq!(t.display(), "Option<u32>");
+    }
+
+    #[test]
+    fn nominal_display_with_multiple_generic_args() {
+        let t = Type::Nominal {
+            path: vec!["Result".to_owned()],
+            args: vec![
+                Type::Primitive(PrimitiveType::U32),
+                Type::Primitive(PrimitiveType::Bool),
+            ],
+        };
+        assert_eq!(t.display(), "Result<u32, bool>");
+    }
+
+    #[test]
+    fn nominal_display_with_nested_generic_arg() {
+        // Option<Result<u32, bool>>
+        let inner = Type::Nominal {
+            path: vec!["Result".to_owned()],
+            args: vec![
+                Type::Primitive(PrimitiveType::U32),
+                Type::Primitive(PrimitiveType::Bool),
+            ],
+        };
+        let outer = Type::Nominal {
+            path: vec!["Option".to_owned()],
+            args: vec![inner],
+        };
+        assert_eq!(outer.display(), "Option<Result<u32, bool>>");
+    }
+
+    #[test]
+    fn nominal_distinct_identity_per_path() {
+        // Even though two `@type` aliases may both wrap u32, the Nominal
+        // values themselves are distinct (Decision #19's nominal-access
+        // identity rule extended to all top-level type-bearing decls).
+        let foo = Type::Nominal {
+            path: vec!["Foo".to_owned()],
+            args: vec![],
+        };
+        let bar = Type::Nominal {
+            path: vec!["Bar".to_owned()],
+            args: vec![],
+        };
+        assert_ne!(foo, bar);
+    }
+
+    #[test]
+    fn nominal_param_type_carries_through() {
+        // A function whose parameter is a path-position type — when the
+        // body references the param by name, the path-expression's
+        // recorded type should be a `Nominal`. (Slice T4a does no
+        // alias-following, so we don't try to use `c` arithmetically;
+        // we just bind it to a `let _y := c;` whose initializer is the
+        // param-as-path expression.)
+        let src = "\
+            @type Counter = u32;\n\
+            @fn observe(c: Counter) {\n  \
+              let _y := c;\n  \
+              return;\n\
+            }\n\
+        ";
+        let typing = infer_str(src).expect("infer ok");
+        let saw_counter_nominal = types_in(&typing).iter().any(|t| {
+            matches!(t, Type::Nominal { path, args } if path == &["Counter"] && args.is_empty())
+        });
+        assert!(
+            saw_counter_nominal,
+            "expected at least one Type::Nominal with path = [\"Counter\"], got {:?}",
+            types_in(&typing)
+        );
+    }
+
+    #[test]
+    fn nominal_let_annotation_emits_e0512_with_nominal_in_message() {
+        // `let x: MyAlias = 0u32;` reads `MyAlias` as a `Type::Nominal`
+        // in the declared-type position. Slice T4a does no alias
+        // following, so the annotation-vs-initializer check (E0512)
+        // sees `Nominal MyAlias` ≠ `Primitive U32` and reports it. The
+        // diagnostic must mention `MyAlias` so users see *their* name.
+        let src = "\
+            @type MyAlias = u32;\n\
+            @fn f() {\n  \
+              let _x: MyAlias = 0u32;\n  \
+              return;\n\
+            }\n\
+        ";
+        let errors = infer_str(src).expect_err("expected E0512 mismatch");
+        let saw_my_alias = errors.iter().any(|e| {
+            matches!(e, TypeError::LetTypeMismatch { declared, actual, .. }
+                if declared == "MyAlias" && actual == "u32")
+        });
+        assert!(
+            saw_my_alias,
+            "expected a LetTypeMismatch with declared `MyAlias` and actual `u32`; got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn nominal_generic_args_translate_recursively() {
+        // A path-position type like `Box<u32>` translates to a Nominal
+        // with `args = [Primitive(U32)]`. The path/args are recorded
+        // verbatim — slice T4a does no resolution.
+        let src = "\
+            @fn make() -> Box<u32> {\n  \
+              return 0u32;\n\
+            }\n\
+        ";
+        // Same as above — this likely emits a return-type mismatch at
+        // T4a (Nominal `Box<u32>` vs Primitive `u32`) — but the typing
+        // map should still include the Nominal somewhere via the return-
+        // type annotation having been seen at parse time.
+        let _ = infer_str(src);
+        // We can't easily peek the return-type annotation through
+        // `Typing` (it keys off expression spans, not signatures).
+        // Instead exercise the helper directly:
+        let tokens = tokenize(src).expect("tokenize");
+        let program = parse(&tokens).expect("parse");
+        let fn_decl = program.items.iter().find_map(|i| match i {
+            Item::Fn(f) => Some(f),
+            _ => None,
+        });
+        let fn_decl = fn_decl.expect("@fn make exists");
+        let ret_ty_expr = fn_decl.return_type.as_ref().expect("explicit return type");
+        let translated = type_from_type_expr(ret_ty_expr);
+        match translated {
+            Type::Nominal { path, args } => {
+                assert_eq!(path, vec!["Box".to_owned()]);
+                assert_eq!(args.len(), 1);
+                assert!(matches!(args[0], Type::Primitive(PrimitiveType::U32)));
+            }
+            other => panic!("expected Nominal Box<u32>, got {}", other.display()),
+        }
+    }
+
+    #[test]
+    fn nominal_no_args_translate_verbatim() {
+        // `Counter` (no generics) translates to a Nominal with empty args.
+        let src = "@fn f(c: Counter) { return; }";
+        let tokens = tokenize(src).expect("tokenize");
+        let program = parse(&tokens).expect("parse");
+        let fn_decl = program.items.iter().find_map(|i| match i {
+            Item::Fn(f) => Some(f),
+            _ => None,
+        });
+        let param_ty = &fn_decl.expect("@fn f exists").params[0].ty;
+        let translated = type_from_type_expr(param_ty);
+        assert!(matches!(translated, Type::Nominal { path, args }
+            if path == vec!["Counter".to_owned()] && args.is_empty()));
     }
 }
