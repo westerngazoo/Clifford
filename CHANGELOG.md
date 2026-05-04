@@ -7,34 +7,117 @@ may include breaking changes.
 
 ## [Unreleased]
 
-### Spec refinement — Refinement #1a: local-stack mutation in any layer (2026-05-02)
+### Spec — Decisions #22-#25: cleaner pure/imperative boundary (2026-05-03)
 
-Clarifies that the §5.5 / Decision #1 layer-boundary rule does not forbid
-local mutable bindings (`let mut x: T = e; x = e';`) in `@fn` bodies, so
-long as `T` does not contain any reference into mutable shared state
-(Decision #13 Rule 0 prevents that case at the type level).
+A coordinated set of four design decisions sharpening Clifford's pure /
+imperative split. **Decisions #22 and #25 lock now** (designs are
+mechanical); **Decisions #23 and #24 record the direction with ADRs
+forthcoming**.
 
-Without this clarification, the bog-standard local-accumulator pattern
-(`let mut total = 0u32; sigma i in 0..n { total = total + arr[i]; }`)
-would have been illegal in `@fn` bodies, forcing every reduce-shaped
-algorithm into recursion or out of `@fn` entirely.
+- **Decision #22 — Kinds of Imperative.** Extend `$ [TraitList]` markers
+  from `@fn` to `#effect` / `#interrupt` / `#transition` declarations.
+  Predeclared traits classify mutation kind: `Hardware`, `Realtime`,
+  `Acquire` / `Release` / `SeqCst` (memory ordering), `LockingDiscipline`,
+  `PureState`, `Encapsulated`. The orthogonality engine ignores them;
+  codegen / `cliffordc audit` / certification consume them. Locked.
+- **Decision #25 — `#hidden` Encapsulation.** Re-introduce `#hidden` as
+  a per-field modifier on automaton fields, with the algebraic
+  interpretation: a hidden field's basis vector cannot appear in any
+  callable's `actual_writes` outside the owning automaton's surface.
+  Encapsulation is "the bit isn't there for outsiders to refer to" —
+  trivial orthogonality by construction. No engine machinery; ~50 LoC
+  parser + resolver. Locked.
+- **Decision #23 — Tighten `@fn` toward Haskell-clean.** Direction
+  agreed: total by default, effect rows in signatures, refinement types
+  in argument positions, local mutation per Refinement #1a remains
+  permitted (ST-monad-equivalent). DESIGN-IN-PROGRESS — needs an ADR
+  surveying Idris totality, Liquid Haskell refinements, Koka effect rows.
+  Targeted ADR: `docs/adr/0003-haskell-clean-fn-discipline.md`.
+- **Decision #24 — `@snapshot` Boundary Operator.** Direction agreed:
+  introduce `@snapshot Auto.field` as the only way to read mutable
+  automaton state into pure-side analysis. The boundary crossing
+  becomes syntactically visible. DESIGN-IN-PROGRESS — needs an ADR
+  resolving the expression-vs-statement question, copy-by-value vs
+  ref-to-snapshot, interaction with `#shared` (Decision #21), and
+  backward compatibility with the existing snapshot-by-convention
+  pattern in book Ch. 39. Targeted ADR:
+  `docs/adr/0004-snapshot-boundary-operator.md`.
 
-- `docs/CLIFFORD_SPEC.md` §5.4 updated with the refined wording.
-- `docs/DECISIONS.md` adds Refinement #1a (locked 2026-05-02) under
-  Decision #1.
-- No code changes — `clifford-check` slice S2 (which implements §5.4)
-  hasn't shipped yet, so the refined rule lands before any over-restrictive
-  code locks the wrong semantics in.
+The four taken together commit Clifford to the framing the architect
+articulated: pure side becomes Haskell-clean (Decisions #23 + #1a);
+imperative side becomes a legible "dark side" with explicit kinds
+(Decision #22), explicit encapsulation (Decision #25), and an explicit
+boundary-crossing operator (Decision #24).
 
-### Open future-considerations recorded (2026-05-02)
+This PR is pure documentation — `DECISIONS.md` updated with the four
+entries, the matrix table extended, and the date footer rewritten.
+No code changes; no spec amendments yet (those land per-decision as
+ADRs lock and implementation begins).
 
-- **Sigma parallel decomposition** (`sigma … parallel { … }`): SIMD or
-  task-parallel iteration. Recorded in `DECISIONS.md` open-list as a
-  candidate for future minor decision *if and when* a real use case
-  surfaces. The `parallel` keyword is reserved by being kept out of the
-  user identifier namespace; no implementation work happens until a
-  decision locks it. Library combinators (sum, fold, etc.) clarified as
-  stdlib code, not language extensions.
+### Spec — §7.0.1 Safety Pillars + book Ch. 39 SPSC ring buffer (2026-05-03)
+
+Pins the v0.1 GA orthogonality engine's contract — what's guaranteed,
+what's deliberately not — and grounds it in the canonical embedded
+worked example.
+
+**Spec:**
+
+- New `docs/CLIFFORD_SPEC.md` §7.0.1 "Safety Pillars" subsection.
+  Two normative statements about what the v0.1 engine guarantees
+  (procedural mutation safety; parallel verification by exhaustive
+  pairwise check) and three explicit limits (narrow-unsafe writes
+  outside the proof boundary, read-write races deferred to v0.2,
+  `@sequential` user-asserted-not-verified). Sets the precise boundary
+  of v0.1 safety so users designing systems know what they can and
+  cannot rely on.
+
+**Book:**
+
+- `book/src/part5/39-firmware.md` — first real Part-V chapter.
+  Producer/consumer SPSC ring-buffer worked example end-to-end. Two
+  versions: the naive design (with a `count` field both sides update,
+  which the engine rejects with E0520 on `count`) and the lock-free
+  SPSC (no `count`, derived from head/tail, which the engine accepts).
+  Each version traced through every compiler phase showing what the
+  engine sees. Closes with explicit cross-references to §7.0.1's two
+  pillars and the read-write deferral. ~5,000 words.
+
+Both items are pure documentation — no code touched. PRs against the
+ortho engine and the effect crate land in their own branches.
+
+### Added — Phase 2 effect slice E1: §6.1 category construction (2026-05-02)
+
+First piece of the GA-engine bridge. After this slice, the compiler
+produces a per-automaton categorical structure (the `C_A` of Appendix B)
+that downstream phases (`crates/ortho`, `crates/codegen`) consume.
+
+- `clifford-effect`: public entry point `extract_categories(&Program)
+  -> Result<Categories, Vec<EffectError>>`. Walks every `#automaton` and
+  produces an `AutomatonCategory` per declaration.
+- New types: `Categories` (the artifact), `AutomatonCategory` (per-automaton
+  state set + transitions + initial state), `StateInfo`, `TransitionInfo`,
+  `EffectError` (reserves E04xx and E06xx ranges per the spec).
+- For monoid automata (no `#states` clause per Decision #5 Rule 4), gets a
+  synthetic `[Ready]` state automatically.
+- For multi-state automata, validates every `#transition T -> Target`'s
+  `Target` is in the declared `#states` (`E0430 UnknownState`). Monoid
+  automata reject any transition with an explicit destination
+  (`E0431 MonoidTransitionWithDestination`).
+- Detects duplicate state names (`E0433`) and duplicate transition names
+  (`E0432`) within the same automaton; first-wins for the table.
+- Errors accumulate (not fail-fast); a single pass surfaces every
+  validation failure.
+- 13 unit tests + 1 doctest covering: empty programs, monoid automata
+  (with and without destinationless transitions), monoid + destination
+  rejection, multi-state state recording, valid destinations, unknown
+  destination rejection, duplicate-transition rejection, multi-error
+  collection, multi-automaton extraction, item_index correctness, and
+  a realistic 3-state Counter automaton.
+- What's deferred to slice E2+: §6.2 mutation profile extraction
+  (per-effect `actual_writes` set, transitive through `#> proc()` calls),
+  §6.3 proc-call resolution and CallContext propagation, §6.4 state-tag
+  update points, §6.5 invariant verification, §6.6 atomic-annotation
+  lowering hints, and the Refinement #5e interrupt-overlap set.
 
 ### Added — Phase 1 check slice 1: §5.5 sigil-layer boundary checking (2026-05-01)
 

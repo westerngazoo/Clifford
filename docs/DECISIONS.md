@@ -1,7 +1,7 @@
 # Clifford Language: Critical Design Decisions
 
-**Status:** Decisions #1–#20 locked (with #12 and #18 designed but deferred to v0.2). Phase 0 scaffolding underway.
-**Dates:** #1–#4 locked April 29, 2026; #5 (incl. Refinements #5a–e) locked April 30, 2026; #6–#20 locked April 30, 2026; Refinements #14a, #19a, #19b locked April 30, 2026.
+**Status:** Decisions #1–#22 + #25 locked (with #12 and #18 designed but deferred to v0.2; #21 design locked, v0.7 implementation; #22 + #25 design locked, v0.2 implementation). Decisions #23 and #24 DESIGN-IN-PROGRESS pending ADRs. Refinement #1a locked. Phase 1 implementation underway.
+**Dates:** see footer below for the full chronological log.
 **Owner:** Goose (Gustavo Delgadillo)
 **Positioning:** General-purpose systems language; embedded firmware is the canonical first target but not the only target. Decisions are language-level and apply across domains.
 
@@ -1174,6 +1174,204 @@ The ADR's "Doors we keep open" section enumerates the things that would foreclos
 
 ---
 
+## Decision #22: Kinds of Imperative — `$ [TraitList]` on Effects ✓ LOCKED
+
+**Date locked:** 2026-05-03
+**Spec impact:** §2.5 (effect grammar — extend with optional trait-list), §4.5 (predeclared effect-kind traits), §7 (informational — engine ignores these traits but downstream phases consume them).
+
+### Summary
+
+Extend `$ [TraitList]` markers from `@fn` (Decision #2) to `#effect`, `#interrupt`, and `#transition` declarations. The traits describe *what kind of imperative the body is*, not *whether it's pure* — a flat-hierarchy classification of mutation kinds:
+
+```clifford
+#effect read_uart()      #mutates: [Uart]    $ [Hardware, Acquire] { … }
+#effect tick_counter()   #mutates: [Counter] $ [PureState]         { … }
+#effect schedule_next()  #mutates: [RunQ]    $ [LockingDiscipline, Realtime(100us)] { … }
+```
+
+The orthogonality engine *does not* read these traits — they don't affect the wedge-product check. Downstream phases (codegen ordering choices, `cliffordc audit`, certification reports, optimization passes) read them. They make the imperative side legible: a reviewer can tell from a signature whether `read_uart()` requires acquire-fence semantics, whether it touches MMIO, whether it's bounded by a real-time deadline.
+
+### Predeclared effect-kind traits (initial set)
+
+In `clifford::core` (or wherever the stdlib settles):
+
+| Trait | Meaning |
+|---|---|
+| `PureState` | Mutates only ordinary automaton fields; no MMIO, no fences, no real-time concerns |
+| `Hardware` | Touches at least one register-block automaton (`#address`-tagged) |
+| `Realtime(deadline)` | Hard real-time deadline on completion (deadline = duration literal); refinement-typed |
+| `LockingDiscipline` | Acquires/releases locks per Decision #21 §5.5 |
+| `Acquire` | Implies acquire-fence semantics on entry (memory ordering) |
+| `Release` | Implies release-fence semantics on exit |
+| `SeqCst` | Implies sequentially-consistent fencing on every memory op |
+| `Relaxed` | No fences (default; explicit only when documenting intent) |
+| `Encapsulated` | Mutates only `#hidden`-marked fields per Decision #25 (effectively no externally-visible side effect on shared state) |
+
+User-declared traits via `@trait Name { … }` (Decision #2 hybrid scheme) work for `#effect` the same way they work for `@fn` — structural satisfaction, no explicit `impl` required.
+
+### Why locked, not ADR-required
+
+The design is mechanically straightforward: extend the parser's `#effect` grammar to accept the same `$ [...]` clause it already parses for `@fn`; extend the AST `EffectDecl` with a `trait_list: Vec<TraitRef>` field; downstream consumers add reads as needed. Implementation cost: ~50 LoC in the parser/AST. No engine impact — the orthogonality check ignores effect traits. No backward incompatibility.
+
+### What this enables
+
+- Codegen can choose memory-ordering instruction selection per effect (`Acquire` → `lda` on ARM, etc.) without users handwriting `#asm`.
+- `cliffordc audit` can list every `Hardware`-tagged effect for hardware-driver review.
+- Certification (DO-178C, IEC 61508) gets a structured per-effect kind classification at the source level.
+- Optimization passes can move/reorder effects with confidence (a `PureState` effect can be re-ordered with respect to a `Hardware` effect; two `Hardware` effects cannot).
+
+### Implementation status
+
+Spec edit + parser + AST extension lands in a follow-up Phase-1 work item; no rush. The traits themselves can be predeclared in `clifford::core` once stdlib bootstrap begins.
+
+---
+
+## Decision #23: Tighten `@fn` Toward Haskell-Clean Discipline 🔬 DESIGN-IN-PROGRESS
+
+**Date proposed:** 2026-05-03
+**Status:** Direction agreed; ADR pending.
+**Tracking ADR:** `docs/adr/0003-haskell-clean-fn-discipline.md` (forthcoming).
+
+### Summary
+
+The pure side of Clifford should commit fully to its math. The current `@fn` excludes `#`-constructs (good) but doesn't enforce totality, refinement-typed effect rows, or termination — properties that distinguish "syntactically pure" from "semantically pure" in the Haskell / Idris / Koka tradition.
+
+Direction agreed:
+
+1. **Total by default.** Every `@fn` must terminate. Proven via structural recursion + sigma-loop bounds. Opt-out via `$ [Partial]` for the rare case where termination cannot be proven.
+2. **Effect rows in signatures.** `$ [Pure]` is the strict default; observation of any external state requires explicit row markers (`$ [Reads<Auto>]`, `$ [Observable]`, etc.). Subsumes Decision #2's TraitList for the strict-effect-tracking case.
+3. **Refinement types in argument positions.** Beyond Decision #14's sigma bounds: arbitrary refinement predicates on parameter types, checked at call sites. Liquid-Haskell-style.
+4. **Local mutation per Refinement #1a remains permitted.** ST-monad-equivalent — invisible to callers, doesn't break purity.
+
+### Why ADR-required
+
+This is not mechanically simple. Totality checking is a real type-system feature (cf. Idris's totality checker, Coq's guard predicate). Effect rows are a research area. Refinement types beyond sigma bounds need an SMT solver or a constructive substitute. Each sub-component is a research-grade engineering effort.
+
+The ADR will:
+
+- Survey the literature (Idris totality; Liquid Haskell refinements; Koka effect rows; Eff handlers).
+- Choose between full HM-with-effect-rows vs structural row polymorphism.
+- Decide whether refinement types ride on top of an SMT call (F* style) or stay decidable-by-structural-induction.
+- Identify which subset is in scope for v0.2 vs deferred to v0.3+.
+
+### Why locked the direction now
+
+The user has committed to "the pure side becomes Haskell-clean." Without recording the direction, future ad-hoc `@fn` extensions risk drifting away from the goal. ADR #0003 nails down the specifics; this entry locks the *intent*.
+
+### Implementation status
+
+ADR drafting → spec amendments → implementation, in that order. v0.2-or-later target.
+
+---
+
+## Decision #24: Explicit Boundary-Crossing via `@snapshot` 🔬 DESIGN-IN-PROGRESS
+
+**Date proposed:** 2026-05-03
+**Status:** Direction agreed; ADR pending.
+**Tracking ADR:** `docs/adr/0004-snapshot-boundary-operator.md` (forthcoming).
+
+### Summary
+
+Crossing the `#`/`@` boundary inward — bringing a value from the imperative side into pure analysis — currently has no syntactic marker. Users learn the snapshot pattern by convention (book Ch. 39): an `#effect` reads automaton fields into stack-local owned values, then passes those owned values to `@fn` for analysis.
+
+Direction agreed: introduce `@snapshot Auto.field` (or equivalent surface) as the *only* way to read mutable automaton state into pure-side analysis. After the snapshot, the read value is an owned, immutable copy that lives entirely on the pure side.
+
+```clifford
+#effect bumper() #mutates: [Counter] {
+  let snap: u32 = @snapshot Counter.value;     // explicit boundary crossing
+  let next: u32 = double(snap);                // pure analysis — no automaton reach
+  Counter.value = next;
+}
+```
+
+The `@snapshot` operator:
+
+- Is an expression yielding an owned value (no `&` to automaton state).
+- Can only appear inside `#`-layer bodies (you can't snapshot from `@fn` — that would be reading automaton state, which §5.5 forbids).
+- Renders the boundary crossing visible in source — reviewer/IDE/`cliffordc audit` can highlight every snapshot point.
+- Provides a hook for §7 read-tracking when v0.2's read-write race detection lands (the snapshot is the read; the engine sees it).
+
+### Why ADR-required
+
+Subtleties to nail down:
+
+- Is `@snapshot` an expression, a statement, or a type-level annotation?
+- Does it copy by value (`u32` cleanly; `[u8; 64]` more expensive)?
+- Does it work for refs to slices?
+- What's the interaction with `#shared` fields (Decision #21) — does snapshotting a shared field require holding the lock at snapshot time?
+- Does it desugar to a function call (so `cliffordc audit` can grep for it) or does it need first-class AST representation?
+- Backward-compatibility with the existing snapshot-by-convention pattern in book Ch. 39: do existing programs need to be rewritten, or does the convention become syntactic sugar for `@snapshot`?
+
+### Why locked the direction now
+
+Same reasoning as #23: the user committed to "boundary crossings should be visible." ADR #0004 specifies the surface; this entry locks the intent.
+
+### Implementation status
+
+ADR drafting → parser support → spec amendments → tooling integration. v0.2 target.
+
+---
+
+## Decision #25: `#hidden` Encapsulation — Algebraic Trivial Orthogonality ✓ LOCKED
+
+**Date locked:** 2026-05-03
+**Spec impact:** §2.5 / §3.7 (automaton-field grammar — extend with optional `#hidden` modifier), §7 (informational — `#hidden` fields trivially orthogonal to anything outside their owning automaton).
+
+### Summary
+
+Re-introduce `#hidden` as a per-field modifier on automaton fields, with a precise algebraic interpretation. Decision #9 dropped the original `#hidden` / `#visible` system because it was subsumed by `#mutates` / `#cannot_mutate`. The reintroduced `#hidden` is *narrower* and *algebraically motivated*:
+
+```clifford
+#automaton Counter {
+  value: u32;                  // ordinary field; visible to anything mutating Counter
+  scratch: u32 #hidden;        // private to Counter's transitions/effects; invisible elsewhere
+  cache:   [u8; 32] #hidden;   // same
+}
+```
+
+A `#hidden` field has the property that its basis vector **cannot appear in any callable's `actual_writes` set unless the callable belongs to the owning automaton's transitions or to an effect declared `#mutates: [Counter]` AND specifically marked as having access to hidden state.**
+
+### The algebraic insight (per the user's framing)
+
+A `#hidden` field's basis vector is *automatically orthogonal to everything outside the owning automaton's surface.* The wedge product never collapses against it from outside, because the bit never appears outside. This is the trivial-orthogonality case of the §7.4 check — no special machinery needed in the engine; the field simply doesn't enter the basis assignment for callables that don't have access.
+
+Practically:
+
+- For callables in the owning automaton (its `#transition`s) — `#hidden` fields appear in their `actual_writes` and are checked normally.
+- For callables outside the owning automaton (other automatons' transitions, effects in `#mutates: [OtherAuto]`) — `#hidden` fields *cannot* be referenced, so they cannot appear in `actual_writes`, so they cannot conflict.
+
+This is encapsulation by construction. No visibility check pass; no special algebra; just "the bit isn't there for outsiders to even refer to."
+
+### Surface syntax
+
+`#hidden` is a per-field modifier alongside `#offset` / `#access`. Order-independent, optional:
+
+```clifford
+#automaton Counter {
+  value:   u32;                          // ordinary
+  scratch: u32 #hidden;                   // hidden
+  status:  u32 #hidden #offset: 0x04 #access: read;  // hidden register-block field
+}
+```
+
+The parser admits the modifier in any field-meta position. `clifford-resolve` (slice R3 `require_field` check) is extended: when checking `Auto.field` references from outside the owning automaton, hidden fields produce `E0407 HiddenFieldNotAccessible` instead of resolving.
+
+### Why this is locked, not ADR-required
+
+The algebraic justification is the entire design. Encapsulation is "the bit doesn't appear" — there's no engine machinery to design, no spec-extension theorem to write. Implementation cost: ~30 LoC in the parser (one new field-meta token) + ~20 LoC in `clifford-resolve` (visibility check in `require_field`). Spec amendment: one paragraph in §3.7.
+
+### What this enables
+
+- Implementation hiding for register-block automata (e.g. UART driver's internal `#hidden` parity-error counter that no other code should see).
+- Caches and scratch buffers per automaton without polluting the global mutation analysis.
+- Cleaner `cliffordc audit` reports — hidden fields don't appear in cross-automaton dependency graphs.
+
+### Implementation status
+
+Spec amendment + parser/resolve extension lands in a follow-up Phase-1 work item; mechanically simple.
+
+---
+
 ## Decision Matrix
 
 | # | Aspect | Question | Chosen | Impact |
@@ -1199,6 +1397,10 @@ The ADR's "Doors we keep open" section enumerates the things that would foreclos
 | #19 | Pointer types | Raw `*const T`/`*mut T` vs Nominal `access<T>` | **Nominal `access<T>` / `access const<T>`** | Type-distinct pointers; peripheral confusion caught at compile time; cross-type casts grep-able via `#unchecked_cast` |
 | #20 | Bitfield access | `#mutate Reg { f = (self.f & ~M) \| (v << S) }` vs First-class `Reg.f.bit = v` | **First-class `#bits` annotation with target-atomic RMW** | Eliminates bit-twiddling boilerplate; atomic RMW where a concurrent writer exists, plain RMW otherwise; subfield-level GA basis vectors |
 | #21 | Shared state | Audit-block escape vs Mixed-metric Cl(p,0,n) algebra with priority-as-scalar lock multivectors and rotor tiebreaks | **Mixed-metric Cl(p,0,n) + §5.5 rotor formulation** | Kernels (Wari, seL4-shape) become typecheckable; lock-ordering safety, deadlock-freedom, and interrupt/lock unification all fall out of the algebra; design locked v0.7, scaffolding lands now |
+| #22 | Imperative kinds | Flat `#effect` everywhere vs effect-traits classifying mutation kind | **`$ [TraitList]` on effects** (Hardware, Realtime, Acquire, Release, SeqCst, LockingDiscipline, PureState, Encapsulated) | Imperative side becomes legible without engine impact; codegen / audit / certification consume the traits |
+| #23 | Functional discipline | Status quo `@fn` (excludes `#`-constructs) vs Haskell-clean (total + effect rows + refinement types) | **Haskell-clean direction locked; ADR pending** | Pure side commits fully to its math; brings Idris/Liquid-Haskell/Koka properties to the systems-language tier |
+| #24 | Boundary crossing | Convention-based snapshot pattern vs `@snapshot Auto.field` operator | **Explicit `@snapshot` operator; ADR pending** | Reading mutable state into pure analysis becomes a visible, named act; supports future read-tracking |
+| #25 | Encapsulation | Re-add `#hidden` per-field modifier with algebraic-trivial-orthogonality interpretation | **`#hidden` on automaton fields** | Implementation hiding by construction; field never appears in outside callables' basis sets, so wedge never collapses against it from outside |
 
 ---
 
@@ -1303,5 +1505,12 @@ All sixteen decisions and six emergent rules are locked (with #12 designed but d
 ---
 
 **Approved by:** Goose
-**Dates:** Decisions #1–#4 approved April 29, 2026; Decisions #5–#16 (incl. Refinements #5a–d) approved April 30, 2026; Decisions #17–#20 approved April 30, 2026; Decision #21 approved May 1, 2026 (locked design direction; v0.7 implementation).
+**Dates:**
+- Decisions #1–#4 approved April 29, 2026.
+- Decisions #5–#16 (incl. Refinements #5a–d) approved April 30, 2026.
+- Decisions #17–#20 approved April 30, 2026.
+- Decision #21 approved May 1, 2026 (locked design direction; v0.7 implementation).
+- Refinement #1a approved May 2, 2026.
+- Decisions #22 and #25 approved May 3, 2026 (locked design; v0.2 implementation).
+- Decisions #23 and #24 approved May 3, 2026 (DESIGN-IN-PROGRESS — ADRs `docs/adr/0003-haskell-clean-fn-discipline.md` and `docs/adr/0004-snapshot-boundary-operator.md` pending).
 **Next Step:** Propagate Decisions #6–#16 through `CLIFFORD_SPEC.md` (§1, §2, §4, §5, §6, §7, §8, §10, §12, §13, new §5.7/§5.8 sub-sections, new error code blocks). After that, Cargo workspace and Phase 1 implementation.

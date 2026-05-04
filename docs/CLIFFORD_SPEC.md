@@ -1020,6 +1020,26 @@ The mixed-metric algebra is sketched in §7.9 below. v0.1–v0.6 implementations
 
 **Implications for v0.1–v0.6 implementations.** No semantic change. `crates/ortho` operates on the restricted algebra. The `crates/ast` `AutomatonField::kind` field is always `FieldKind::Private`. Diagnostics, conformance tests, and downstream phases all behave as if Decision #21 did not exist — except that the reserved tokens above produce the early-rejection diagnostic.
 
+### 7.0.1 Safety Pillars **[NORMATIVE]**
+
+Two precise statements about what the v0.1 GA orthogonality engine guarantees, and an explicit list of what it does *not*. Users designing systems in Clifford should keep both lists in mind: the *guarantees* are what they can rely on; the *limits* are what they remain responsible for.
+
+**The engine guarantees:**
+
+1. **Procedural mutation safety.** Two callables that the engine considers concurrent (per §7.3) cannot both perform `#mutate` / `Auto.field <op>= …` / `#> proc()`-routed writes to the same automaton field. The Cl(0,0,n) wedge-product check is the constructive proof per §7.4. This holds *transitively*: writes propagated through proc-call chains (per §6.2's `actual_writes` closure) participate in the check on equal footing with direct writes.
+
+2. **Parallel verification by exhaustive pairwise check.** The §7.4 check is performed for every pair in the §7.3 concurrency matrix. A program that compiles cannot exhibit a write-write race through the structured mutation surface. There is no opt-out; there is no "safety-mode" toggle that disables the check.
+
+**The engine deliberately does not guarantee:**
+
+1. **Safety of mutations through narrow unsafe primitives** (`#unchecked_store`, `#volatile_store`, `#asm`). These are audit-loggable per Decision #17 and intentionally outside the proof boundary. `cliffordc audit --list-unsafe` enumerates every such call site for review; their correctness is the user's responsibility, not the engine's.
+
+2. **Read-write race-freedom at field granularity.** v0.1 catches *write-write* races; one callable writing while another reads is permitted (and frequently expected, per the SPSC ring-buffer pattern documented in book Ch. 39). The graded read/write algebra extension that catches read-write races is reserved for v0.2 (see the §7.2 closing note for the cost / benefit analysis).
+
+3. **Concurrency between automata excluded by `@sequential(A, B)`** (Decision #11). The user's assertion that A and B never run concurrently is *trusted*; the compiler does not verify it. Misuse of `@sequential` (declaring two automata sequential when in practice they may concur) is a user-introduced soundness bug — outside the engine's proof boundary by design, with the trade-off that legitimate sequential-execution programs become checkable.
+
+These pillars carve the precise boundary of v0.1 safety. Subsequent versions tighten the boundary in the directions noted; the pillars themselves do not change.
+
 ### 7.1 Basis Vector Assignment
 
 The compiler builds two disjoint basis spaces and concatenates them into a single Geometric Algebra `G(n, 0, 0)` over Euclidean signature.
