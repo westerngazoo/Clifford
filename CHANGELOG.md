@@ -7,97 +7,36 @@ may include breaking changes.
 
 ## [Unreleased]
 
-### Added — Phase 3 ortho slice O1: GA orthogonality engine, Cl(0,0,n) bitmask check (2026-05-02)
+### Spec — §7.0.1 Safety Pillars + book Ch. 39 SPSC ring buffer (2026-05-03)
 
-**The headline slice.** After this lands, Clifford does the thing it
-claims to do: compile-time race detection via geometric algebra.
+Pins the v0.1 GA orthogonality engine's contract — what's guaranteed,
+what's deliberately not — and grounds it in the canonical embedded
+worked example.
 
-- `clifford-ortho`: full v0.1 pipeline. Public entry
-  `check_orthogonality(&Program, &MutationProfiles) -> Result<OrthoReport, OrthoError>`.
-- New types:
-  - `BasisAssignment` — bidirectional `(automaton, field) ↔ bit-position`
-    map; deterministic ordering (sorted by automaton then field) per
-    CLAUDE.md §3.5 reproducibility requirement.
-  - `Blade { bits: u64 }` — the bitmask wedge of basis vectors. `grade()`
-    returns the population count.
-  - `CallableBehavior { blade }` — per-callable behavior multivector
-    (§7.2). One blade per callable, the wedge of all `(automaton, field)`
-    pairs the callable writes transitively.
-  - `ConcurrencyMatrix` — pairs of callables that can_concur per §7.3's
-    sound-conservative heuristic.
-  - `OrthoReport` — the artifact: basis + behaviors + concurrency
-    matrix + errors. Returned even on success so downstream consumers
-    can inspect the engine's internal state.
-- New errors:
-  - `E0520 OrthogonalityViolation` — two concurrent callables write a
-    shared field. Diagnostic names both callables AND the shared
-    `(automaton, field)` pairs by source identifier per Emergent Rule 1
-    (never raw `e_n` indices).
-  - `E0530 TooManyBasisVectors` — program exceeds the 64-field
-    `MAX_BASIS_VECTORS_V1` cap (will lift via wide-blade `Vec<u64>` in v0.2).
-- §7.4 algorithm: per-pair `outer_product(blade_a, blade_b)`; `None`
-  (collapse to zero) → race detected.
-- §7.3 concurrency inference: every pair of `#effect`s, `#interrupt`s,
-  and effect-interrupt combinations is treated as concurrent unless
-  excluded by `@sequential(A, B)`. Strict v0.1 rule: a pair is excluded
-  only when each side touches *exactly one* of {A, B} and they touch
-  different sides — preventing `@sequential` from masking races through
-  third automata.
-- §7.5 diagnostic: shared fields decoded back to source `(automaton.field)`
-  notation; pre-formatted display string ready for renderer.
-- 18 unit tests + 2 doctests covering: outer_product invariant; empty
-  program; single effect (no concurrency); two effects on same field
-  (E0520, both pairing orderings checked); two effects on disjoint
-  fields (clean); effects on different automata (clean); interrupt vs
-  effect race (E0520); transitive write through proc-call caught (the
-  thing E2 enables); `@sequential` exclusion of clean pairs;
-  `@sequential` does NOT mask cross-touching races (the disambiguator);
-  multiple races collected (3-effect, 3-pair); realistic clean program
-  (sample/actuate/log on 3 disjoint automata); basis assignment
-  determinism across runs; basis assignment sorted order; behavior
-  blade grade equals field count; capacity check.
-- **Total clifford-ortho: 18 unit + 2 doctest passed.**
+**Spec:**
 
-### Added — Phase 2 effect slice E2: §6.2 mutation profile extraction (2026-05-02)
+- New `docs/CLIFFORD_SPEC.md` §7.0.1 "Safety Pillars" subsection.
+  Two normative statements about what the v0.1 engine guarantees
+  (procedural mutation safety; parallel verification by exhaustive
+  pairwise check) and three explicit limits (narrow-unsafe writes
+  outside the proof boundary, read-write races deferred to v0.2,
+  `@sequential` user-asserted-not-verified). Sets the precise boundary
+  of v0.1 safety so users designing systems know what they can and
+  cannot rely on.
 
-The bridge piece the GA orthogonality engine actually consumes. After
-this slice, every `#effect` / `#interrupt` / `#transition` carries a
-fully-resolved `(automaton, field)` write set — direct + transitive
-through `#> proc()` calls per Decision #3.
+**Book:**
 
-- `clifford-effect`: public entry point `extract_mutation_profiles(&Program, &Resolution)
-  -> Result<MutationProfiles, Vec<EffectError>>`. Walks every callable,
-  collects direct writes, then computes the transitive closure through
-  proc-calls via fixed-point iteration.
-- New types: `CallableId` (`Effect(name)` / `Interrupt(name)` /
-  `Transition { automaton, name }`), `FieldRef { automaton, field }`,
-  `MutationProfile { actual_writes, actual_automata }`, `MutationProfiles`
-  (the artifact, indexed by `CallableId`).
-- Direct writes collected from `#mutate Auto { field = expr }` (canonical
-  form) and `Auto.field <op>= expr` (Decision #15 sugar).
-- Transitive writes propagated through `#> proc()` calls using the
-  resolver's `BindingRef::Proc { ctx, ... }`. `CallContext::Identity`
-  resolves to `CallableId::Effect`; `CallContext::Transition` resolves
-  via a per-name index of all transitions across all automata.
-- Cycles in the proc-call graph (mutual recursion) are handled
-  defensively: the worklist algorithm reaches a fixed point because the
-  union over a finite field-set is monotonic and bounded. Explicit
-  E0422 cycle rejection is deferred to slice E3.
-- New errors: `E0410 EffectMutatesUndeclaredAutomaton` (effect/interrupt
-  writes an automaton not in its `#mutates` clause; transitive),
-  `E0411 EffectMutatesExcludedAutomaton` (writes an automaton in its
-  `#cannot_mutate` clause).
-- Transition mutation profiles are computed but not validated — transitions
-  implicitly mutate their enclosing automaton; the cross-automaton
-  transition-write check (a different rule than effect/interrupt) lives
-  in a future slice.
-- 16 new tests + every E1 test still green: empty programs, MutateShort
-  collection, canonical Mutate collection, interrupt mutation,
-  transition mutation, proc-call to effect propagation, proc-call to
-  transition propagation, deep proc-call chain (a → b → c), undeclared
-  automaton (direct + transitive), excluded automaton, multi-automaton
-  effect, mutual recursion termination, realistic 3-callable program
-  with full transitive analysis. **Total clifford-effect: 29 unit + 1 doctest.**
+- `book/src/part5/39-firmware.md` — first real Part-V chapter.
+  Producer/consumer SPSC ring-buffer worked example end-to-end. Two
+  versions: the naive design (with a `count` field both sides update,
+  which the engine rejects with E0520 on `count`) and the lock-free
+  SPSC (no `count`, derived from head/tail, which the engine accepts).
+  Each version traced through every compiler phase showing what the
+  engine sees. Closes with explicit cross-references to §7.0.1's two
+  pillars and the read-write deferral. ~5,000 words.
+
+Both items are pure documentation — no code touched. PRs against the
+ortho engine and the effect crate land in their own branches.
 
 ### Added — Phase 2 effect slice E1: §6.1 category construction (2026-05-02)
 
