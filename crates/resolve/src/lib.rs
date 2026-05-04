@@ -144,6 +144,29 @@ pub enum ResolveError {
         /// Byte offset of the reference.
         at: usize,
     },
+
+    /// A reference outside the owning automaton's `#transition`s tried to
+    /// access a `#hidden` field (Decision #25). The field exists on the
+    /// automaton but is encapsulated: only the automaton's own
+    /// transitions may name it. From everywhere else (other automata's
+    /// transitions, `#effect` / `#interrupt` bodies whose `#mutates` lists
+    /// this automaton, `@fn` bodies) the field is invisible — its basis
+    /// vector cannot enter outside callables' `actual_writes`, which is
+    /// the *algebraic-trivial-orthogonality* property §3.7 promises.
+    ///
+    /// The diagnostic carries the owning automaton's name, the field name
+    /// (so the user sees their identifier), and the reference's byte
+    /// offset. Distinct from `UnknownField` (E0405): the field is real,
+    /// just not visible from here.
+    #[error("E0407: `{automaton}.{field}` is `#hidden`; only `{automaton}`'s own `#transition`s may access it (referenced at byte {at})")]
+    HiddenFieldNotAccessible {
+        /// Owning automaton name.
+        automaton: String,
+        /// Field name (the one marked `#hidden`).
+        field: String,
+        /// Byte offset of the reference.
+        at: usize,
+    },
 }
 
 /// Which kind of top-level item a [`Symbol`] refers to.
@@ -550,10 +573,16 @@ pub fn resolve(program: &Program) -> Result<Resolution, Vec<ResolveError>> {
 }
 
 /// Side tables for each `#automaton` declaration: the set of declared field
-/// names and the set of declared transition names. Lookups are O(1).
+/// names, the subset marked `#hidden` (Decision #25), and the set of
+/// declared transition names. Lookups are O(1).
 struct AutomatonMeta {
     /// Map: automaton name → set of field names.
     fields: HashMap<String, HashSet<String>>,
+    /// Map: automaton name → set of `#hidden`-marked field names per
+    /// Decision #25. Always a subset of `fields[name]`. Lookup answers
+    /// "is `Auto.field` hidden?" in O(1) for the visibility check in
+    /// [`Walker::require_field`].
+    hidden_fields: HashMap<String, HashSet<String>>,
     /// Map: automaton name → map of transition name → transition source span.
     /// The span lets `BindingRef::Proc` point back at the transition's
     /// declaration site.
@@ -562,20 +591,32 @@ struct AutomatonMeta {
 
 fn build_automaton_meta(program: &Program) -> AutomatonMeta {
     let mut fields: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut hidden_fields: HashMap<String, HashSet<String>> = HashMap::new();
     let mut transitions: HashMap<String, HashMap<String, Span>> = HashMap::new();
     for item in &program.items {
         if let Item::Automaton(decl) = item {
             let f: HashSet<String> = decl.fields.iter().map(|f| f.name.clone()).collect();
+            let h: HashSet<String> = decl
+                .fields
+                .iter()
+                .filter(|f| f.hidden)
+                .map(|f| f.name.clone())
+                .collect();
             let t: HashMap<String, Span> = decl
                 .transitions
                 .iter()
                 .map(|t| (t.name.clone(), t.span))
                 .collect();
             fields.insert(decl.name.clone(), f);
+            hidden_fields.insert(decl.name.clone(), h);
             transitions.insert(decl.name.clone(), t);
         }
     }
-    AutomatonMeta { fields, transitions }
+    AutomatonMeta {
+        fields,
+        hidden_fields,
+        transitions,
+    }
 }
 
 /// Internal walker state carried through one resolution pass.
@@ -713,24 +754,66 @@ impl<'a> Walker<'a> {
         self.bindings.insert(at, resolved);
     }
 
-    /// Validate that `field` exists on the automaton named `automaton`.
-    /// Records nothing on success (the surrounding mutation statement
-    /// already records the automaton resolution); pushes
-    /// [`ResolveError::UnknownField`] if the field is absent.
+    /// Validate that `field` exists on the automaton named `automaton`,
+    /// and is *visible* from the current enclosing context per Decision #25.
+    ///
+    /// Records nothing on success; pushes one of:
+    ///
+    /// - [`ResolveError::UnknownField`] (E0405) — the field doesn't exist
+    ///   on the automaton at all.
+    /// - [`ResolveError::HiddenFieldNotAccessible`] (E0407) — the field
+    ///   exists but is `#hidden`, and the current callable is not a
+    ///   `#transition` of the *same* automaton. Per Decision #25's
+    ///   algebraic-trivial-orthogonality reading, the hidden field's
+    ///   basis vector cannot enter the `actual_writes` of any callable
+    ///   outside the owning automaton's surface, so the engine's wedge
+    ///   product never collapses against it from outside.
     ///
     /// If `automaton` doesn't even resolve to an `#automaton` symbol, this
     /// helper is a no-op — the upstream `require_automaton` call will have
     /// already pushed [`ResolveError::NotAnAutomaton`], and emitting
     /// E0405 on top would be redundant noise.
+    ///
+    /// Hidden-field visibility rule (Decision #25 §"Surface syntax"):
+    ///
+    /// - Inside a `#transition` of automaton `A` (`enclosing.transition_of
+    ///   == Some(A)`), every field of `A` (hidden or not) is accessible.
+    /// - Everywhere else (`@fn` bodies, `#effect` / `#interrupt` bodies
+    ///   even when they declare `#mutates: [A]`, transitions of a
+    ///   *different* automaton), `#hidden` fields of `A` are inaccessible.
     fn require_field(&mut self, automaton: &str, field: &str, at: Span) {
-        if let Some(field_set) = self.automaton_meta.fields.get(automaton) {
-            if !field_set.contains(field) {
-                self.errors.push(ResolveError::UnknownField {
-                    automaton: automaton.to_owned(),
-                    field: field.to_owned(),
-                    at: at.start,
-                });
-            }
+        let Some(field_set) = self.automaton_meta.fields.get(automaton) else {
+            return;
+        };
+        if !field_set.contains(field) {
+            self.errors.push(ResolveError::UnknownField {
+                automaton: automaton.to_owned(),
+                field: field.to_owned(),
+                at: at.start,
+            });
+            return;
+        }
+        // The field exists. Now check Decision #25 visibility.
+        let is_hidden = self
+            .automaton_meta
+            .hidden_fields
+            .get(automaton)
+            .is_some_and(|hs| hs.contains(field));
+        if !is_hidden {
+            return;
+        }
+        // Hidden field — only accessible from a transition of the same automaton.
+        let inside_owning_transition = self
+            .enclosing
+            .as_ref()
+            .and_then(|e| e.transition_of.as_deref())
+            .is_some_and(|t| t == automaton);
+        if !inside_owning_transition {
+            self.errors.push(ResolveError::HiddenFieldNotAccessible {
+                automaton: automaton.to_owned(),
+                field: field.to_owned(),
+                at: at.start,
+            });
         }
     }
 
@@ -798,8 +881,7 @@ impl<'a> Walker<'a> {
     fn require_automaton(&mut self, name: &str, at: Span) {
         match self.symbols.lookup(name) {
             Some(sym) if matches!(sym.kind, SymbolKind::Automaton) => {
-                self.bindings
-                    .insert(at, BindingRef::TopLevel(sym.clone()));
+                self.bindings.insert(at, BindingRef::TopLevel(sym.clone()));
             }
             Some(sym) => {
                 self.errors.push(ResolveError::NotAnAutomaton {
@@ -1014,9 +1096,7 @@ impl<'a> Walker<'a> {
                 // record an `AutomatonField` binding under the *outer*
                 // FieldAccess expression's span.
                 let auto_sym: Option<Symbol> = match self.bindings.get(&obj.span) {
-                    Some(BindingRef::TopLevel(s))
-                        if matches!(s.kind, SymbolKind::Automaton) =>
-                    {
+                    Some(BindingRef::TopLevel(s)) if matches!(s.kind, SymbolKind::Automaton) => {
                         Some(s.clone())
                     }
                     Some(BindingRef::SelfRef { automaton }) => Some(automaton.clone()),
@@ -1206,10 +1286,7 @@ mod tests {
 
     #[test]
     fn layer_is_derived_from_item_kind() {
-        let table = build_str(
-            "@fn pure_thing() { } #automaton imperative_thing { }",
-        )
-        .unwrap();
+        let table = build_str("@fn pure_thing() { } #automaton imperative_thing { }").unwrap();
         assert_eq!(table.lookup("pure_thing").unwrap().layer, Layer::Functional);
         assert_eq!(
             table.lookup("imperative_thing").unwrap().layer,
@@ -1221,10 +1298,9 @@ mod tests {
 
     #[test]
     fn impl_does_not_populate_table() {
-        let table = build_str(
-            "#interface Serial { } #automaton Counter { } #impl Serial for Counter { }",
-        )
-        .unwrap();
+        let table =
+            build_str("#interface Serial { } #automaton Counter { } #impl Serial for Counter { }")
+                .unwrap();
         // 2 named items: Serial and Counter. Impl is anonymous.
         assert_eq!(table.len(), 2);
         assert!(table.lookup("Serial").is_some());
@@ -1242,10 +1318,7 @@ mod tests {
 
     #[test]
     fn sequential_attribute_does_not_populate_table() {
-        let table = build_str(
-            "#automaton A { } #automaton B { } @sequential(A, B);",
-        )
-        .unwrap();
+        let table = build_str("#automaton A { } #automaton B { } @sequential(A, B);").unwrap();
         // A and B are symbols; the @sequential attribute itself is not.
         assert_eq!(table.len(), 2);
     }
@@ -1277,10 +1350,7 @@ mod tests {
     #[test]
     fn three_way_duplicate_emits_two_errors() {
         // Three declarations of `dup`: errors for the 2nd and 3rd, not 1st.
-        let errors = build_str(
-            "@fn dup() { } @fn dup() { } @fn dup() { }",
-        )
-        .unwrap_err();
+        let errors = build_str("@fn dup() { } @fn dup() { } @fn dup() { }").unwrap_err();
         assert_eq!(errors.len(), 2);
         for e in &errors {
             assert!(matches!(
@@ -1350,9 +1420,7 @@ mod tests {
 
     #[test]
     fn multiple_tests_do_not_collide() {
-        let table =
-            build_str(r#"#test "first" { } #test "second" { } #test "first" { }"#)
-                .unwrap();
+        let table = build_str(r#"#test "first" { } #test "second" { } #test "first" { }"#).unwrap();
         assert!(table.is_empty());
     }
 
@@ -1414,8 +1482,7 @@ mod tests {
     #[test]
     fn all_returns_every_symbol() {
         let table = build_str("@fn a() { } @fn b() { } @fn c() { }").unwrap();
-        let names: std::collections::HashSet<_> =
-            table.all().map(|(n, _)| n.as_str()).collect();
+        let names: std::collections::HashSet<_> = table.all().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names.len(), 3);
         assert!(names.contains("a"));
         assert!(names.contains("b"));
@@ -1476,10 +1543,7 @@ mod tests {
     fn param_resolves_to_local() {
         let res = resolve_str("@fn f(x: u32) -> u32 { return x; }").unwrap();
         let local = find_local_named(&res, "x").expect("x resolved");
-        assert!(matches!(
-            local.kind,
-            LocalKind::Param { mutable: false }
-        ));
+        assert!(matches!(local.kind, LocalKind::Param { mutable: false }));
     }
 
     #[test]
@@ -1493,8 +1557,7 @@ mod tests {
 
     #[test]
     fn let_binding_resolves() {
-        let res =
-            resolve_str("@fn f() -> u32 { let x: u32 = 1; return x; }").unwrap();
+        let res = resolve_str("@fn f() -> u32 { let x: u32 = 1; return x; }").unwrap();
         let local = find_local_named(&res, "x").expect("x resolved");
         assert!(matches!(
             local.kind,
@@ -1514,10 +1577,8 @@ mod tests {
 
     #[test]
     fn let_mut_carries_mutability() {
-        let res = resolve_str(
-            "#effect e() #mutates: [] { let mut x: u32 = 1; let _y := x; }",
-        )
-        .unwrap();
+        let res =
+            resolve_str("#effect e() #mutates: [] { let mut x: u32 = 1; let _y := x; }").unwrap();
         let local = find_local_named(&res, "x").expect("x resolved");
         assert!(matches!(
             local.kind,
@@ -1532,14 +1593,11 @@ mod tests {
     fn let_value_sees_outer_x_not_new_x() {
         // `let x = x + 1;` — the RHS `x` MUST resolve to the outer `x`,
         // not the binding being introduced. (Standard let semantics.)
-        let res = resolve_str(
-            "@fn f(x: u32) -> u32 { let x: u32 = x + 1; return x; }",
-        )
-        .unwrap();
+        let res = resolve_str("@fn f(x: u32) -> u32 { let x: u32 = x + 1; return x; }").unwrap();
         // Find the `x` reference inside the `let` initializer (the `x + 1`).
         // The first `Path([x])` in the body's first stmt's value expr.
-        let prog_tokens = tokenize("@fn f(x: u32) -> u32 { let x: u32 = x + 1; return x; }")
-            .unwrap();
+        let prog_tokens =
+            tokenize("@fn f(x: u32) -> u32 { let x: u32 = x + 1; return x; }").unwrap();
         let prog = parse(&prog_tokens).unwrap();
         let fn_decl = match &prog.items[0] {
             Item::Fn(d) => d,
@@ -1581,10 +1639,9 @@ mod tests {
     fn local_shadows_top_level() {
         // `@fn helper() { } @fn caller() { let helper := 1; helper; }`
         // The `helper` reference resolves to the local Let, not the top-level.
-        let res = resolve_str(
-            "@fn helper() { } @fn caller() { let helper := 1; let _x := helper; }",
-        )
-        .unwrap();
+        let res =
+            resolve_str("@fn helper() { } @fn caller() { let helper := 1; let _x := helper; }")
+                .unwrap();
         // Find a LetShort binding for `_x` whose value is a Path resolving
         // to the local `helper`. The simplest check: iterate bindings.
         let mut found_local_helper = false;
@@ -1620,10 +1677,8 @@ mod tests {
 
     #[test]
     fn multiple_undefined_names_are_all_collected() {
-        let errors = resolve_str(
-            "@fn f() -> u32 { let x := alpha; let y := beta; return gamma; }",
-        )
-        .unwrap_err();
+        let errors = resolve_str("@fn f() -> u32 { let x := alpha; let y := beta; return gamma; }")
+            .unwrap_err();
         let names: Vec<_> = errors
             .iter()
             .filter_map(|e| match e {
@@ -1678,10 +1733,8 @@ mod tests {
 
     #[test]
     fn mutate_unknown_automaton_is_e0403() {
-        let errors = resolve_str(
-            "#effect e() #mutates: [] { #mutate NotAThing { f = 1 }; }",
-        )
-        .unwrap_err();
+        let errors =
+            resolve_str("#effect e() #mutates: [] { #mutate NotAThing { f = 1 }; }").unwrap_err();
         assert!(errors.iter().any(|e| matches!(
             e,
             ResolveError::NotAnAutomaton {
@@ -1736,7 +1789,10 @@ mod tests {
         .unwrap_err();
         assert!(errors.iter().any(|e| matches!(
             e,
-            ResolveError::NotAnAutomaton { found: "function", .. }
+            ResolveError::NotAnAutomaton {
+                found: "function",
+                ..
+            }
         )));
     }
 
@@ -1759,7 +1815,15 @@ mod tests {
         let local_count = res
             .bindings
             .values()
-            .filter(|b| matches!(b, BindingRef::Local(LocalBinding { kind: LocalKind::Let { .. }, .. })))
+            .filter(|b| {
+                matches!(
+                    b,
+                    BindingRef::Local(LocalBinding {
+                        kind: LocalKind::Let { .. },
+                        ..
+                    })
+                )
+            })
             .count();
         assert_eq!(local_count, 3);
     }
@@ -1769,10 +1833,8 @@ mod tests {
     #[test]
     fn names_inside_compound_expressions_resolve() {
         // Names buried inside Binary, Index, Call, etc. all resolve.
-        let res = resolve_str(
-            "@fn f(buf: &[u8], i: u32, j: u32) -> u8 { return buf[i + j]; }",
-        )
-        .unwrap();
+        let res =
+            resolve_str("@fn f(buf: &[u8], i: u32, j: u32) -> u8 { return buf[i + j]; }").unwrap();
         // Three references: `buf`, `i`, `j` — all are Param locals.
         let param_count = res
             .bindings
@@ -1792,10 +1854,7 @@ mod tests {
 
     #[test]
     fn names_in_array_repeat_resolve() {
-        let res = resolve_str(
-            "@fn f(n: u32) { let _x: u32 = n; let _arr := [0; n]; }",
-        )
-        .unwrap();
+        let res = resolve_str("@fn f(n: u32) { let _x: u32 = n; let _arr := [0; n]; }").unwrap();
         // `n` referenced twice (let value, array-repeat count). Both resolve.
         let n_param_refs = res
             .bindings
@@ -1843,10 +1902,9 @@ mod tests {
 
     #[test]
     fn unsafe_load_pointer_resolves() {
-        let res = resolve_str(
-            "#effect e(p: u32) #mutates: [] { let _v := #volatile_load<u8>(p); }",
-        )
-        .unwrap();
+        let res =
+            resolve_str("#effect e(p: u32) #mutates: [] { let _v := #volatile_load<u8>(p); }")
+                .unwrap();
         let p_refs = res
             .bindings
             .values()
@@ -1952,8 +2010,8 @@ mod tests {
              #transition tick { let _x := Self; } }",
         )
         .unwrap();
-        let b = find_binding(&res, |b| matches!(b, BindingRef::SelfRef { .. }))
-            .expect("Self resolved");
+        let b =
+            find_binding(&res, |b| matches!(b, BindingRef::SelfRef { .. })).expect("Self resolved");
         match b {
             BindingRef::SelfRef { automaton } => {
                 assert_eq!(automaton.name, "Counter");
@@ -1965,10 +2023,7 @@ mod tests {
 
     #[test]
     fn self_outside_transition_is_undefined() {
-        let errors = resolve_str(
-            "@fn confused() -> u32 { return Self; }",
-        )
-        .unwrap_err();
+        let errors = resolve_str("@fn confused() -> u32 { return Self; }").unwrap_err();
         // Self outside a transition body has no binding → falls through to
         // UndefinedName.
         assert!(errors.iter().any(|e| matches!(
@@ -2055,10 +2110,7 @@ mod tests {
         // — slice 3 doesn't yet have type info to validate this, so the
         // resolver SILENTLY recurses into the receiver and stops. No error,
         // no AutomatonField binding.
-        let res = resolve_str(
-            "@fn f(p: SomeStruct) -> u32 { return p.x; }",
-        )
-        .unwrap();
+        let res = resolve_str("@fn f(p: SomeStruct) -> u32 { return p.x; }").unwrap();
         // No AutomatonField binding produced.
         assert!(find_binding(&res, |b| matches!(b, BindingRef::AutomatonField { .. })).is_none());
     }
@@ -2111,10 +2163,9 @@ mod tests {
         // When the automaton is undefined, we get E0403 NotAnAutomaton
         // but NOT also E0405 UnknownField — the field check is skipped to
         // avoid redundant noise (you already know what's wrong).
-        let errors = resolve_str(
-            "#effect e() #mutates: [] { #mutate NotAThing { whatever = 1 }; }",
-        )
-        .unwrap_err();
+        let errors =
+            resolve_str("#effect e() #mutates: [] { #mutate NotAThing { whatever = 1 }; }")
+                .unwrap_err();
         let has_e0403 = errors
             .iter()
             .any(|e| matches!(e, ResolveError::NotAnAutomaton { .. }));
@@ -2122,7 +2173,10 @@ mod tests {
             .iter()
             .any(|e| matches!(e, ResolveError::UnknownField { .. }));
         assert!(has_e0403);
-        assert!(!has_e0405, "should not double-report a field on a non-automaton");
+        assert!(
+            !has_e0405,
+            "should not double-report a field on a non-automaton"
+        );
     }
 
     // ── #> proc resolution + CallContext tagging ─────────────────────────
@@ -2199,10 +2253,7 @@ mod tests {
 
     #[test]
     fn proc_call_unknown_name_is_e0404() {
-        let errors = resolve_str(
-            "#effect e() #mutates: [] { #> mystery(); }",
-        )
-        .unwrap_err();
+        let errors = resolve_str("#effect e() #mutates: [] { #> mystery(); }").unwrap_err();
         assert!(errors.iter().any(|e| matches!(
             e,
             ResolveError::UnknownProc { name, .. } if name == "mystery"
@@ -2246,8 +2297,7 @@ mod tests {
                    #effect e() #mutates: [] { #> log(0); }";
         let res = resolve_str(src).unwrap();
         let log_sym = res.symbols.lookup("log").unwrap();
-        let b = find_binding(&res, |b| matches!(b, BindingRef::Proc { .. }))
-            .expect("Proc binding");
+        let b = find_binding(&res, |b| matches!(b, BindingRef::Proc { .. })).expect("Proc binding");
         match b {
             BindingRef::Proc { target_span, .. } => {
                 assert_eq!(*target_span, log_sym.span);
@@ -2289,9 +2339,8 @@ mod tests {
              #transition tick { let _x: u32 = Self.value + 1; } }",
         )
         .unwrap();
-        let self_field_count = count_bindings(&res, |b| {
-            matches!(b, BindingRef::AutomatonField { .. })
-        });
+        let self_field_count =
+            count_bindings(&res, |b| matches!(b, BindingRef::AutomatonField { .. }));
         assert_eq!(self_field_count, 1);
     }
 
@@ -2375,10 +2424,8 @@ mod tests {
     #[test]
     fn duplicate_item_and_undefined_name_both_reported() {
         // Mix slice-1 and slice-2 errors in one program.
-        let errors = resolve_str(
-            "@fn dup() { } @fn dup() { } @fn caller() { use_undefined; }",
-        )
-        .unwrap_err();
+        let errors =
+            resolve_str("@fn dup() { } @fn dup() { } @fn caller() { use_undefined; }").unwrap_err();
         let dup_count = errors
             .iter()
             .filter(|e| matches!(e, ResolveError::DuplicateItem { .. }))
@@ -2389,5 +2436,214 @@ mod tests {
             .count();
         assert_eq!(dup_count, 1);
         assert_eq!(undef_count, 1);
+    }
+
+    // ── Decision #25: `#hidden` field encapsulation ─────────────────────
+
+    /// Hidden fields are accessible from inside the owning automaton's
+    /// transitions — that's the *whole point* of the feature, so verify
+    /// transitions get their normal access first. (The mutate-short form
+    /// `Auto.field = value;` is the canonical write syntax inside
+    /// transitions per Decision #15; `Self.field` reads work too.)
+    #[test]
+    fn hidden_field_accessible_from_owning_transition() {
+        let src = "\
+            #automaton Counter { \
+              value: u32; \
+              scratch: u32 #hidden; \
+              #transition tick { \
+                Counter.scratch = 1u32; \
+                Counter.value   = 0u32; \
+              } \
+            }\
+        ";
+        let res = resolve_str(src);
+        assert!(
+            res.is_ok(),
+            "expected own-transition access to succeed, got {res:?}"
+        );
+    }
+
+    /// From an `#effect` body whose `#mutates` *does* list the owning
+    /// automaton, hidden fields are still inaccessible. The `#mutates`
+    /// declaration grants *automaton* access, not *hidden-field* access —
+    /// per Decision #25 only the automaton's own transitions see the
+    /// hidden basis vectors.
+    #[test]
+    fn hidden_field_e0407_from_effect_with_mutates() {
+        let src = "\
+            #automaton Counter { \
+              value: u32; \
+              scratch: u32 #hidden; \
+            } \
+            #effect bump() #mutates: [Counter] { \
+              Counter.scratch = 1u32; \
+            }\
+        ";
+        let errors = resolve_str(src).expect_err("expected E0407");
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                ResolveError::HiddenFieldNotAccessible { automaton, field, .. }
+                    if automaton == "Counter" && field == "scratch"
+            )
+        });
+        assert!(
+            saw,
+            "expected E0407 HiddenFieldNotAccessible; got {errors:?}"
+        );
+    }
+
+    /// From a `Self.field` reference in a *different* automaton's
+    /// transition, hidden fields of `Counter` aren't even referenceable
+    /// (the receiver doesn't resolve to `Counter`); from a `Counter.field`
+    /// reference in another automaton's transition, E0407 fires.
+    #[test]
+    fn hidden_field_e0407_from_other_automaton_transition() {
+        let src = "\
+            #automaton A { \
+              secret: u32 #hidden; \
+              public: u32; \
+            } \
+            #automaton B { \
+              tag: u32; \
+              #transition spy { \
+                A.secret = 7u32; \
+              } \
+            }\
+        ";
+        let errors = resolve_str(src).expect_err("expected E0407");
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                ResolveError::HiddenFieldNotAccessible { automaton, field, .. }
+                    if automaton == "A" && field == "secret"
+            )
+        });
+        assert!(
+            saw,
+            "expected E0407 from other-automaton transition; got {errors:?}"
+        );
+    }
+
+    /// From an `@fn` body, hidden fields are inaccessible (even if the
+    /// `@fn` happens to take a path-position argument naming the owning
+    /// automaton). Today `@fn`s don't take automaton-state arguments
+    /// directly, so the easiest probe is a `Counter.field` read.
+    #[test]
+    fn hidden_field_e0407_from_pure_fn() {
+        let src = "\
+            #automaton Counter { \
+              scratch: u32 #hidden; \
+            } \
+            @fn peek() -> u32 { \
+              return Counter.scratch; \
+            }\
+        ";
+        let errors = resolve_str(src).expect_err("expected E0407");
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                ResolveError::HiddenFieldNotAccessible { automaton, field, .. }
+                    if automaton == "Counter" && field == "scratch"
+            )
+        });
+        assert!(saw, "expected E0407 from @fn; got {errors:?}");
+    }
+
+    /// A non-hidden field on the same automaton remains accessible from
+    /// outside callables (the negative control: `#hidden` is opt-in,
+    /// not blanket).
+    #[test]
+    fn non_hidden_field_remains_accessible_from_effect() {
+        let src = "\
+            #automaton Counter { \
+              value: u32; \
+              scratch: u32 #hidden; \
+            } \
+            #effect bump() #mutates: [Counter] { \
+              Counter.value = 1u32; \
+            }\
+        ";
+        let res = resolve_str(src);
+        assert!(
+            res.is_ok(),
+            "expected non-hidden field to remain accessible; got {res:?}"
+        );
+    }
+
+    /// E0407 (hidden-field) and E0405 (unknown-field) are distinct and
+    /// don't bleed into each other: a real-but-hidden field gets E0407;
+    /// an absent field gets E0405; both can fire from the same body.
+    #[test]
+    fn hidden_field_distinct_from_unknown_field() {
+        let src = "\
+            #automaton Counter { \
+              scratch: u32 #hidden; \
+            } \
+            #effect bad() #mutates: [Counter] { \
+              Counter.scratch = 1u32; \
+              Counter.bogus  = 2u32; \
+            }\
+        ";
+        let errors = resolve_str(src).expect_err("expected mixed errors");
+        let hidden_count = errors
+            .iter()
+            .filter(|e| matches!(e, ResolveError::HiddenFieldNotAccessible { .. }))
+            .count();
+        let unknown_count = errors
+            .iter()
+            .filter(|e| matches!(e, ResolveError::UnknownField { .. }))
+            .count();
+        assert_eq!(hidden_count, 1, "want one E0407, got errors {errors:?}");
+        assert_eq!(unknown_count, 1, "want one E0405, got errors {errors:?}");
+    }
+
+    /// Hidden access from a transition of automaton `A` to a hidden
+    /// field of automaton `B` (named via `B.field`, not `Self.field`)
+    /// is denied. The visibility check is by *owning* automaton, not by
+    /// "any transition I happen to be in."
+    #[test]
+    fn hidden_field_e0407_cross_automaton_via_full_path_in_transition() {
+        let src = "\
+            #automaton A { \
+              ax: u32; \
+              #transition reach { \
+                B.bsecret = 1u32; \
+              } \
+            } \
+            #automaton B { \
+              bsecret: u32 #hidden; \
+            }\
+        ";
+        let errors = resolve_str(src).expect_err("expected E0407");
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                ResolveError::HiddenFieldNotAccessible { automaton, field, .. }
+                    if automaton == "B" && field == "bsecret"
+            )
+        });
+        assert!(saw, "expected E0407 cross-automaton path; got {errors:?}");
+    }
+
+    /// Hidden array-typed fields are accessible from the owning
+    /// automaton's transition (using the indexed `#mutate` block form).
+    /// Exercises the `assigns[].index` walk path through `require_field`.
+    #[test]
+    fn hidden_array_field_indexed_write_in_own_transition_works() {
+        let src = "\
+            #automaton Counter { \
+              cache: [u8; 4] #hidden; \
+              #transition init { \
+                #mutate Counter { cache[0usize] = 0u8 }; \
+              } \
+            }\
+        ";
+        let res = resolve_str(src);
+        assert!(
+            res.is_ok(),
+            "expected indexed hidden-array write in own transition to succeed, got {res:?}"
+        );
     }
 }
