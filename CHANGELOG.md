@@ -7,100 +7,36 @@ may include breaking changes.
 
 ## [Unreleased]
 
-### Added — Phase 2 effect slice E4: Refinement #5e interrupt-overlap set R(A) (2026-05-04)
+### Spec — §7.0.1 Safety Pillars + book Ch. 39 SPSC ring buffer (2026-05-03)
 
-- `clifford-effect`: new public entry `compute_interrupt_overlap(&MutationProfiles)
-  -> InterruptOverlap`. For each `#automaton A`, computes R(A) = the
-  set of `#interrupt` declarations that mutate A transitively (per
-  their `#mutates` clause expanded through `#> proc()` calls — using
-  E2's already-computed transitive `actual_automata` set).
-- New types: `InterruptOverlap` (the artifact). API: `interrupts_for(name)`
-  returns `&HashSet<String>` of overlapping interrupt names (always a
-  set, empty when no overlap — uses `OnceLock` for the cached empty
-  set); `is_overlapped(name)` convenience for the codegen-question
-  "do I need critical-section wrapping?"; `all()` / `len()` /
-  `is_empty()` standard collection methods.
-- Drives `clifford-codegen`'s §8.4 transition-atomicity wrapping
-  decision: any transition of an automaton with non-empty R(A) needs
-  CLI/STI on Cortex-M (or `csrrci sie` on RISC-V) so an interrupt
-  doesn't preempt mid-transition and observe a torn state.
-- Useful for `cliffordc audit` "interrupts affecting this automaton"
-  reports and for `@sequential(A, B)` overrides per Decision #11.
-- Reuses E2's transitive closure machinery — no re-walking of the call
-  graph. Slice is essentially "invert the existing interrupt → automatons
-  relation."
-- 9 new tests + 1 doctest: empty program, no interrupts, single
-  interrupt over single automaton, two interrupts on same automaton,
-  one interrupt across two automatons, transitive overlap through
-  proc-call, effects-alone don't create overlap, realistic IRQ +
-  consumer (Wari shape), lookup for non-existent automaton, all()
-  iterator. **Total clifford-effect: 51 unit + 3 doctest tests.**
+Pins the v0.1 GA orthogonality engine's contract — what's guaranteed,
+what's deliberately not — and grounds it in the canonical embedded
+worked example.
 
-### Added — Phase 2 effect slice E3: §6.3 proc-call graph + cycle detection (2026-05-03)
+**Spec:**
 
-- `clifford-effect`: new public entry `extract_call_graph(&Program, &Resolution)
-  -> Result<ProcCallGraph, Vec<EffectError>>`. Builds the directed
-  call graph (caller → callee) from every `#> proc()` site and rejects
-  any cycles per spec §6.3 step 6.
-- New types: `ProcCallGraph` (the artifact, with `callees(id)` lookup
-  and iteration), `EffectError::ProcCallCycle { cycle, cycle_display }`.
-- Cycle detection: DFS with three-color marking (white / gray / black);
-  cycles canonicalised by rotating to lex-smallest member so the same
-  cycle is reported once regardless of DFS entry point.
-- New error: `E0422 ProcCallCycle` — cycle members listed in traversal
-  order, plus a pre-rendered display string (e.g. `` `a` → `b` → `c` → `a` ``).
-  Multiple disjoint cycles produce multiple errors.
-- Hand-rolled graph data structure: `HashMap<CallableId, HashSet<CallableId>>`.
-  No external graph library — keeps deps minimal per CLAUDE.md, the
-  algorithms are textbook DFS/SCC, and `petgraph` would be premature
-  commitment.
-- 12 new tests + 1 doctest: empty program, no-edge cleanup, linear
-  chains (2 + 3), self-loop (E0422), mutual recursion (E0422),
-  3-cycle (E0422), two disjoint cycles (two E0422s), transition
-  self-call cycle, diamond DAG clean, canonicalisation idempotence,
-  realistic Wari-style program clean. **Total clifford-effect: 41 unit
-  + 2 doctest tests.**
+- New `docs/CLIFFORD_SPEC.md` §7.0.1 "Safety Pillars" subsection.
+  Two normative statements about what the v0.1 engine guarantees
+  (procedural mutation safety; parallel verification by exhaustive
+  pairwise check) and three explicit limits (narrow-unsafe writes
+  outside the proof boundary, read-write races deferred to v0.2,
+  `@sequential` user-asserted-not-verified). Sets the precise boundary
+  of v0.1 safety so users designing systems know what they can and
+  cannot rely on.
 
-### Added — Phase 2 effect slice E2: §6.2 mutation profile extraction (2026-05-02)
+**Book:**
 
-The bridge piece the GA orthogonality engine actually consumes. After
-this slice, every `#effect` / `#interrupt` / `#transition` carries a
-fully-resolved `(automaton, field)` write set — direct + transitive
-through `#> proc()` calls per Decision #3.
+- `book/src/part5/39-firmware.md` — first real Part-V chapter.
+  Producer/consumer SPSC ring-buffer worked example end-to-end. Two
+  versions: the naive design (with a `count` field both sides update,
+  which the engine rejects with E0520 on `count`) and the lock-free
+  SPSC (no `count`, derived from head/tail, which the engine accepts).
+  Each version traced through every compiler phase showing what the
+  engine sees. Closes with explicit cross-references to §7.0.1's two
+  pillars and the read-write deferral. ~5,000 words.
 
-- `clifford-effect`: public entry point `extract_mutation_profiles(&Program, &Resolution)
-  -> Result<MutationProfiles, Vec<EffectError>>`. Walks every callable,
-  collects direct writes, then computes the transitive closure through
-  proc-calls via fixed-point iteration.
-- New types: `CallableId` (`Effect(name)` / `Interrupt(name)` /
-  `Transition { automaton, name }`), `FieldRef { automaton, field }`,
-  `MutationProfile { actual_writes, actual_automata }`, `MutationProfiles`
-  (the artifact, indexed by `CallableId`).
-- Direct writes collected from `#mutate Auto { field = expr }` (canonical
-  form) and `Auto.field <op>= expr` (Decision #15 sugar).
-- Transitive writes propagated through `#> proc()` calls using the
-  resolver's `BindingRef::Proc { ctx, ... }`. `CallContext::Identity`
-  resolves to `CallableId::Effect`; `CallContext::Transition` resolves
-  via a per-name index of all transitions across all automata.
-- Cycles in the proc-call graph (mutual recursion) are handled
-  defensively: the worklist algorithm reaches a fixed point because the
-  union over a finite field-set is monotonic and bounded. Explicit
-  E0422 cycle rejection is deferred to slice E3.
-- New errors: `E0410 EffectMutatesUndeclaredAutomaton` (effect/interrupt
-  writes an automaton not in its `#mutates` clause; transitive),
-  `E0411 EffectMutatesExcludedAutomaton` (writes an automaton in its
-  `#cannot_mutate` clause).
-- Transition mutation profiles are computed but not validated — transitions
-  implicitly mutate their enclosing automaton; the cross-automaton
-  transition-write check (a different rule than effect/interrupt) lives
-  in a future slice.
-- 16 new tests + every E1 test still green: empty programs, MutateShort
-  collection, canonical Mutate collection, interrupt mutation,
-  transition mutation, proc-call to effect propagation, proc-call to
-  transition propagation, deep proc-call chain (a → b → c), undeclared
-  automaton (direct + transitive), excluded automaton, multi-automaton
-  effect, mutual recursion termination, realistic 3-callable program
-  with full transitive analysis. **Total clifford-effect: 29 unit + 1 doctest.**
+Both items are pure documentation — no code touched. PRs against the
+ortho engine and the effect crate land in their own branches.
 
 ### Added — Phase 2 effect slice E1: §6.1 category construction (2026-05-02)
 
