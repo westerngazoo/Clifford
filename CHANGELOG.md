@@ -7,6 +7,37 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Spec — §7.0.1 Safety Pillars + book Ch. 39 SPSC ring buffer (2026-05-03)
+
+Pins the v0.1 GA orthogonality engine's contract — what's guaranteed,
+what's deliberately not — and grounds it in the canonical embedded
+worked example.
+
+**Spec:**
+
+- New `docs/CLIFFORD_SPEC.md` §7.0.1 "Safety Pillars" subsection.
+  Two normative statements about what the v0.1 engine guarantees
+  (procedural mutation safety; parallel verification by exhaustive
+  pairwise check) and three explicit limits (narrow-unsafe writes
+  outside the proof boundary, read-write races deferred to v0.2,
+  `@sequential` user-asserted-not-verified). Sets the precise boundary
+  of v0.1 safety so users designing systems know what they can and
+  cannot rely on.
+
+**Book:**
+
+- `book/src/part5/39-firmware.md` — first real Part-V chapter.
+  Producer/consumer SPSC ring-buffer worked example end-to-end. Two
+  versions: the naive design (with a `count` field both sides update,
+  which the engine rejects with E0520 on `count`) and the lock-free
+  SPSC (no `count`, derived from head/tail, which the engine accepts).
+  Each version traced through every compiler phase showing what the
+  engine sees. Closes with explicit cross-references to §7.0.1's two
+  pillars and the read-write deferral. ~5,000 words.
+
+Both items are pure documentation — no code touched. PRs against the
+ortho engine and the effect crate land in their own branches.
+
 ### Added — Phase 2 effect slice E1: §6.1 category construction (2026-05-02)
 
 First piece of the GA-engine bridge. After this slice, the compiler
