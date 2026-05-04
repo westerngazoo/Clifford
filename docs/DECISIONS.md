@@ -1,6 +1,6 @@
 # Clifford Language: Critical Design Decisions
 
-**Status:** Decisions #1–#22 + #25 locked (with #12 and #18 designed but deferred to v0.2; #21 design locked, v0.7 implementation; #22 + #25 design locked, v0.2 implementation). Decisions #23 and #24 DESIGN-IN-PROGRESS pending ADRs. Refinement #1a locked. Phase 1 implementation underway.
+**Status:** Decisions #1–#22 and #25 LOCKED; Decisions #23 and #24 DESIGN-IN-PROGRESS (ADRs forthcoming). Implementation gating: #12 and #18 designed but deferred to v0.2; #21 design locked, implementation gated to v0.7; #22 and #25 design locked, implementation slated for v0.2. Refinement #1a LOCKED. Phase 1 implementation underway.
 **Dates:** see footer below for the full chronological log.
 **Owner:** Goose (Gustavo Delgadillo)
 **Positioning:** General-purpose systems language; embedded firmware is the canonical first target but not the only target. Decisions are language-level and apply across domains.
@@ -1469,7 +1469,7 @@ Spec amendment + parser/resolve extension lands in a follow-up Phase-1 work item
 
 ## Open Questions
 
-All sixteen decisions and six emergent rules are locked (with #12 designed but deferred to v0.2). Items previously listed as open in `CLIFFORD_SPEC.md §12` and resolved here:
+Decisions #1–#22 and #25 are locked alongside six emergent rules and Refinement #1a; Decisions #23 and #24 are DESIGN-IN-PROGRESS pending their respective ADRs (`0003-haskell-clean-fn-discipline.md`, `0004-snapshot-boundary-operator.md`). Implementation gating per the status header at the top of this file: #12 and #18 deferred to v0.2; #21 implementation gated to v0.7; #22 and #25 design locked, implementation slated for v0.2. Items previously listed as open in `CLIFFORD_SPEC.md §12` and resolved here:
 
 - ~~Effect/state/transition coupling~~ — Resolved by Decision #5.
 - ~~`#hardware` capabilities~~ — Resolved by Decision #6 (subsumed into `#automaton` with hardware annotations).

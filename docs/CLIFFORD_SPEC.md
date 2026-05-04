@@ -1,7 +1,7 @@
 # Clifford Language Technical Specification
 
 **Version:** 0.6.0-draft
-**Status:** Pre-implementation; reconciled with `DECISIONS.md` (Decisions #1–#21 locked; #12 and #18 designed but deferred to v0.2; Decision #21 implementation gated on v0.7+)
+**Status:** Pre-implementation; reconciled with `DECISIONS.md` (Decisions #1–#22, #25 locked; Decisions #23 and #24 designed with ADRs forthcoming; #12 and #18 designed but deferred to v0.2; Decision #21 implementation gated on v0.7+)
 **Target:** LLVM IR via custom frontend
 **Audience:** Compiler implementers (human and AI agents)
 **Positioning:** General-purpose systems language. Embedded firmware is the canonical first target because the safety properties matter most there; the language is not embedded-only and the same constructs work for servers, robotics, scientific computing, game engines, and other systems-software domains. Domain-specific support (heap allocators, IO primitives, etc.) lives in Phase 5 stdlib, not in the core language.
@@ -10,7 +10,7 @@
 
 ## 0. How to Use This Document
 
-This is an implementation-oriented spec. It defines *what* Clifford is precisely enough that an implementer can build a compiler from it. It does not motivate design decisions — see `clifford_spec_draft0.docx` for rationale and `DECISIONS.md` for the four locked design decisions.
+This is an implementation-oriented spec. It defines *what* Clifford is precisely enough that an implementer can build a compiler from it. It does not motivate design decisions — see `clifford_spec_draft0.docx` for rationale and `DECISIONS.md` for the locked design decisions (Decisions #1–#22 and #25 locked, #23 and #24 designed with ADRs forthcoming, plus six emergent rules).
 
 **Conventions:**
 - Grammar uses EBNF. `?` means optional, `*` means zero-or-more, `+` means one-or-more, `|` means alternation.
@@ -19,7 +19,7 @@ This is an implementation-oriented spec. It defines *what* Clifford is precisely
 - Sections marked **[OPEN]** are unresolved design questions.
 
 **Companion documents:**
-- `DECISIONS.md` — locks four design decisions (sigil layering, hybrid `$ [TraitList]` traits, named effect procedures with `#>`, auto-assigned GA basis vectors) and five emergent rules. Where this spec and `DECISIONS.md` disagree, `DECISIONS.md` wins until reconciled here.
+- `DECISIONS.md` — the locked design decisions (Decisions #1–#22 and #25 locked; #23 and #24 designed with ADRs forthcoming) and six emergent rules; among the most foundational locks: sigil layering (#1), hybrid `$ [TraitList]` traits (#2), named effect procedures with `#>` (#3), auto-assigned GA basis vectors (#4), and the cleaner pure/imperative boundary cluster (#22, #25). Where this spec and `DECISIONS.md` disagree, `DECISIONS.md` wins until reconciled here.
 - `clifford_spec_draft0.docx` — rationale and worked examples (informative).
 
 **Implementation order recommendation:**
@@ -1009,7 +1009,7 @@ The semantics in this section are the normative form of `DECISIONS.md` Decision 
 
 ### 7.0 Algebra: restricted form (v0.1–v0.6) and full form (v0.7+) **[NORMATIVE]**
 
-This spec version (v0.5.0-draft, targeting language v0.1–v0.6) defines the orthogonality engine over the **restricted Clifford algebra Cl(0,0,n)**: every basis vector squares to zero. The bitmask check in §7.4 (`a & b != 0 ⇒ wedge == 0`) is the operational form of this restriction. Under the restricted form, two automata are concurrent-safe iff they touch *literally disjoint* state — the strongest possible isolation property and the right one for embedded firmware that does not deliberately share mutable state.
+This spec version (v0.6.0-draft, targeting language v0.1–v0.6) defines the orthogonality engine over the **restricted Clifford algebra Cl(0,0,n)**: every basis vector squares to zero. The bitmask check in §7.4 (`a & b != 0 ⇒ wedge == 0`) is the operational form of this restriction. Under the restricted form, two automata are concurrent-safe iff they touch *literally disjoint* state — the strongest possible isolation property and the right one for embedded firmware that does not deliberately share mutable state.
 
 **Reservation for v0.7+: mixed-metric extension.** Per `DECISIONS.md` Decision #21 (and ADR 0002), v0.7.0-draft will extend the engine to the **mixed-metric Clifford algebra Cl(p,0,n)** in which:
 
@@ -1682,4 +1682,4 @@ Its scope is exactly: the categorical foundation of automata, transitions, and t
 
 ---
 
-*End of specification v0.5.0-draft.*
+*End of specification v0.6.0-draft.*

@@ -85,6 +85,112 @@ worked example.
 Both items are pure documentation — no code touched. PRs against the
 ortho engine and the effect crate land in their own branches.
 
+### Added — Ortho slice O1: GA orthogonality engine (Cl(0,0,n) bitmask check) (2026-05-03)
+
+The headline slice. After this lands, Clifford does the thing it claims
+to do: compile-time race detection via geometric algebra, on real `.cl`
+source, with diagnostics in source identifiers (not basis indices).
+
+End-to-end pipeline driven by `check_orthogonality(&Program,
+&MutationProfiles)`:
+
+1. **Basis assignment** (§7.1): every distinct `(automaton, field)`
+   pair appearing in any callable's `actual_writes` set gets a unique
+   bit position in the blade. Sorted by `(automaton, field)` for
+   reproducibility.
+2. **Behavior multivector construction** (§7.2): per callable, one
+   `Blade { bits }` whose set bits = the basis vectors of fields the
+   callable writes (direct + transitive per slice E2).
+3. **Concurrency inference** (§7.3): every pair of `#effect`s,
+   `#interrupt`s, and effect-interrupt combinations is treated as
+   concurrent. `@sequential(A, B)` excludes pairs *only* when each
+   side touches exactly one of `{A, B}` (strict v0.1 rule — prevents
+   the attribute from masking races through third automata).
+4. **Pairwise check** (§7.4): for every concurrent pair,
+   `outer_product(blade_a, blade_b)`. `None` (collapse) → race
+   detected.
+5. **Diagnostic** (§7.5): shared fields decoded back to source
+   `(automaton.field)` notation per Emergent Rule 1; never raw `e_n`
+   indices.
+
+Public surface: `check_orthogonality`, `assign_basis`,
+`build_behaviors`, `build_concurrency_matrix`, `outer_product`,
+`BasisAssignment`, `Blade`, `CallableBehavior`, `ConcurrencyMatrix`,
+`OrthoReport`. `MAX_BASIS_VECTORS_V1 = 64` (with `E0530` when
+exceeded). `outer_product`'s foundational invariant
+(`is_some() ⟺ a & b == 0`) is property-tested.
+
+Errors: `E0520 OrthogonalityViolation` (callable pair + shared
+`(automaton.field)` pairs by source name), `E0530 TooManyBasisVectors`.
+
+PR #5; built atop slice E2 (mutation profiles, PR #10).
+
+### Added — Phase 2 effect slice E4: Refinement #5e interrupt-overlap set R(A) (2026-05-02)
+
+Computes the `R(A)` set per Refinement #5e: for each automaton `A`,
+the set of interrupts whose `actual_writes` overlap `A`'s field set.
+Downstream consumers (atomicity check, `cliffordc audit`) use `R(A)`
+to determine which critical sections need interrupt-disabling.
+
+- Public entry: `compute_interrupt_overlap(&Program, &MutationProfiles)
+  -> InterruptOverlap`. Returns a `HashMap<AutomatonName, HashSet<
+  InterruptName>>`.
+- `InterruptOverlap::interrupts_for(&str)` lookup; returns a static
+  empty set via `OnceLock` for the no-overlap path (no allocation).
+- Validates that every `#mutates` entry on `#interrupt` declarations
+  references a real automaton; emits `E0440 UnknownMutatedAutomaton`
+  otherwise.
+- Tests cover: empty programs, single interrupt + single overlap,
+  multi-interrupt overlap, transitive overlap through `#>` calls,
+  no-overlap silence, unknown-automaton diagnostic, and shared-set
+  static-empty optimization.
+
+PR #9.
+
+### Added — Phase 2 effect slice E3: §6.3 proc-call graph + cycle detection (2026-05-02)
+
+Builds the procedure-call graph per §6.3 and detects strongly-connected
+components (cycles) via Tarjan's algorithm. The graph is the substrate
+for slice E2's transitive `actual_writes` closure and for
+`@sequential` constraint propagation.
+
+- Public entry: `build_call_graph(&Program) -> Result<ProcCallGraph,
+  Vec<EffectError>>`.
+- `ProcCallGraph` is a hand-rolled `HashMap<CallableId,
+  HashSet<CallableId>>` (no `petgraph` dep — keeps deps minimal per
+  CLAUDE.md §3.1; algorithms are textbook ~30 lines).
+- `CallableId` covers `@fn`, `#effect`, `#interrupt`, `#transition`,
+  and `#proc` (Decision #3); cycle reporting canonicalizes by
+  rotating to the lex-smallest member so the same cycle isn't
+  reported twice from different DFS entry points.
+- Errors: `E0441 CycleInProcCalls` (lists the cycle in canonical
+  order), `E0442 UnknownProcReference`.
+
+PR #8.
+
+### Added — Phase 2 effect slice E2: §6.2 mutation profile extraction (2026-05-02)
+
+Computes per-callable `actual_writes` sets per §6.2 (the heart of the
+GA engine's input). Transitively closes through `#> proc()` calls
+using slice E3's `ProcCallGraph` (delivered together).
+
+- Public entry: `extract_mutation_profiles(&Program) ->
+  Result<MutationProfiles, Vec<EffectError>>`. Returns
+  `MutationProfiles { actual_writes: HashMap<CallableId,
+  HashSet<(AutomatonName, FieldName)>> }`.
+- Walks every `#effect`, `#interrupt`, `#transition`, and `#proc`
+  body. Records direct writes (`Auto.field = …`, `Auto.field +=
+  …`, etc. — the §15 sugars from Decision #15).
+- Transitively unions `actual_writes` of every `#>` callee, using
+  the call graph from slice E3. Resolves before slice O1's wedge
+  check sees the input.
+- Validates that every `#mutates` declaration matches the body's
+  actual writes (no over-promising or under-promising); emits
+  `E0445 MutationProfileMismatch` with both sets named by source
+  identifier.
+
+PR #10.
+
 ### Added — Phase 2 effect slice E1: §6.1 category construction (2026-05-02)
 
 First piece of the GA-engine bridge. After this slice, the compiler
