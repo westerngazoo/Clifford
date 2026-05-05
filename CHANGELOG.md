@@ -281,6 +281,82 @@ This is a pure documentation ADR — no code changes, no spec changes
 yet. Spec amendments and `crates/ortho` extensions land per ADR
 acceptance and per Decision #21's v0.7 milestone.
 
+### Proposed — ADR 0003 + ADR 0004: Haskell-clean `@fn` discipline + `@snapshot` boundary operator (2026-05-04)
+
+The two design-in-progress ADRs that close out Decisions #23 and
+#24's open questions. Status: **Proposed** for both — locks pending
+architect sign-off on the proposed resolutions.
+
+**ADR 0003 — Haskell-clean `@fn` discipline.** Surveys Haskell,
+Idris, Liquid Haskell, and Koka on three axes (totality, effect
+rows, refinement types) and proposes a concrete design for what
+"Haskell-clean `@fn`" means in Clifford:
+
+- **Total by default** with `@partial @fn` opt-out (Idris-style
+  structural-recursion check; non-structural recursion → `E0540`).
+- **First-class effect rows** as an extension of `$ [TraitList]`
+  (Decision #2 + #22): `Readable`, `Observable`, `Pure`, `Opaque`
+  with row-composition checking (`E0541`).
+- **Limited refinement types** via the §5.8 sigma-bound machinery
+  (Decision #14) — extended from loop variables to function
+  arguments. Catches "index in bounds" without an SMT solver
+  (`E0542 RefinementNotDischarged`). Full SMT-backed refinements
+  deferred to v1.0+ ADR.
+- **Local mutation** (Refinement #1a) already locked, no change.
+
+The headline trade: totality + effect rows are real wins; full
+refinement types via SMT are not (yet) — the firmware target makes
+a 50 MB solver dependency a deal-breaker. The sigma-bound carve-out
+gives 80% of the value at 5% of the cost.
+
+Five open questions answered with proposed resolutions (structural-
+recursion rule, `#`-layer effect-row interaction, Throws<E> vs
+Result<_, E>, Diverges trait drop, SMT timeline). Implementation
+gated to v0.2 (totality + effect rows) and v0.4+ (refinements
+beyond sigma-bound).
+
+**ADR 0004 — `@snapshot` boundary operator.** Resolves Decision
+#24's four explicit open questions:
+
+1. **Expression vs statement?** → Expression. `let v := @snapshot
+   Counter.value;` composes in any expression position.
+2. **Copy-by-value vs ref-to-snapshot?** → Copy-by-value for `Copy`
+   types in v0.2; `@snapshot_ref` borrow form deferred to v0.4+.
+3. **Interaction with `#shared` (Decision #21)?** → `@snapshot` of
+   a `#shared` field requires the lock to be held by the caller's
+   thread-plane (statically demonstrable per ADR 0005). From `@fn`
+   in v0.2: `E0552 SnapshotNeedsLockProof` (snapshot of `#shared`
+   only from `#`-layer).
+4. **Backward compat with the implicit-read pattern in book Ch. 39?**
+   → Two-phase migration: v0.2 deprecation warning (`W0001
+   ImplicitFieldRead`); v0.4+ hard `E0101`.
+
+Atomicity: only word-size `Copy` fields snapshot atomically;
+larger types → `E0551 SnapshotNotAtomic` (use `#shared` + lock).
+The `Readable` trait from ADR 0003 is the gate for `@snapshot`
+from `@fn` (`E0550 SnapshotInUnreadableFn`).
+
+Five additional open questions resolved (purity status of
+`@snapshot`, `Self.field` snapshot inside transitions, complex
+composite reads, migration timing, explicit ordering annotation).
+
+The two ADRs are **complementary** and should land together —
+ADR 0003's `Readable` trait is the gate that ADR 0004 uses; ADR
+0004's `@snapshot` operator is the only `@fn`-side mechanism for
+discharging `Readable`. Locking one without the other leaves an
+unfilled hole.
+
+If accepted, both Decisions #23 and #24 transition from
+DESIGN-IN-PROGRESS to ✓ LOCKED with one-paragraph entries in
+DECISIONS.md citing the respective ADRs. Implementation milestones
+laid out in each ADR's §"Implementation milestones" section: bulk
+of work in v0.2; tail (refinements, `@snapshot_ref`, ordering
+control) in v0.4+ / v0.7+.
+
+Pure documentation — no code changes, no spec amendments yet.
+Spec edits (§2, §4, §5, §10) and `clifford-check` work land per
+ADR acceptance.
+
 ### Type Checker — Slice T4a: nominal types from Path-position type expressions (2026-05-01)
 
 First semantic resolution of `Path`-form type expressions in the type
