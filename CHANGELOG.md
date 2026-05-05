@@ -85,6 +85,81 @@ construction; no engine machinery.**
 - `decision-index.md`: #22-#25 rows now point to their actual
   chapter numbers (was previously aspirational).
 
+### Added — Decision #22: imperative trait list on `#effect` / `#interrupt` / `#transition` (2026-05-05)
+
+First implementation of Decision #22 (locked 2026-05-03). Extends
+the `$ [TraitList]` mechanism from `@fn` (Decision #2) to imperative-
+layer callables, with semantic interpretation switching from *purity*
+to **kind classification** — what kind of imperative work the
+callable does.
+
+**AST (`crates/ast`):**
+
+- `EffectDecl`, `InterruptDecl`, and `TransitionDecl` each gain a
+  `pub trait_list: Vec<TraitRef>` field. Empty if no `$ [...]` clause
+  appears. Same `TraitRef` shape as `FnDecl::trait_list`.
+
+**Parser (`crates/parser`):**
+
+- `parse_effect_decl`, `parse_interrupt_decl`, `parse_transition_decl`
+  each accept an optional `$ [TraitList]` clause between their
+  metadata clauses (or destination, for transitions) and the body
+  block. Implementation is one three-line `if matches!(...)
+  Dollar` block per decl, reusing `parse_trait_list` (already
+  factored from Decision #2).
+- Trait names are stored verbatim — the parser performs no
+  predeclared-trait validation. Downstream tools (codegen,
+  `cliffordc audit`, `clifford-types` once it grows imperative-side
+  trait checking) interpret the list.
+- 11 new parser tests (215 total, was 204). Coverage: single trait,
+  multiple traits, empty/missing list, `#cannot_mutate` then `$
+  [...]` ordering, transition with destination then `$ [...]`,
+  generic trait names (`$ [LockingDiscipline<RwLock>]`), non-
+  predeclared user-defined names pass through.
+
+**Spec (`docs/CLIFFORD_SPEC.md` §2.5):**
+
+- Grammar `effect_decl` and `transition_decl` extended with optional
+  `trait_list?` between metadata and body. New `trait_list` non-
+  terminal added with cross-reference to `@fn`'s usage.
+- New normative bullet describing the eight predeclared imperative
+  traits — `Hardware`, `Realtime`, `Acquire`, `Release`, `SeqCst`,
+  `LockingDiscipline`, `PureState`, `Encapsulated` — along with
+  their consumers (codegen for memory-ordering markers; `cliffordc
+  audit --traits` and certification artefacts for the rest). Spec
+  is explicit that the orthogonality engine ignores `trait_list`
+  entirely, and explains why (§7's race-detection question is
+  decided by `actual_writes`, which no trait can change).
+
+**Book (`book/src/part2/22-d22-imperative-kinds.md`):**
+
+- Replaces the stub created on the unmerged Decision #25 PR with
+  ~270-line full chapter. Covers: the one-line summary, the
+  predeclared traits with their consumers, why the engine
+  deliberately ignores trait lists (separation of concerns —
+  race-detection vs memory-ordering), surface syntax + grammar,
+  a worked example (UART RX driver with full classification across
+  `#interrupt`, `#transition`, `@fn`), the full ~30-LoC
+  implementation guide (AST + parser + tests), what Decision #22
+  enables (memory-ordering codegen, real-time audit, certification,
+  encapsulation reporting), and what it explicitly doesn't (race
+  detection, `#mutates` replacement, type-system effects).
+
+What Decision #22 deliberately defers:
+
+- Codegen for `Acquire`/`Release`/`SeqCst` memory-ordering fences
+  (v0.2 codegen work).
+- `clifford-types` validation of predeclared trait names (v0.2
+  type-check work).
+- `cliffordc audit --traits` flag and certification report formats
+  (v0.2 tooling).
+- `LockingDiscipline` interaction with `#shared` fields (v0.7+
+  alongside Decision #21).
+
+Workspace remains green; clippy clean. The Decision is **locked**;
+parser/AST scaffolding ships now (this PR), downstream consumers in
+v0.2.
+
 ### Type Checker — Slice T4a: nominal types from Path-position type expressions (2026-05-01)
 
 First semantic resolution of `Path`-form type expressions in the type
