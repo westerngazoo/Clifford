@@ -263,6 +263,7 @@ basis_vector     := 'e' integer
 effect_decl      := effect_kind ident generic_params?
                     '(' params? ')' return_type?
                     effect_meta+
+                    trait_list?         // Decision #22: optional $ [...] before body
                     block
 effect_kind      := '#effect' | '#interrupt'
 
@@ -280,8 +281,19 @@ atomic_clause        := '#atomic'        ':' atomic_kind
 priority_level       := 'LOW' | 'MEDIUM' | 'HIGH' | integer
 atomic_kind          := 'interrupt_critical' | 'multicore_critical' | ident
 
-transition_decl  := '#transition' ident ':' ident '->' ident block
-                    // named transition: #transition <name>: Source -> Target { body }
+transition_decl  := '#transition' ident ('->' ident)? trait_list? block
+                    // named transition (Refinement #5b); destination optional
+                    // for monoid automata. Decision #22: optional $ [...]
+                    // before body.
+
+trait_list       := '$' '[' trait_ref (',' trait_ref)* ']'
+                    // Decision #22 extends @fn's trait-list mechanism
+                    // (Decision #2) to #effect / #interrupt / #transition.
+                    // Predeclared imperative traits — Hardware, Realtime,
+                    // Acquire, Release, SeqCst, LockingDiscipline,
+                    // PureState, Encapsulated — classify mutation kind for
+                    // codegen, `cliffordc audit`, and certification consumers.
+                    // The orthogonality engine (§7) ignores trait_list.
 
 interface_decl   := '#interface' ident generic_params? '{' interface_method* '}'
 interface_method := 'effect' ident '(' params? ')' return_type? ';'
@@ -316,6 +328,20 @@ sequential_attr  := '@sequential' '(' ident ',' ident ')' ';'
 - **Interface declarations (Decision #16):** an `#interface` lists effect signatures (`effect name(params) -> ret;`); `#mutates: [self]` is implicit and refers to the implementing automaton at monomorphization. Multiple `#impl Interface for Automaton { … }` blocks provide bodies; coherence (one impl per `(Interface, Automaton)` pair) is checked in §5.
 - **Test declarations (Decision #7):** `#test "name" { body }` is a top-level item with mixed-layer access. Each test runs in isolation; automata are reset to their declared initial state before each test invocation. Tests are discovered by `cliffordc test` and elided from production binaries.
 - **Sequential attribute (Decision #11):** `@sequential(A, B);` at top level is a *trusted assertion* that the named automata never run concurrently. Consumed by the GA engine (§7.3) to suppress orthogonality checks between the named pair. The attribute is symmetric (`@sequential(A, B)` = `@sequential(B, A)`).
+- **Imperative trait list (Decision #22):** `#effect`, `#interrupt`, and `#transition` declarations may carry an optional `$ [TraitList]` clause between their metadata clauses (or destination, for transitions) and the body block. The mechanism is the same as Decision #2's `@fn` trait list (same parse rule, same `TraitRef` AST shape) but the semantics are *classification* rather than purity. Predeclared imperative traits, with their meanings:
+
+  | Trait | Meaning |
+  |---|---|
+  | `Hardware` | Mutates memory-mapped registers (typically `#mutates` a register-block automaton per Decision #6) |
+  | `Realtime` | Has a stated worst-case execution-time bound; permitted in real-time scheduling decisions |
+  | `Acquire` | Carries acquire memory ordering (per `Ordering::Acquire` semantics) |
+  | `Release` | Carries release memory ordering |
+  | `SeqCst` | Carries sequential consistency (the strongest ordering) |
+  | `LockingDiscipline` | Manipulates a `#shared` field's lock per Decision #21 (v0.7+) |
+  | `PureState` | Mutates only its own automaton's private state (no externally-visible side effects on other automata) |
+  | `Encapsulated` | Mutates only `#hidden`-marked fields per Decision #25 (effectively no externally-visible side effect on any state) |
+
+  These traits are *recorded by the parser verbatim* (the parser does not validate names — that's `clifford-types` semantic work). The orthogonality engine (§7) ignores `trait_list` entirely; codegen uses memory-ordering markers (`Acquire` / `Release` / `SeqCst`) to emit appropriate fences; `cliffordc audit --traits` and certification artefacts consume the rest. User-defined traits (non-predeclared identifiers) are accepted by the parser; whether they have downstream meaning is determined by the consuming tool. See `DECISIONS.md` Decision #22 for the locked design.
 
 ### 2.6 Statements and Expressions
 

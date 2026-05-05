@@ -369,9 +369,19 @@ pub struct TransitionDecl {
     /// Optional `-> NextState` target. `None` for monoid-automaton
     /// transitions and for transitions that stay in the current state.
     pub destination: Option<String>,
+    /// `$ [Trait, Trait, …]` markers per Decision #22 (extension of
+    /// Decision #2's `@fn` trait-list mechanism to imperative-layer
+    /// callables). Empty if no `$ [...]` clause appears in source.
+    /// Predeclared traits per Decision #22 — `Hardware`, `Realtime`,
+    /// `Acquire` / `Release` / `SeqCst`, `LockingDiscipline`,
+    /// `PureState`, `Encapsulated` — are validated downstream by
+    /// `clifford-types` and consumed by codegen / `cliffordc audit` /
+    /// certification. The orthogonality engine ignores them.
+    pub trait_list: Vec<TraitRef>,
     /// Transition body — sequence of statements per §2.6.
     pub body: Block,
-    /// Source span covering `#transition name (-> Dest)? { … }` end-to-end.
+    /// Source span covering `#transition name (-> Dest)? $ [...]? { … }`
+    /// end-to-end.
     pub span: Span,
 }
 
@@ -396,6 +406,10 @@ pub struct EffectDecl {
     pub mutates: Vec<String>,
     /// Automaton names listed in `#cannot_mutate: [...]`. Optional.
     pub cannot_mutate: Vec<String>,
+    /// `$ [Trait, Trait, …]` markers per Decision #22. Empty if no
+    /// `$ [...]` clause appears in source. See [`TransitionDecl::trait_list`]
+    /// for predeclared trait set and consumer responsibilities.
+    pub trait_list: Vec<TraitRef>,
     /// Effect body — sequence of statements.
     pub body: Block,
     /// Source span covering the full declaration end-to-end.
@@ -424,6 +438,12 @@ pub struct InterruptDecl {
     pub mutates: Vec<String>,
     /// Required `#priority: …` per §2.5 effect_meta requirements for `#interrupt`.
     pub priority: PriorityLevel,
+    /// `$ [Trait, Trait, …]` markers per Decision #22. Empty if no
+    /// `$ [...]` clause appears in source. See [`TransitionDecl::trait_list`]
+    /// for predeclared trait set and consumer responsibilities. Particularly
+    /// relevant on `#interrupt`s for `Hardware` / `Realtime` classification
+    /// and for memory-ordering markers (`Acquire` / `Release` / `SeqCst`).
+    pub trait_list: Vec<TraitRef>,
     /// Interrupt handler body — sequence of statements.
     pub body: Block,
     /// Source span covering the full declaration.

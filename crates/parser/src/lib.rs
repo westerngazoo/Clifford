@@ -620,11 +620,21 @@ impl<'t> Parser<'t> {
         } else {
             None
         };
+        // Decision #22: optional `$ [TraitList]` between the destination
+        // (if any) and the body block. Mirrors the @fn / fn-pointer
+        // placement convention.
+        let trait_list = if matches!(self.peek().kind, TokenKind::Dollar) {
+            let (list, _) = self.parse_trait_list()?;
+            list
+        } else {
+            Vec::new()
+        };
         let body = self.parse_block()?;
         let end = body.span.end;
         Ok(TransitionDecl {
             name,
             destination,
+            trait_list,
             body,
             span: Span::new(start, end),
         })
@@ -651,6 +661,15 @@ impl<'t> Parser<'t> {
 
         let (mutates, cannot_mutate) = self.parse_effect_meta_for_effect()?;
 
+        // Decision #22: optional `$ [TraitList]` after the `#mutates` /
+        // `#cannot_mutate` metadata, before the body block.
+        let trait_list = if matches!(self.peek().kind, TokenKind::Dollar) {
+            let (list, _) = self.parse_trait_list()?;
+            list
+        } else {
+            Vec::new()
+        };
+
         let body = self.parse_block()?;
         let end = body.span.end;
         Ok(EffectDecl {
@@ -659,6 +678,7 @@ impl<'t> Parser<'t> {
             return_type,
             mutates,
             cannot_mutate,
+            trait_list,
             body,
             span: Span::new(start, end),
         })
@@ -681,6 +701,15 @@ impl<'t> Parser<'t> {
 
         let (mutates, priority) = self.parse_effect_meta_for_interrupt(start)?;
 
+        // Decision #22: optional `$ [TraitList]` after `#mutates` / `#priority`
+        // metadata, before the body block.
+        let trait_list = if matches!(self.peek().kind, TokenKind::Dollar) {
+            let (list, _) = self.parse_trait_list()?;
+            list
+        } else {
+            Vec::new()
+        };
+
         let body = self.parse_block()?;
         let end = body.span.end;
         Ok(InterruptDecl {
@@ -689,6 +718,7 @@ impl<'t> Parser<'t> {
             return_type,
             mutates,
             priority,
+            trait_list,
             body,
             span: Span::new(start, end),
         })
@@ -5729,6 +5759,191 @@ mod tests {
                 assert_eq!(trait_list[0].name, "Pure");
             }
             other => panic!("expected cmd_is_help, got {:?}", other),
+        }
+    }
+
+    // ─── Decision #22: $ [TraitList] on #effect / #interrupt / #transition ──
+
+    #[test]
+    fn effect_with_trait_list_single() {
+        let p = parse_str(
+            "#automaton Counter { value: u32; } \
+             #effect tick() #mutates: [Counter] $ [Realtime] { }",
+        )
+        .expect("parse #effect $ [Realtime]");
+        match &p.items[1] {
+            Item::Effect(EffectDecl { trait_list, .. }) => {
+                assert_eq!(trait_list.len(), 1);
+                assert_eq!(trait_list[0].name, "Realtime");
+            }
+            other => panic!("expected Effect, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn effect_with_trait_list_multi() {
+        let p = parse_str(
+            "#automaton Mmio { ctl: u32; } \
+             #effect setup() #mutates: [Mmio] $ [Hardware, Realtime, SeqCst] { }",
+        )
+        .expect("parse multi-trait effect");
+        match &p.items[1] {
+            Item::Effect(EffectDecl { trait_list, .. }) => {
+                let names: Vec<_> = trait_list.iter().map(|t| t.name.as_str()).collect();
+                assert_eq!(names, vec!["Hardware", "Realtime", "SeqCst"]);
+            }
+            other => panic!("expected Effect, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn effect_no_trait_list_keeps_empty() {
+        let p = parse_str(
+            "#automaton C { x: u32; } #effect bump() #mutates: [C] { }",
+        )
+        .expect("no $ clause");
+        match &p.items[1] {
+            Item::Effect(EffectDecl { trait_list, .. }) => assert!(trait_list.is_empty()),
+            other => panic!("expected Effect, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn effect_with_cannot_mutate_then_trait_list() {
+        // Trait list comes after #cannot_mutate (which is itself optional).
+        let p = parse_str(
+            "#automaton A { x: u32; } \
+             #automaton B { y: u32; } \
+             #effect e() #mutates: [A] #cannot_mutate: [B] $ [PureState] { }",
+        )
+        .expect("parse #cannot_mutate then $");
+        match &p.items[2] {
+            Item::Effect(EffectDecl { cannot_mutate, trait_list, .. }) => {
+                assert_eq!(cannot_mutate, &vec!["B".to_owned()]);
+                assert_eq!(trait_list.len(), 1);
+                assert_eq!(trait_list[0].name, "PureState");
+            }
+            other => panic!("expected Effect, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn interrupt_with_trait_list() {
+        let p = parse_str(
+            "#automaton Tim { count: u32; } \
+             #interrupt SysTick() #mutates: [Tim] #priority: HIGH $ [Hardware, Realtime] { }",
+        )
+        .expect("parse #interrupt with $");
+        match &p.items[1] {
+            Item::Interrupt(InterruptDecl { trait_list, .. }) => {
+                let names: Vec<_> = trait_list.iter().map(|t| t.name.as_str()).collect();
+                assert_eq!(names, vec!["Hardware", "Realtime"]);
+            }
+            other => panic!("expected Interrupt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn interrupt_no_trait_list_keeps_empty() {
+        let p = parse_str(
+            "#automaton T { x: u32; } \
+             #interrupt SysTick() #mutates: [T] #priority: HIGH { }",
+        )
+        .expect("interrupt without $");
+        match &p.items[1] {
+            Item::Interrupt(InterruptDecl { trait_list, .. }) => {
+                assert!(trait_list.is_empty());
+            }
+            other => panic!("expected Interrupt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn transition_with_trait_list() {
+        let p = parse_str(
+            "#automaton Counter { value: u32; \
+                #transition tick $ [PureState] { Counter.value = 1u32; } \
+              }",
+        )
+        .expect("parse transition with $");
+        match &p.items[0] {
+            Item::Automaton(AutomatonDecl { transitions, .. }) => {
+                assert_eq!(transitions.len(), 1);
+                assert_eq!(transitions[0].trait_list.len(), 1);
+                assert_eq!(transitions[0].trait_list[0].name, "PureState");
+            }
+            other => panic!("expected Automaton, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn transition_with_destination_then_trait_list() {
+        // Destination clause `-> Next` comes before `$ [...]`.
+        let p = parse_str(
+            "#automaton M { #states: [A, B]; \
+                #transition step -> B $ [Realtime] { } \
+              }",
+        )
+        .expect("parse `-> Dest` then $");
+        match &p.items[0] {
+            Item::Automaton(AutomatonDecl { transitions, .. }) => {
+                assert_eq!(transitions[0].destination.as_deref(), Some("B"));
+                assert_eq!(transitions[0].trait_list.len(), 1);
+                assert_eq!(transitions[0].trait_list[0].name, "Realtime");
+            }
+            other => panic!("expected Automaton, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn transition_no_trait_list_keeps_empty() {
+        let p = parse_str(
+            "#automaton C { x: u32; #transition tick { } }",
+        )
+        .expect("transition without $");
+        match &p.items[0] {
+            Item::Automaton(AutomatonDecl { transitions, .. }) => {
+                assert!(transitions[0].trait_list.is_empty());
+            }
+            other => panic!("expected Automaton, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn effect_with_generic_trait_in_list() {
+        // Generic trait references work the same as on @fn.
+        let p = parse_str(
+            "#automaton Bus { f: u32; } \
+             #effect tx() #mutates: [Bus] $ [LockingDiscipline<RwLock>] { }",
+        )
+        .expect("parse generic trait on effect");
+        match &p.items[1] {
+            Item::Effect(EffectDecl { trait_list, .. }) => {
+                assert_eq!(trait_list.len(), 1);
+                assert_eq!(trait_list[0].name, "LockingDiscipline");
+                assert_eq!(trait_list[0].generic_args.len(), 1);
+            }
+            other => panic!("expected Effect, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn imperative_trait_names_pass_through_verbatim() {
+        // The parser doesn't validate predeclared trait names — it's
+        // syntactic only. Non-predeclared identifiers also parse cleanly;
+        // semantic validation (which lives in clifford-types) reports
+        // unknown traits there. This matches @fn's behaviour.
+        let p = parse_str(
+            "#automaton C { x: u32; } \
+             #effect e() #mutates: [C] $ [MadeUpTrait, AnotherUserTrait] { }",
+        )
+        .expect("user-defined trait names parse");
+        match &p.items[1] {
+            Item::Effect(EffectDecl { trait_list, .. }) => {
+                let names: Vec<_> = trait_list.iter().map(|t| t.name.as_str()).collect();
+                assert_eq!(names, vec!["MadeUpTrait", "AnotherUserTrait"]);
+            }
+            other => panic!("expected Effect, got {:?}", other),
         }
     }
 }
