@@ -229,6 +229,58 @@ correctly with E0306.
 
 Workspace remains green; clippy clean on the check crate.
 
+### Proposed — ADR 0005: Rotor-based plane-confined locks (2026-05-04)
+
+New ADR formalising a sharper interpretation of the rotor machinery
+already locked in Decision #21 / ADR 0002. **Status: Proposed.** The
+ADR reframes rotors from a same-priority *tiebreak* mechanism to the
+*acquisition primitive itself*: a `#rotor_lock L` is conceptually a
+multivector cell that gets rotated into the holder's signature plane
+on acquire, and the runtime check "is acquire possible?" reduces to
+the wedge-product the orthogonality engine already computes
+(`caller.thread_plane ∧ lock.plane`).
+
+Three properties fall out of the algebra:
+- **Mutual exclusion.** Cross-plane acquire produces a non-rotor
+  multivector (odd-grade components) → reject.
+- **Wrong-thread release detection.** `R̃_t' · R_t ≠ 1` for `t' ≠ t`
+  → reject.
+- **Re-entrancy.** Same-plane re-entry produces `R_t(2θ)`, still a
+  rotor in the holder's plane → succeed (with optional depth
+  counter — Q2 in §6).
+
+**Crucial: `exp` cost is zero at runtime.** The lowered code is a
+standard CAS-based spinlock with an integer owner-ID field; the GA
+formulation lives entirely in the *static analyzer*. This is the
+same pattern Decision #21 established: GA is the proof system, not
+the runtime.
+
+**Status remains Proposed (not Accepted)** until the five open
+questions in ADR §6 close:
+1. Thread-plane assignment (embedded vs RTOS — proposed: pool-based
+   for v0.7).
+2. Re-entrancy semantics (free / counted / forbidden — proposed:
+   counted to match POSIX expectations).
+3. Same-plane uniqueness enforcement (proposed: hard error
+   `E0539 DuplicateThreadPlane`).
+4. Who carries `θ` for release symmetry (proposed: lock owns its
+   full state).
+5. Relation to Decision #21's priority-ordering proof (proposed:
+   rotor-as-acquisition supersedes; priority becomes a derived
+   total order on planes).
+
+If accepted, this becomes a *refinement* of Decision #21 (not a
+separate decision), implementation gated to v0.7+ alongside the
+rest of the mixed-metric machinery.
+
+Diagnostic family proposed: E0535 PlaneeMismatch, E0536 NoThreadPlane,
+E0537 SharedFieldOutsideLock, E0538 ReEntryViolation, E0539
+DuplicateThreadPlane.
+
+This is a pure documentation ADR — no code changes, no spec changes
+yet. Spec amendments and `crates/ortho` extensions land per ADR
+acceptance and per Decision #21's v0.7 milestone.
+
 ### Type Checker — Slice T4a: nominal types from Path-position type expressions (2026-05-01)
 
 First semantic resolution of `Path`-form type expressions in the type
