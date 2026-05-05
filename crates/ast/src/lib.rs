@@ -313,6 +313,17 @@ pub struct AutomatonField {
     /// Whether this field is private (default, v0.1) or shared (v0.7+).
     /// See [`FieldKind`].
     pub kind: FieldKind,
+    /// `#hidden` modifier per Decision #25 (algebraic-trivial encapsulation).
+    /// `true` if the field is marked `#hidden`, `false` otherwise. A hidden
+    /// field's basis vector cannot appear in the `actual_writes` set of any
+    /// callable outside the owning automaton's surface; `clifford-resolve`
+    /// (slice R3 `require_field` check) emits `E0407 HiddenFieldNotAccessible`
+    /// when an outside callable references one. The orthogonality engine
+    /// itself has no special machinery — the field simply doesn't enter
+    /// non-owning callables' basis assignment, so the wedge product never
+    /// collapses against it from outside ("the bit isn't there for outsiders
+    /// to refer to"). Order-independent with `offset` / `access`.
+    pub hidden: bool,
     /// Source span covering the whole field declaration end-to-end.
     pub span: Span,
 }

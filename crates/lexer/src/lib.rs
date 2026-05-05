@@ -217,6 +217,12 @@ pub enum TokenKind {
     KwHashStaged,
     /// `#audit` annotation (Decision #18, reserved for v0.2)
     KwHashAudit,
+    /// `#hidden` per-field encapsulation modifier (Decision #25).
+    /// Marks an automaton field as private to the owning automaton's
+    /// transitions; outside callables cannot reference it. Algebraic-
+    /// trivial-orthogonality: the field's basis vector simply doesn't
+    /// appear in non-owning callables' `actual_writes`.
+    KwHashHidden,
     /// `#shared` field qualifier (Decision #21, reserved for v0.7+).
     /// Lexes as a token so source compatibility holds across the v0.7
     /// transition; the parser rejects with a "reserved for v0.7" diagnostic.
@@ -1055,6 +1061,8 @@ impl<'src> Lexer<'src> {
             "staged" => TokenKind::KwHashStaged,
             "flush" => TokenKind::KwHashFlush,
             "audit" => TokenKind::KwHashAudit,
+            // Decision #25 — `#hidden` field encapsulation modifier.
+            "hidden" => TokenKind::KwHashHidden,
             // Reserved for v0.7+ — Decision #21 (shared automata via mutator
             // multivectors). Lexed so source compatibility holds across the
             // v0.7 transition; the parser will reject these with a
@@ -1392,6 +1400,7 @@ mod tests {
                    #unchecked_load #unchecked_store #volatile_load #volatile_store \
                    #unchecked_cast #unchecked_offset #asm #free \
                    #staged #flush #audit \
+                   #hidden \
                    #shared #lock #with_lock #reads #rotor";
         let expected = vec![
             TokenKind::KwHashAutomaton,
@@ -1425,6 +1434,8 @@ mod tests {
             TokenKind::KwHashStaged,
             TokenKind::KwHashFlush,
             TokenKind::KwHashAudit,
+            // Decision #25 — `#hidden` field encapsulation modifier.
+            TokenKind::KwHashHidden,
             // Decision #21 — reserved for v0.7+ but lexed today.
             TokenKind::KwHashShared,
             TokenKind::KwHashLock,

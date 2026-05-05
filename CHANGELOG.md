@@ -7,6 +7,84 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Decision #25: `#hidden` field encapsulation (parser + resolver + book Ch. 25) (2026-05-04)
+
+First implementation of Decision #25 (locked 2026-05-03): a per-field
+`#hidden` modifier on automaton fields with algebraic-trivial-
+orthogonality semantics. A hidden field's basis vector cannot enter
+the `actual_writes` set of any callable outside the owning automaton
+(because the resolver rejects the reference), so the §7.4 wedge
+product never collapses against it from outside. **Encapsulation by
+construction; no engine machinery.**
+
+**Lexer (`crates/lexer`):**
+- New `TokenKind::KwHashHidden` for the `#hidden` keyword.
+- Added to the `all_imperative_sigil_forms` test alongside `#offset`,
+  `#access`, etc.
+
+**AST (`crates/ast`):**
+- `AutomatonField` gains `pub hidden: bool` (default `false`),
+  orthogonal to the existing `kind: FieldKind` axis (Decision #21).
+
+**Parser (`crates/parser`):**
+- `parse_automaton_field` accepts `#hidden` as a third field-meta
+  clause, in any order with `#offset` and `#access`. Duplicate
+  `#hidden` is `ParseError::DuplicateClause("#hidden")`.
+- Five new tests: hidden alone, default false, hidden in any
+  intermixed order with `#offset`/`#access`, duplicate rejection,
+  multiple-fields-mixed.
+
+**Resolver (`crates/resolve`):**
+- New `ResolveError::HiddenFieldNotAccessible` (`E0407`); diagnostic
+  names the owning automaton and field by source identifier.
+- `AutomatonMeta` gains a `hidden_fields: HashMap<String,
+  HashSet<String>>` side table.
+- `require_field` extended: after confirming the field exists (E0405),
+  if it's hidden, reject unless the enclosing context is a
+  `#transition` of the *owning* automaton (i.e.,
+  `enclosing.transition_of == Some(automaton_name)`). The check is
+  six lines past the existence check.
+- Eight new tests covering every cell of the visibility table:
+  accessible from owning transition (positive control), inaccessible
+  from `#effect #mutates: [A]`, from another automaton's transition,
+  from `@fn`, from full-path cross-automaton reference; non-hidden
+  remains accessible (negative control); E0407 distinct from E0405;
+  hidden array indexed write inside `#mutate` block from owning
+  transition.
+
+**Spec (`docs/CLIFFORD_SPEC.md`):**
+- §2.5 grammar: `field_attr` extended with the new `#hidden`
+  alternative; added a normative bullet describing the semantic
+  intent (algebraic-trivial orthogonality) and the E0407 visibility
+  rule.
+- §3 parser-behavior: new point 6a documenting parser handling
+  alongside the existing register-block dispatch (point 6).
+- Updated §2.5's old "Decision #9 removed `#hidden` and `#visible`"
+  language to clarify the *visibility-clause system* was removed but
+  the per-field encapsulation modifier is back under Decision #25.
+
+**Book (`book/src/`):**
+- New Chapter 25 (`part2/25-d25-hidden.md`): full chapter (~440 lines)
+  covering surface syntax, the algebraic insight, the visibility
+  table (every cell), why "owning-transition only" is the right
+  scope, what `#hidden` enables, a worked UART driver example with
+  the parity-error counter, the full `~50 LoC` implementation (lexer
+  + AST + parser + resolver) so a reader could implement it
+  themselves, what `#hidden` deliberately is *not*, and
+  cross-references. Per the book's editorial bar: "someone reading
+  this should be able to write their own compiler."
+- New stub Chapters 22, 23, 24 (`part2/22-d22-imperative-kinds.md`,
+  `23-d23-haskell-clean-fn.md`, `24-d24-snapshot-operator.md`) so
+  the four locked / in-progress Decisions all have chapter slots
+  reserved. Stubs cite `DECISIONS.md` and the targeted ADRs;
+  full text lands with the respective implementation PRs.
+- `SUMMARY.md`: inserted four new Part-II entries (Ch. 22-25) and
+  renumbered Part III chapters 22-29 → 26-33, Part IV 30-37 →
+  34-41, Part V 38-42 → 42-46. File names unchanged; only chapter
+  titles in SUMMARY shift.
+- `decision-index.md`: #22-#25 rows now point to their actual
+  chapter numbers (was previously aspirational).
+
 ### Type Checker — Slice T4a: nominal types from Path-position type expressions (2026-05-01)
 
 First semantic resolution of `Path`-form type expressions in the type

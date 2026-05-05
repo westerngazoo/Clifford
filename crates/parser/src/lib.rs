@@ -500,9 +500,11 @@ impl<'t> Parser<'t> {
     }
 
     /// Parse one automaton field:
-    /// `name: TypeExpr (#offset: HEX)? (#access: MODE)?;`.
+    /// `name: TypeExpr (#hidden | #offset: HEX | #access: MODE)*;`.
     ///
-    /// `#offset` and `#access` may appear in either order; each at most once.
+    /// All three modifiers (`#hidden` per Decision #25, `#offset` and
+    /// `#access` per Decision #6) may appear in any order; each at most
+    /// once. `#hidden` is a flag (no value); the other two take values.
     fn parse_automaton_field(&mut self) -> Result<AutomatonField, ParseError> {
         let start = self.peek().span.start;
         let (name, _) = self.expect_ident("field name in automaton body")?;
@@ -511,6 +513,7 @@ impl<'t> Parser<'t> {
 
         let mut offset: Option<String> = None;
         let mut access: Option<AccessMode> = None;
+        let mut hidden = false;
         loop {
             match self.peek().kind {
                 TokenKind::KwHashOffset => {
@@ -553,6 +556,16 @@ impl<'t> Parser<'t> {
                     self.expect(TokenKind::Colon, "`:` after `#access`")?;
                     access = Some(self.parse_access_mode()?);
                 }
+                TokenKind::KwHashHidden => {
+                    if hidden {
+                        return Err(ParseError::DuplicateClause {
+                            clause: "#hidden",
+                            at: self.peek().span.start,
+                        });
+                    }
+                    self.advance();
+                    hidden = true;
+                }
                 _ => break,
             }
         }
@@ -566,6 +579,7 @@ impl<'t> Parser<'t> {
             offset,
             access,
             kind: FieldKind::Private,
+            hidden,
             span: Span::new(start, close.end),
         })
     }
@@ -5403,6 +5417,71 @@ mod tests {
             err,
             ParseError::DuplicateClause { clause: "#access", .. }
         ));
+    }
+
+    // ── #hidden (Decision #25) ───────────────────────────────────────────
+
+    #[test]
+    fn field_with_hidden_modifier() {
+        // `#hidden` is a flag (no value). The simplest form: ordinary
+        // field marked hidden.
+        let p = parse_str("#automaton X { scratch: u32 #hidden; }").unwrap();
+        let f = &auto(&p, 0).fields[0];
+        assert!(f.hidden, "expected hidden = true");
+        assert!(f.offset.is_none());
+        assert!(f.access.is_none());
+    }
+
+    #[test]
+    fn field_without_hidden_defaults_false() {
+        // Sanity: ordinary fields default to `hidden = false`.
+        let p = parse_str("#automaton X { value: u32; }").unwrap();
+        assert!(!auto(&p, 0).fields[0].hidden);
+    }
+
+    #[test]
+    fn field_hidden_with_offset_and_access_in_any_order() {
+        // Decision #25 spec example: hidden + register-block field meta
+        // intermixed in arbitrary order. Each variant parses the same way.
+        let variants = [
+            "#automaton X { status: u32 #hidden #offset: 0x04 #access: read; }",
+            "#automaton X { status: u32 #offset: 0x04 #hidden #access: read; }",
+            "#automaton X { status: u32 #offset: 0x04 #access: read #hidden; }",
+            "#automaton X { status: u32 #access: read #hidden #offset: 0x04; }",
+        ];
+        for src in variants {
+            let p = parse_str(src).unwrap_or_else(|e| panic!("{src}: {e}"));
+            let f = &auto(&p, 0).fields[0];
+            assert!(f.hidden, "src: {src}");
+            assert_eq!(f.offset.as_deref(), Some("0x04"), "src: {src}");
+            assert_eq!(f.access, Some(AccessMode::Read), "src: {src}");
+        }
+    }
+
+    #[test]
+    fn duplicate_field_hidden_rejected() {
+        // `#hidden` is a flag — repeating it is a duplicate clause error,
+        // matching the policy for `#offset` / `#access`.
+        let err = parse_str("#automaton X { f: u32 #hidden #hidden; }")
+            .expect_err("duplicate #hidden");
+        assert!(matches!(
+            err,
+            ParseError::DuplicateClause { clause: "#hidden", .. }
+        ));
+    }
+
+    #[test]
+    fn multiple_fields_with_mixed_hidden() {
+        // Multiple fields in one automaton; `#hidden` on a subset.
+        let p = parse_str(
+            "#automaton Counter { value: u32; scratch: u32 #hidden; cache: [u8; 4] #hidden; }",
+        )
+        .unwrap();
+        let fields = &auto(&p, 0).fields;
+        assert_eq!(fields.len(), 3);
+        assert!(!fields[0].hidden, "value should not be hidden");
+        assert!(fields[1].hidden, "scratch should be hidden");
+        assert!(fields[2].hidden, "cache should be hidden");
     }
 
     // ── #transition (Refinement #5b) ─────────────────────────────────────
