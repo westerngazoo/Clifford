@@ -160,6 +160,75 @@ Workspace remains green; clippy clean. The Decision is **locked**;
 parser/AST scaffolding ships now (this PR), downstream consumers in
 v0.2.
 
+### Added — Check Slice S2: §5.4 mutation-authorisation checking (2026-05-04)
+
+Second slice of `clifford-check`. Slice 1 implemented §5.5 sigil-layer
+boundary checking (rejecting `#`-constructs in `@fn` bodies); S2 walks
+the *imperative-layer* bodies that S1 deliberately skipped (`#effect`,
+`#interrupt`, `#transition`) and verifies every mutation against its
+enclosing context's authorisation set.
+
+Two new diagnostics:
+
+- **E0302 WriteToUndeclaredAutomaton.** A `#mutate A { ... }` (canonical
+  form) or `Auto.field <op>= …` (sugar) statement targets automaton `A`
+  that is **not** in the enclosing context's permitted-mutation set.
+  The set is:
+  - For an `#effect` body: the names in its `#mutates: [...]` clause.
+  - For an `#interrupt` body: the names in its `#mutates: [...]` clause.
+  - For a `#transition` body of automaton `Owner`: the singleton
+    `[Owner]` (transitions implicitly mutate only their owning
+    automaton, per Decision #5).
+  - For an `#impl` method body: the implementing automaton (Decision
+    #16's implicit `#mutates: [self]` — deferred until parser slice 7+
+    materialises method bodies).
+
+- **E0306 WriteToCannotMutate.** A `#mutate A { ... }` or sugar
+  statement targets automaton `A` that explicitly appears in the
+  enclosing `#effect`'s `#cannot_mutate: [...]` exclusion list.
+  Prohibition wins over `#mutates`-membership: if `A` is in both lists,
+  E0306 fires (the more specific user error) and E0302 is suppressed.
+
+The diagnostic display name names the enclosing callable verbatim
+(e.g. `"#effect bump"`, `"#transition tick in #automaton Counter"`)
+so users see *their* identifier, never an internal handle.
+
+What S2 deliberately defers:
+
+- **E0301 cross-boundary mutation through references.** §5.4's first
+  rule — "every mutation through a reference rooted in shared state
+  occurs inside a mutation context" — needs the type checker to
+  classify references by their root's mutability. That's post-T4b
+  territory; lands in Slice S3.
+- **E0303 unknown automaton field.** Already covered by the resolver's
+  E0405 UnknownField. Spec §5.4 was clarified to note this overlap
+  rather than duplicating the check.
+- **`#impl` method body authorisation.** Method bodies don't exist on
+  the AST yet (parser slice 7+).
+
+Tests: 15 new unit tests (40 total in `clifford-check`, was 25):
+
+- `#effect` permits declared automatons (single + multi-target +
+  canonical `#mutate` form);
+- `#effect` rejects undeclared targets (sugar + canonical form);
+- empty `#mutates: []` rejects every write;
+- `#cannot_mutate` rejects explicit-target writes (E0306);
+- `#cannot_mutate` is silent for unrelated targets;
+- E0306 wins over E0302 when both rules would fire;
+- `#interrupt` accept/reject parallel to `#effect`;
+- `#transition` implicitly permits owning automaton;
+- `#transition` rejects writes to other automata;
+- multiple errors collected in one pass;
+- Slice 1 boundary check still runs alongside S2 (no regression).
+
+Spec edit (`docs/CLIFFORD_SPEC.md` §5.4): clarified E0303 overlap
+with the resolver's E0405; fixed earlier draft text that wrongly said
+`#cannot_mutate` lists "fields" — the grammar at §2.5 has always
+taken automaton names per Decision #3, and S2 now enforces this
+correctly with E0306.
+
+Workspace remains green; clippy clean on the check crate.
+
 ### Type Checker — Slice T4a: nominal types from Path-position type expressions (2026-05-01)
 
 First semantic resolution of `Path`-form type expressions in the type
