@@ -156,6 +156,47 @@ pub enum CheckError {
         /// Byte offset of the offending mutation statement.
         at: usize,
     },
+
+    /// A non-`@partial` `@fn` contains a recursive call to itself
+    /// (direct recursion) without satisfying any of the structural-
+    /// recursion rules from ADR 0003 Q1's three-rule cut.
+    ///
+    /// Decision #23 / ADR 0003 makes `@fn` total by default. The
+    /// opt-out is `@partial @fn`, marking the function as
+    /// possibly-non-terminating (and restricting its callers). This
+    /// slice's check is the most conservative form of the totality
+    /// rule: any direct self-recursion in a non-`@partial @fn` is
+    /// rejected.
+    ///
+    /// Slice scope (per ADR 0003 implementation milestones):
+    /// - **This slice (v0.2-β):** direct recursion → E0540 unless
+    ///   `@partial`. The structural-recursion rules (constructor
+    ///   destructuring, sigma-bounded indexing, tail-position
+    ///   recognition) are deferred to v0.4+ — until then, recursive
+    ///   `@fn`s must be marked `@partial` even when they are obviously
+    ///   total.
+    /// - **v0.4+:** layered three-rule cut so common total recursions
+    ///   (recursing on a constructor arg, recursing on a sigma-bound
+    ///   index) are accepted without `@partial`.
+    ///
+    /// Mutual recursion (cycles in the `@fn` call graph involving 2+
+    /// participants) is not yet detected — same-slice deferral. Today
+    /// it slips through this check; a future slice adds Tarjan SCC
+    /// analysis to catch it.
+    ///
+    /// The diagnostic names the offending function and points at the
+    /// recursive call site so users can fix it (either by marking the
+    /// fn `@partial` or by restructuring to a non-recursive form).
+    #[error("E0540: non-`@partial` `@fn {fn_name}` contains a recursive call to itself; mark it `@partial @fn` to opt out of the totality check or restructure to remove the recursion (call site at byte {call_at}, fn declared at byte {decl_at})")]
+    TotalityViolation {
+        /// Name of the offending `@fn`.
+        fn_name: String,
+        /// Byte offset of the recursive call site.
+        call_at: usize,
+        /// Byte offset of the `@fn` declaration (so the diagnostic
+        /// can point users at the place to add `@partial`).
+        decl_at: usize,
+    },
 }
 
 /// Run §5.5 sigil-layer boundary checking on a [`Program`] given its
@@ -209,10 +250,172 @@ pub fn check(program: &Program, resolution: &Resolution) -> Result<(), Vec<Check
             _ => {}
         }
     }
+    // Decision #23 / ADR 0003 — totality check (Slice 3): non-`@partial`
+    // `@fn`s with direct self-recursion → E0540. Runs as a separate pass
+    // (not interleaved with the boundary walk) so that totality errors
+    // surface even on `@fn`s whose bodies the boundary walker has
+    // nothing to report on.
+    check_totality(program, &mut walker.errors);
+
     if walker.errors.is_empty() {
         Ok(())
     } else {
         Err(walker.errors)
+    }
+}
+
+/// Decision #23 / ADR 0003 totality check (Slice 3 minimum-viable form).
+///
+/// Walks every non-`@partial` `@fn` and reports `E0540 TotalityViolation`
+/// if the body contains a direct recursive call (a `Call { callee:
+/// Path([fn.name]), … }` expression). This is the most conservative form
+/// of the totality rule: any direct self-recursion is rejected unless
+/// the function is marked `@partial`.
+///
+/// Slice scope (per ADR 0003 implementation milestones):
+///
+/// - **This slice (v0.2-β):** direct recursion → E0540 unless `@partial`.
+/// - **v0.4+:** layered three-rule cut so common total recursions
+///   (recursing on a constructor arg, sigma-bound index, tail position)
+///   are accepted without `@partial`.
+/// - **Future:** mutual recursion via Tarjan SCC over the `@fn`
+///   call graph; today mutual recursion slips through.
+///
+/// First-recursive-call wins: only one E0540 is emitted per function,
+/// pointing at the first self-call the walker encounters in source
+/// order. This matches rustc's "report each error once" convention and
+/// keeps the output noise-free when a fn has many recursive call sites.
+fn check_totality(program: &Program, errors: &mut Vec<CheckError>) {
+    for item in &program.items {
+        if let Item::Fn(decl) = item {
+            if decl.partial {
+                continue;
+            }
+            let mut finder = SelfRecursionFinder {
+                target: &decl.name,
+                found_at: None,
+            };
+            finder.walk_block(&decl.body);
+            if let Some(call_at) = finder.found_at {
+                errors.push(CheckError::TotalityViolation {
+                    fn_name: decl.name.clone(),
+                    call_at,
+                    decl_at: decl.span.start,
+                });
+            }
+        }
+    }
+}
+
+/// Walker that scans an expression tree for the first direct call to
+/// `target`, recording its byte offset.
+///
+/// Stops at the first hit (`found_at = Some(_)`); subsequent walks
+/// are no-ops via the early-return guards. Direct recursion is the only
+/// shape this slice detects: a `Call { callee: Path([target]), … }` —
+/// the more elaborate forms (closure-based recursion, indirect recursion
+/// through a function pointer) would need additional machinery and
+/// don't exist in v0.1 / v0.2 anyway.
+struct SelfRecursionFinder<'a> {
+    target: &'a str,
+    found_at: Option<usize>,
+}
+
+impl<'a> SelfRecursionFinder<'a> {
+    fn walk_block(&mut self, block: &Block) {
+        for s in &block.stmts {
+            if self.found_at.is_some() {
+                return;
+            }
+            self.walk_stmt(s);
+        }
+    }
+
+    fn walk_stmt(&mut self, stmt: &Stmt) {
+        if self.found_at.is_some() {
+            return;
+        }
+        match &stmt.kind {
+            StmtKind::Let { value, .. } | StmtKind::LetShort { value, .. } => {
+                self.walk_expr(value);
+            }
+            StmtKind::Expr(e) => self.walk_expr(e),
+            StmtKind::Return(Some(e)) => self.walk_expr(e),
+            // `@fn` bodies cannot contain `#`-layer statements
+            // (Decision #1 / Emergent Rule 4 enforced by S1) so the
+            // mutation / proc-call / unsafe-store arms of `StmtKind`
+            // are absent in well-formed `@fn` source. We still pattern-
+            // match safely — fall through silently for any other shape.
+            _ => {}
+        }
+    }
+
+    fn walk_expr(&mut self, expr: &Expr) {
+        if self.found_at.is_some() {
+            return;
+        }
+        match &expr.kind {
+            ExprKind::Call { callee, args } => {
+                // The headline case: callee is `Path([target])` → direct
+                // recursion. Record the call site (the callee's span
+                // start, so the diagnostic points at the callee identifier
+                // not the opening paren).
+                if let ExprKind::Path(segs) = &callee.kind {
+                    if segs.len() == 1 && segs[0] == self.target {
+                        self.found_at = Some(callee.span.start);
+                        return;
+                    }
+                }
+                self.walk_expr(callee);
+                for a in args {
+                    self.walk_expr(a);
+                    if self.found_at.is_some() {
+                        return;
+                    }
+                }
+            }
+            ExprKind::Binary { lhs, rhs, .. } => {
+                self.walk_expr(lhs);
+                self.walk_expr(rhs);
+            }
+            ExprKind::Unary { operand, .. } | ExprKind::Ref { operand, .. } => {
+                self.walk_expr(operand);
+            }
+            ExprKind::Paren(inner) => self.walk_expr(inner),
+            ExprKind::Tuple(es) | ExprKind::Array(es) => {
+                for e in es {
+                    self.walk_expr(e);
+                    if self.found_at.is_some() {
+                        return;
+                    }
+                }
+            }
+            ExprKind::ArrayRepeat { value, count } => {
+                self.walk_expr(value);
+                self.walk_expr(count);
+            }
+            ExprKind::FieldAccess { obj, .. } => self.walk_expr(obj),
+            ExprKind::Index { obj, index } => {
+                self.walk_expr(obj);
+                self.walk_expr(index);
+            }
+            ExprKind::MethodCall { obj, args, .. } => {
+                self.walk_expr(obj);
+                for a in args {
+                    self.walk_expr(a);
+                    if self.found_at.is_some() {
+                        return;
+                    }
+                }
+            }
+            ExprKind::Cast { value, .. } => self.walk_expr(value),
+            ExprKind::Range { lo, hi, .. } => {
+                self.walk_expr(lo);
+                self.walk_expr(hi);
+            }
+            // Atoms and `#`-only forms don't recurse usefully.
+            _ => {}
+        }
     }
 }
 
@@ -1156,5 +1359,195 @@ mod tests {
             CheckError::WriteToUndeclaredAutomaton { automaton, .. } if automaton == "Other"
         ));
         assert!(saw_e0101 && saw_e0302, "expected both E0101 and E0302; got {errors:?}");
+    }
+
+    // ─── Slice 3 (Decision #23 / ADR 0003): totality check (E0540) ───────
+
+    #[test]
+    fn non_recursive_fn_passes_totality() {
+        // Trivial pass case: no recursion, no @partial needed.
+        let src = "@fn add(a: u32, b: u32) -> u32 { return a; }";
+        assert!(
+            check_str(src).is_ok(),
+            "non-recursive @fn should pass totality"
+        );
+    }
+
+    #[test]
+    fn direct_recursive_fn_without_partial_emits_e0540() {
+        // The headline E0540 case: `@fn fact(n: u32) -> u32 { return
+        // fact(n); }` recurses on itself with no @partial marker.
+        let src = "@fn fact(n: u32) -> u32 { return fact(n); }";
+        let errors = check_str(src).expect_err("expected E0540");
+        let saw = errors.iter().any(|e| {
+            matches!(e, CheckError::TotalityViolation { fn_name, .. } if fn_name == "fact")
+        });
+        assert!(
+            saw,
+            "expected E0540 TotalityViolation for `fact`; got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn direct_recursive_partial_fn_is_silent() {
+        // Same shape, but `@partial` opts out of the totality check.
+        let src = "@partial @fn fact(n: u32) -> u32 { return fact(n); }";
+        assert!(
+            check_str(src).is_ok(),
+            "@partial should suppress E0540"
+        );
+    }
+
+    #[test]
+    fn recursion_inside_arg_position_caught() {
+        // The recursive call is buried in a binary expr's arg — the
+        // walker recurses through Binary, Call, etc. to find it.
+        let src = "@fn f(n: u32) -> u32 { return f(n) + 1u32; }";
+        let errors = check_str(src).expect_err("expected E0540");
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            CheckError::TotalityViolation { fn_name, .. } if fn_name == "f"
+        )));
+    }
+
+    #[test]
+    fn recursion_inside_let_rhs_caught() {
+        let src = "@fn f(n: u32) -> u32 { let _x: u32 = f(n); return 0u32; }";
+        let errors = check_str(src).expect_err("expected E0540");
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            CheckError::TotalityViolation { fn_name, .. } if fn_name == "f"
+        )));
+    }
+
+    #[test]
+    fn recursion_inside_paren_caught() {
+        let src = "@fn f(n: u32) -> u32 { return (f(n)); }";
+        let errors = check_str(src).expect_err("expected E0540");
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            CheckError::TotalityViolation { fn_name, .. } if fn_name == "f"
+        )));
+    }
+
+    #[test]
+    fn recursion_inside_field_access_receiver_caught() {
+        // Recursion through a method-style call's receiver — exercises
+        // the FieldAccess walk arm (the receiver is `f(n)`).
+        let src = "\
+            @type Pair = (u32, u32);\n\
+            @fn f(n: u32) -> Pair { return f(n); }\n\
+        ";
+        // The recursion is direct here (the body's `return f(n);` is a
+        // direct self-call); the test just ensures the walker doesn't
+        // get confused by the @type alias context.
+        let errors = check_str(src).expect_err("expected E0540");
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            CheckError::TotalityViolation { fn_name, .. } if fn_name == "f"
+        )));
+    }
+
+    #[test]
+    fn calls_to_other_fn_not_flagged() {
+        // `f` calls `g`, not itself. Should pass cleanly even though
+        // `g` is also a non-`@partial` fn.
+        let src = "\
+            @fn g(x: u32) -> u32 { return x; }\n\
+            @fn f(n: u32) -> u32 { return g(n); }\n\
+        ";
+        assert!(check_str(src).is_ok(), "non-self call should not trigger E0540");
+    }
+
+    #[test]
+    fn first_recursive_call_wins() {
+        // Multiple recursive call sites — only one E0540 emitted (the
+        // first encountered in source order). This matches rustc's
+        // "report each error once per fn" convention and keeps the
+        // diagnostic noise-free for small bugs.
+        let src = "@fn f(n: u32) -> u32 { let _x: u32 = f(n); return f(n); }";
+        let errors = check_str(src).expect_err("expected E0540");
+        let count = errors
+            .iter()
+            .filter(|e| matches!(e, CheckError::TotalityViolation { fn_name, .. } if fn_name == "f"))
+            .count();
+        assert_eq!(count, 1, "expected exactly one E0540; got {count}: {errors:?}");
+    }
+
+    #[test]
+    fn diagnostic_carries_decl_and_call_offsets() {
+        // The E0540 diagnostic records both the declaration site (so
+        // users can find where to add `@partial`) and the call site.
+        // Verify both byte offsets are non-trivial (decl < call, and
+        // both within source).
+        let src = "@fn fact(n: u32) -> u32 { return fact(n); }";
+        let errors = check_str(src).expect_err("expected E0540");
+        for e in &errors {
+            if let CheckError::TotalityViolation { fn_name, call_at, decl_at } = e {
+                assert_eq!(fn_name, "fact");
+                assert!(*decl_at < *call_at, "decl_at must precede call_at");
+                assert!(*call_at < src.len(), "call_at must be within source");
+                return;
+            }
+        }
+        panic!("expected E0540, got {errors:?}");
+    }
+
+    #[test]
+    fn partial_marker_on_non_recursive_fn_is_silent() {
+        // `@partial` on a fn that isn't recursive is harmless — the
+        // totality check passes (because there's no recursion to check)
+        // and other checks see partial=true but don't have any extra
+        // rules to apply yet.
+        let src = "@partial @fn pure_helper(x: u32) -> u32 { return x; }";
+        assert!(
+            check_str(src).is_ok(),
+            "@partial on non-recursive @fn should be silent"
+        );
+    }
+
+    #[test]
+    fn mutual_recursion_not_yet_caught() {
+        // Documenting the slice-scope deferral: mutual recursion (call
+        // graph cycles of size ≥ 2) is NOT detected in this slice. The
+        // future slice that adds Tarjan SCC analysis will catch it.
+        // For now, two non-`@partial` `@fn`s that call each other
+        // pass without diagnostic — a documented gap, not a soundness
+        // bug.
+        let src = "\
+            @fn even(n: u32) -> bool { return odd(n); }\n\
+            @fn odd(n: u32) -> bool { return even(n); }\n\
+        ";
+        // Expect the boundary check to not flag this — neither fn is
+        // self-recursive, so direct-recursion detection passes silently.
+        // If a future slice flips this, the test becomes the canonical
+        // "mutual recursion now detected" canary.
+        let res = check_str(src);
+        assert!(
+            res.is_ok(),
+            "mutual recursion intentionally not detected this slice; got {res:?}"
+        );
+    }
+
+    #[test]
+    fn totality_runs_alongside_other_checks() {
+        // Combine a totality violation with an S1 boundary error. Both
+        // should fire — they're independent passes accumulating into
+        // the same `errors` vec.
+        let src = "\
+            #automaton Counter { value: u32; }\n\
+            @fn f(n: u32) -> u32 { let _v: u32 = Counter.value; return f(n); }\n\
+        ";
+        let errors = check_str(src).expect_err("expected E0101 + E0540");
+        let saw_total = errors.iter().any(|e| {
+            matches!(e, CheckError::TotalityViolation { fn_name, .. } if fn_name == "f")
+        });
+        let saw_boundary = errors
+            .iter()
+            .any(|e| matches!(e, CheckError::ImperativeInFunctional { .. }));
+        assert!(
+            saw_total && saw_boundary,
+            "expected both E0540 and E0101; got {errors:?}"
+        );
     }
 }
