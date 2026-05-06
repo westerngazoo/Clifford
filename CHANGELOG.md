@@ -7,6 +7,104 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Type Checker — Slice T4c: generic alias substitution + E0518/E0519 path validation (2026-05-05)
+
+Third slice of type-checker path-resolution work. T4a translated
+paths to `Type::Nominal` verbatim; T4b followed non-generic aliases.
+T4c adds **generic alias substitution** (the headline feature) and
+the **separate validation pass** that surfaces unknown-name and
+arity-mismatch diagnostics at signature time.
+
+**Implementation (`crates/types/src/lib.rs`):**
+
+- `NominalDecl` upgraded from tuple variants to struct variants
+  carrying generic-parameter names:
+  - `Alias { params: Vec<String>, target: Type }`
+  - `Adt { params: Vec<String> }`
+- New `Type::substitute(&HashMap<&str, &Type>) -> Type` helper:
+  walks the type tree replacing single-segment `Nominal` leaves
+  whose name matches a key in the mapping. Recurses through `Ref`,
+  `Array`, `Slice`, `Tuple`, `Range`, and the args of generic-arg
+  nominals; preserves atoms (`Unit`, `Primitive`, `StringSlice`,
+  `Unknown`).
+- `TypeRegistry::unfold_one` extended: when a nominal has args
+  matching the alias's params arity, builds a `param-name → arg`
+  mapping and applies `Type::substitute` to the alias body. Arity
+  mismatches return `None` (don't unfold) — the validation pass
+  reports E0519 separately.
+- New `validate_nominal_paths(program, registry, errors)` pass
+  walks every type-bearing position in the AST (`@fn` /
+  `#effect` / `#interrupt` params + return types + bodies,
+  `#automaton` field types + transition bodies, `@type`
+  alias/ADT body type expressions) and validates each path
+  against the registry. Threads `params_in_scope: &[String]`
+  through the recursion so a `@type Pair<T> = (T, T);` body
+  treats `T` as known (a generic parameter, not a missing
+  declaration).
+- Two new `TypeError` variants:
+  - `E0518 UnknownNominalType { name, at }` — path doesn't
+    resolve to any registered `@type` decl and isn't a generic
+    param in scope.
+  - `E0519 GenericArityMismatch { name, expected, actual, at }`
+    — known nominal whose arg count differs from declared arity.
+
+**Semantics enforced:**
+
+- `@type Pair<T> = (T, T);` + `Pair<u32>` ⇒ unfolds to `(u32, u32)`
+  (positive headline case).
+- `@type Both<A, B> = (A, B);` + `Both<u32, bool>` ⇒
+  `(u32, bool)`.
+- `Pair<u32, bool>` (too many args) ⇒ E0519 expected=1 actual=2.
+- `Pair` (no args) ⇒ E0519 expected=1 actual=0.
+- `NotARealType` in any type position ⇒ E0518 with the user's name.
+- `Container<NotReal>` ⇒ both `Container` (E0518) AND `NotReal`
+  (E0518) reported — generic args walked even when outer name is
+  unknown.
+- `Pair<Foo, NotReal>` ⇒ E0519 (Pair has 1 param, given 2) plus
+  E0518 (NotReal unknown) — both diagnostics surface.
+- `@type Result<T, E> = | Ok(T) | Err(E);` + `Result<u32, bool>`
+  ⇒ silent (ADT arity-checked, body types validated under T/E
+  in scope).
+
+**What T4c deliberately defers:**
+
+- Trait-bound satisfaction on generic params (`@type Wrapper<T:
+  Copy>`) — full HM-unification work.
+- Multi-segment paths (`clifford::core::Option`) — module work,
+  T4d+. Today they always trigger E0518.
+- Variant-position resolution (`Result::Ok` in expression
+  position) — T4d.
+- Generic params on `@fn` declarations — parser slice for `@fn<T>(…)`
+  is post-T4c; the validation pass already threads
+  `params_in_scope` through, so the wiring is ready when the AST
+  catches up.
+
+**Tests:**
+
+- *Types*: 15 new T4c tests (143 total, was 128).
+  - Generic alias substitutes: one-param, two-param, used in call
+    arg.
+  - Arity mismatch: too many args; too few args; on ADT.
+  - Unknown nominal: in param / return / let-annotation / nested
+    in tuple / nested in generic args.
+  - Known alias / known ADT with correct arity → silent.
+  - `Type::substitute` direct unit tests: leaf replacement;
+    leaf-not-in-mapping unchanged; recursion through `Tuple`,
+    `Ref`, generic-arg nominals.
+- Three pre-T4c test scaffolds updated to the new
+  `NominalDecl::Alias { params, target }` struct-variant form.
+- One T4b test (`t4b_generic_args_block_alias_unfolding`)
+  re-comment-ed to reflect T4c's reading: a non-generic alias
+  given args is now an arity mismatch (handled by the validation
+  pass), not "args block unfolding."
+
+Workspace remains green; clippy clean.
+
+This closes the third T4 sub-slice. T4d (module resolution +
+ADT-variant resolution) and T4e (trait bounds, full HM unification)
+are the remaining pieces; both deferred until use cases push for
+them.
+
 ### Added — Decision #24: `@snapshot Self.field` inside `#transition` rejected as E0553 (2026-05-05)
 
 Third slice of the v0.2-β batch. Closes the last open piece from

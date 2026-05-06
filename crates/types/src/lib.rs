@@ -170,6 +170,54 @@ pub enum TypeError {
         at: usize,
     },
 
+    /// A path-position type expression names a top-level type that is
+    /// neither predeclared nor declared via `@type Name { … }` in the
+    /// program.
+    ///
+    /// Slice T4c reports this as a *signature-time* check, separate
+    /// from compatibility checking. T4a/T4b would let an unknown
+    /// nominal slip through and trigger E0512 (mismatch) downstream
+    /// when compared to anything else; T4c reports the more useful
+    /// "this name doesn't exist" diagnostic up front.
+    ///
+    /// Multi-segment paths (e.g. `clifford::core::Option`) are
+    /// always reported as unknown in T4c — module resolution lands
+    /// in T4d+. Today users referencing such paths must wait for
+    /// T4d to lift the false positive.
+    #[error("E0518: unknown type `{name}` in type position (at byte {at}); declare via `@type {name} {{ … }}` or check the spelling")]
+    UnknownNominalType {
+        /// The unresolved type name as written in source (single
+        /// segment for v0.1 / v0.2; multi-segment paths join with
+        /// `::` for the diagnostic).
+        name: String,
+        /// Byte offset of the type-expression's path.
+        at: usize,
+    },
+
+    /// A path-position type expression's number of generic arguments
+    /// does not match the declared `@type`'s arity.
+    ///
+    /// `@type Pair<T> = (T, T);` has arity 1; `Pair<u32>` works,
+    /// `Pair` (no args) and `Pair<u32, bool>` (too many) are both
+    /// E0519. The diagnostic carries the offending name and both
+    /// counts so users can fix the call site.
+    ///
+    /// Bound-trait checks on generic parameters (`T: Copy`) are full
+    /// HM-unification work and stay deferred. T4c only validates
+    /// arity.
+    #[error("E0519: `{name}` takes {expected} generic argument(s) but {actual} were supplied (at byte {at})")]
+    GenericArityMismatch {
+        /// The type name being instantiated.
+        name: String,
+        /// The declared number of generic parameters (the `@type`'s
+        /// arity).
+        expected: usize,
+        /// The number of generic arguments at the offending site.
+        actual: usize,
+        /// Byte offset of the type-expression's path.
+        at: usize,
+    },
+
     /// An `@fn` body contains a `@snapshot Auto.field` expression but
     /// the function's `$ [TraitList]` does not include `Readable` (the
     /// row that gates `@snapshot` per Decision #24 / ADR 0004).
@@ -404,6 +452,66 @@ impl Type {
     pub fn is_unknown(&self) -> bool {
         matches!(self, Self::Unknown(_))
     }
+
+    /// Substitute generic parameters by name, returning a new [`Type`].
+    ///
+    /// `mapping` maps parameter names to their replacement types.
+    /// Substitution applies at `Type::Nominal` *leaves* — single-segment
+    /// nominals with no generic args whose path matches a key in the
+    /// mapping are replaced by the mapped type. Compound types (`Ref`,
+    /// `Array`, `Slice`, `Tuple`, `Range`, generic-arg `Nominal`) are
+    /// recursed into but otherwise preserved.
+    ///
+    /// This is used by [`TypeRegistry::unfold_one`] when instantiating
+    /// a generic alias: after looking up `@type Pair<T> = (T, T);`, we
+    /// substitute `{T → u32}` in the target to yield `(u32, u32)`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// // Internal — exercised via integration tests; the substitution
+    /// // helper is not part of the public API today.
+    /// ```
+    pub(crate) fn substitute(&self, mapping: &HashMap<&str, &Type>) -> Type {
+        match self {
+            Self::Nominal { path, args } => {
+                // Leaf substitution: single-segment, no args, name matches.
+                if path.len() == 1 && args.is_empty() {
+                    if let Some(replacement) = mapping.get(path[0].as_str()) {
+                        return (*replacement).clone();
+                    }
+                }
+                // Otherwise recurse into args. The path stays as-is (it
+                // refers to a top-level type, not a generic param).
+                let new_args: Vec<Type> = args.iter().map(|a| a.substitute(mapping)).collect();
+                Self::Nominal {
+                    path: path.clone(),
+                    args: new_args,
+                }
+            }
+            Self::Ref { mutable, inner } => Self::Ref {
+                mutable: *mutable,
+                inner: Box::new(inner.substitute(mapping)),
+            },
+            Self::Array { element, size } => Self::Array {
+                element: Box::new(element.substitute(mapping)),
+                size: size.clone(),
+            },
+            Self::Slice { element } => Self::Slice {
+                element: Box::new(element.substitute(mapping)),
+            },
+            Self::Tuple(elems) => {
+                Self::Tuple(elems.iter().map(|t| t.substitute(mapping)).collect())
+            }
+            Self::Range { element, inclusive } => Self::Range {
+                element: Box::new(element.substitute(mapping)),
+                inclusive: *inclusive,
+            },
+            // Atoms — `Unit`, `Primitive(...)`, `StringSlice`,
+            // `Unknown(...)` — have no substitutable parts.
+            other => other.clone(),
+        }
+    }
 }
 
 /// The output of [`infer`] — a per-expression type map keyed by source span.
@@ -505,6 +613,11 @@ pub fn infer(program: &Program, resolution: &Resolution) -> Result<Typing, Vec<T
     // callables are not gated.
     validate_snapshot_row_gates(program, &mut walker.errors);
 
+    // Slice T4c: validate every path-position type expression in the
+    // program against the type registry. Emits E0518 for unknown
+    // nominals and E0519 for arity mismatches.
+    validate_nominal_paths(program, &type_registry, &mut walker.errors);
+
     if walker.errors.is_empty() {
         Ok(Typing {
             types: walker.types,
@@ -580,19 +693,48 @@ fn build_automaton_field_types(program: &Program) -> HashMap<String, HashMap<Str
 /// One entry in the [`TypeRegistry`] — a top-level `@type` declaration
 /// classified by what kind of body it has.
 ///
-/// Slice T4b only distinguishes aliases (whose body is a target [`Type`]
-/// to be unfolded by [`TypeRegistry::unalias`]) from ADTs (which are
-/// nominal *terminal* types — they do not unfold further, and equality
-/// is by name + args). Slice T4c+ will add variant resolution for
-/// multi-segment paths like `Result::Ok`.
+/// Slice T4b distinguished aliases from ADTs but did not capture generic
+/// parameter names. Slice T4c extends both variants with `params`
+/// (the generic-parameter names declared on the `@type`) so that
+/// generic alias substitution (`@type Pair<T> = (T, T)` applied to
+/// `Pair<u32>`) and arity validation (`Pair<u32, bool>` is `E0519`) are
+/// possible.
 #[derive(Debug, Clone)]
 enum NominalDecl {
-    /// `@type Foo = u32;` — body is the target type the alias resolves to.
-    Alias(Type),
-    /// `@type Result = | Ok(u32) | Err(bool);` — ADT: nominal, terminal,
-    /// does not unfold. Two ADT nominals are equal iff their names + args
-    /// match (per Decision #19's nominal-identity rule).
-    Adt,
+    /// `@type Foo = u32;` (params=[]) or `@type Pair<T> = (T, T);`
+    /// (params=["T"]). The `target` references generic-parameter names
+    /// as `Type::Nominal { path: [name], args: [] }` shapes (since the
+    /// parser doesn't distinguish them syntactically); substitution
+    /// at instantiation time replaces those leaves with the actual
+    /// type arguments.
+    Alias {
+        /// Generic parameter names in declaration order. Empty for
+        /// non-generic aliases.
+        params: Vec<String>,
+        /// The alias's target type, with generic parameters surviving
+        /// as same-named `Type::Nominal { path: [name], args: [] }`
+        /// leaves. [`Type::substitute`] replaces them at instantiation.
+        target: Type,
+    },
+    /// `@type Result<T, E> = | Ok(T) | Err(E);` — ADT: nominal,
+    /// terminal, does not unfold. Two ADT nominals are equal iff their
+    /// names + args match (per Decision #19). T4c records `params` for
+    /// arity validation; variant-position resolution (`Result::Ok`)
+    /// remains T4d+ work.
+    Adt {
+        /// Generic parameter names in declaration order. Empty for
+        /// non-generic ADTs.
+        params: Vec<String>,
+    },
+}
+
+impl NominalDecl {
+    /// Number of generic parameters this declaration takes.
+    fn arity(&self) -> usize {
+        match self {
+            Self::Alias { params, .. } | Self::Adt { params } => params.len(),
+        }
+    }
 }
 
 /// Registry of every top-level `@type` declaration in the program, indexed
@@ -600,44 +742,77 @@ enum NominalDecl {
 /// comparing types (so `let x: MyAlias = 0u32;` typechecks when
 /// `@type MyAlias = u32;`).
 ///
-/// Slice T4b scope: single-segment, non-generic alias following + ADT
-/// terminal-marker registration. Generic alias substitution and
-/// multi-segment variant resolution land in T4c+.
+/// Slice T4c scope:
+/// - Non-generic alias following (T4b carry-forward).
+/// - **Generic alias substitution** (T4c new): `@type Pair<T> = (T, T);`
+///   applied to `Pair<u32>` unfolds to `(u32, u32)` via
+///   [`Type::substitute`] using the alias's `params`.
+/// - **Path validation** via [`validate_nominal_paths`] reports
+///   `E0518 UnknownNominalType` and `E0519 ArityMismatch` separately.
+///
+/// Multi-segment variant resolution (`Result::Ok`) and module-qualified
+/// paths remain T4d+ work.
 #[derive(Debug)]
 struct TypeRegistry {
-    /// Map: `@type` name → declaration kind (alias target or ADT marker).
+    /// Map: `@type` name → declaration kind (alias target + params, or
+    /// ADT marker + params).
     decls: HashMap<String, NominalDecl>,
 }
 
 impl TypeRegistry {
     /// Returns true if `path` (single segment, currently) names a known
     /// top-level `@type` declaration. Multi-segment paths (e.g.
-    /// `clifford::core::Option`) always return false in T4b — module
-    /// resolution lands in T4d+.
-    #[allow(dead_code)] // used by the validation pass in T4c
+    /// `clifford::core::Option`) always return false in T4b/T4c —
+    /// module resolution lands in T4d+.
     fn is_known(&self, path: &[String]) -> bool {
         path.len() == 1 && self.decls.contains_key(&path[0])
     }
 
-    /// If `t` is a single-segment, non-generic `Type::Nominal` whose path
-    /// names a registered alias, return the alias's target type (one step,
-    /// not transitively). Returns `None` for: primitives, `Ref`/`Array`/
-    /// other compounds, ADT nominals, generic-arg nominals, multi-segment
-    /// nominals, unknown nominals.
+    /// Look up the [`NominalDecl`] for a single-segment path, if any.
+    fn lookup(&self, path: &[String]) -> Option<&NominalDecl> {
+        if path.len() != 1 {
+            return None;
+        }
+        self.decls.get(&path[0])
+    }
+
+    /// If `t` is a single-segment `Type::Nominal` whose path names a
+    /// registered alias *and the arity matches*, return the alias's
+    /// target type with generic parameters substituted by the supplied
+    /// args. One step (not transitive); [`Self::unalias`] iterates.
     ///
-    /// Generic alias instantiation (`@type Vec<T> = …` applied to
-    /// `Vec<u32>`) is T4c work; T4b only handles non-generic aliases.
+    /// Returns `None` for:
+    /// - non-`Nominal` types (primitives, `Ref`, `Array`, …)
+    /// - ADT nominals (terminal — never unfold)
+    /// - multi-segment nominals (deferred to T4d)
+    /// - unknown nominals
+    /// - **arity-mismatched nominals** (the validation pass reports
+    ///   `E0519`; unfolding silently is the right behaviour at the
+    ///   compatibility-check site since the program is already
+    ///   ill-formed and we don't want a cascade of mismatches).
     fn unfold_one(&self, t: &Type) -> Option<Type> {
         let Type::Nominal { path, args } = t else {
             return None;
         };
-        if path.len() != 1 || !args.is_empty() {
+        let decl = self.lookup(path)?;
+        let NominalDecl::Alias { params, target } = decl else {
+            return None;
+        };
+        if params.len() != args.len() {
             return None;
         }
-        match self.decls.get(&path[0])? {
-            NominalDecl::Alias(target) => Some(target.clone()),
-            NominalDecl::Adt => None,
+        if params.is_empty() {
+            // Non-generic alias — no substitution needed.
+            return Some(target.clone());
         }
+        // Build the substitution mapping (param-name → arg) and apply
+        // it to the alias body.
+        let mapping: HashMap<&str, &Type> = params
+            .iter()
+            .map(String::as_str)
+            .zip(args.iter())
+            .collect();
+        Some(target.substitute(&mapping))
     }
 
     /// Recursively unfold aliases until `t` is no longer a registered
@@ -821,6 +996,317 @@ fn validate_snapshot_row_gates(program: &Program, errors: &mut Vec<TypeError>) {
     }
 }
 
+/// Slice T4c: walk every path-position [`TypeExpr`] in the program and
+/// validate it against the [`TypeRegistry`]. Emits:
+///
+/// - `E0518 UnknownNominalType` when a single-segment path doesn't
+///   resolve to any registered `@type` decl *and* isn't a generic
+///   parameter in scope. Multi-segment paths currently always trigger
+///   E0518 — module resolution is T4d+ work.
+/// - `E0519 GenericArityMismatch` when a known nominal's generic-arg
+///   count differs from the declared arity (e.g. `Pair<u32, bool>` for
+///   `@type Pair<T> = …;`).
+///
+/// **Generic-parameter scoping (T4c):** When walking a `@type
+/// Pair<T> = (T, T);` body, `T` is treated as a known name within that
+/// body's type expressions. Same for `@fn` generic params (when those
+/// land at parser level for `@fn` signatures). The walker threads a
+/// `&[String]` slice of names-in-scope through every recursion.
+///
+/// What this slice does NOT validate:
+/// - Trait-bound satisfaction on generic params (`T: Copy`) — full
+///   HM-unification work, deferred to a later slice.
+/// - Paths inside `@trait` method signatures — Slice 6 work.
+fn validate_nominal_paths(
+    program: &Program,
+    registry: &TypeRegistry,
+    errors: &mut Vec<TypeError>,
+) {
+    let no_params: &[String] = &[];
+    for item in &program.items {
+        match item {
+            Item::Fn(decl) => {
+                // `@fn` doesn't carry generic params at the AST level
+                // yet (parser slice for `@fn<T>` is post-T4c). When it
+                // does, it'll feed them in here.
+                for p in &decl.params {
+                    walk_type_expr(&p.ty, registry, no_params, errors);
+                }
+                if let Some(rt) = &decl.return_type {
+                    walk_type_expr(rt, registry, no_params, errors);
+                }
+                walk_block_for_type_exprs(&decl.body, registry, no_params, errors);
+            }
+            Item::Effect(decl) => {
+                for p in &decl.params {
+                    walk_type_expr(&p.ty, registry, no_params, errors);
+                }
+                if let Some(rt) = &decl.return_type {
+                    walk_type_expr(rt, registry, no_params, errors);
+                }
+                walk_block_for_type_exprs(&decl.body, registry, no_params, errors);
+            }
+            Item::Interrupt(decl) => {
+                for p in &decl.params {
+                    walk_type_expr(&p.ty, registry, no_params, errors);
+                }
+                if let Some(rt) = &decl.return_type {
+                    walk_type_expr(rt, registry, no_params, errors);
+                }
+                walk_block_for_type_exprs(&decl.body, registry, no_params, errors);
+            }
+            Item::Automaton(decl) => {
+                for f in &decl.fields {
+                    walk_type_expr(&f.ty, registry, no_params, errors);
+                }
+                for tr in &decl.transitions {
+                    walk_block_for_type_exprs(&tr.body, registry, no_params, errors);
+                }
+            }
+            Item::Type(decl) => {
+                use clifford_ast::{TypeBody, VariantData};
+                // The `@type`'s own generic params are in scope inside
+                // its body — `Pair<T> = (T, T)` references `T`.
+                let params: Vec<String> =
+                    decl.generic_params.iter().map(|p| p.name.clone()).collect();
+                match &decl.body {
+                    TypeBody::Alias(te) => walk_type_expr(te, registry, &params, errors),
+                    TypeBody::Adt(variants) => {
+                        for v in variants {
+                            match &v.data {
+                                VariantData::None => {}
+                                VariantData::Tuple(types) => {
+                                    for t in types {
+                                        walk_type_expr(t, registry, &params, errors);
+                                    }
+                                }
+                                VariantData::Struct(fields) => {
+                                    for f in fields {
+                                        walk_type_expr(&f.ty, registry, &params, errors);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Other items don't carry type expressions in v0.1 / v0.2
+            // scope (or carry them in slots T4c isn't required to walk).
+            _ => {}
+        }
+    }
+}
+
+/// Recursively visit a [`TypeExpr`] and validate every nested path
+/// position. `params_in_scope` is the set of generic-parameter names
+/// the surrounding context introduced (e.g. `T` from `@type Pair<T>`).
+/// Single-segment paths matching one of those names are treated as
+/// known with arity 0 (no further check) — they're parameters, not
+/// top-level decls.
+fn walk_type_expr(
+    t: &TypeExpr,
+    registry: &TypeRegistry,
+    params_in_scope: &[String],
+    errors: &mut Vec<TypeError>,
+) {
+    match &t.kind {
+        TypeKind::Path(pt) => {
+            // Recurse into generic args first (so unknown args report
+            // even when the outer name is unknown).
+            for arg in &pt.generic_args {
+                walk_type_expr(arg, registry, params_in_scope, errors);
+            }
+            // Single-segment + matches a generic param in scope?
+            // Then it's a parameter reference (always 0-arity for now;
+            // we don't yet support higher-kinded params like `T<u32>`).
+            if pt.segments.len() == 1 && params_in_scope.contains(&pt.segments[0]) {
+                if !pt.generic_args.is_empty() {
+                    errors.push(TypeError::GenericArityMismatch {
+                        name: pt.segments[0].clone(),
+                        expected: 0,
+                        actual: pt.generic_args.len(),
+                        at: t.span.start,
+                    });
+                }
+                return;
+            }
+            // Otherwise validate against the registry.
+            if pt.segments.len() != 1 || !registry.is_known(&pt.segments) {
+                errors.push(TypeError::UnknownNominalType {
+                    name: pt.segments.join("::"),
+                    at: t.span.start,
+                });
+                return;
+            }
+            // Known top-level: arity-check.
+            if let Some(decl) = registry.lookup(&pt.segments) {
+                let expected = decl.arity();
+                let actual = pt.generic_args.len();
+                if expected != actual {
+                    errors.push(TypeError::GenericArityMismatch {
+                        name: pt.segments[0].clone(),
+                        expected,
+                        actual,
+                        at: t.span.start,
+                    });
+                }
+            }
+        }
+        TypeKind::Ref(rt) => walk_type_expr(&rt.inner, registry, params_in_scope, errors),
+        TypeKind::Array(at) => walk_type_expr(&at.element, registry, params_in_scope, errors),
+        TypeKind::Slice(st) => walk_type_expr(&st.element, registry, params_in_scope, errors),
+        TypeKind::Tuple(tt) => {
+            for elem in &tt.elements {
+                walk_type_expr(elem, registry, params_in_scope, errors);
+            }
+        }
+        TypeKind::Access(at) => walk_type_expr(&at.inner, registry, params_in_scope, errors),
+        TypeKind::Fn(ft) => {
+            for p in &ft.params {
+                walk_type_expr(p, registry, params_in_scope, errors);
+            }
+            if let Some(rt) = &ft.return_type {
+                walk_type_expr(rt, registry, params_in_scope, errors);
+            }
+        }
+        // `Unit`, `Primitive` — no nested paths.
+        _ => {}
+    }
+}
+
+/// Walk a function/effect/transition body looking for `let _: T = …;`
+/// type annotations and validate `T` against the registry. Statement-
+/// level type expressions land here; expression-level type expressions
+/// (e.g. `expr as T` casts) are also reachable through this walk.
+fn walk_block_for_type_exprs(
+    block: &Block,
+    registry: &TypeRegistry,
+    params_in_scope: &[String],
+    errors: &mut Vec<TypeError>,
+) {
+    for s in &block.stmts {
+        walk_stmt_for_type_exprs(s, registry, params_in_scope, errors);
+    }
+}
+
+fn walk_stmt_for_type_exprs(
+    stmt: &Stmt,
+    registry: &TypeRegistry,
+    params_in_scope: &[String],
+    errors: &mut Vec<TypeError>,
+) {
+    match &stmt.kind {
+        StmtKind::Let { ty, value, .. } => {
+            if let Some(annotation) = ty {
+                walk_type_expr(annotation, registry, params_in_scope, errors);
+            }
+            walk_expr_for_type_exprs(value, registry, params_in_scope, errors);
+        }
+        StmtKind::LetShort { value, .. } => {
+            walk_expr_for_type_exprs(value, registry, params_in_scope, errors);
+        }
+        StmtKind::Expr(e) => walk_expr_for_type_exprs(e, registry, params_in_scope, errors),
+        StmtKind::Return(Some(e)) => walk_expr_for_type_exprs(e, registry, params_in_scope, errors),
+        StmtKind::Mutate { assigns, .. } => {
+            for fa in assigns {
+                if let Some(idx) = &fa.index {
+                    walk_expr_for_type_exprs(idx, registry, params_in_scope, errors);
+                }
+                walk_expr_for_type_exprs(&fa.value, registry, params_in_scope, errors);
+            }
+        }
+        StmtKind::MutateShort { value, .. } => {
+            walk_expr_for_type_exprs(value, registry, params_in_scope, errors);
+        }
+        StmtKind::ProcCall { args, .. } => {
+            for a in args {
+                walk_expr_for_type_exprs(a, registry, params_in_scope, errors);
+            }
+        }
+        StmtKind::UncheckedStore { ptr, value, .. }
+        | StmtKind::VolatileStore { ptr, value, .. } => {
+            walk_expr_for_type_exprs(ptr, registry, params_in_scope, errors);
+            walk_expr_for_type_exprs(value, registry, params_in_scope, errors);
+        }
+        _ => {}
+    }
+}
+
+fn walk_expr_for_type_exprs(
+    expr: &Expr,
+    registry: &TypeRegistry,
+    params_in_scope: &[String],
+    errors: &mut Vec<TypeError>,
+) {
+    match &expr.kind {
+        ExprKind::Cast { value, ty } => {
+            walk_expr_for_type_exprs(value, registry, params_in_scope, errors);
+            walk_type_expr(ty, registry, params_in_scope, errors);
+        }
+        ExprKind::UncheckedLoad { ty, ptr } | ExprKind::VolatileLoad { ty, ptr } => {
+            walk_type_expr(ty, registry, params_in_scope, errors);
+            walk_expr_for_type_exprs(ptr, registry, params_in_scope, errors);
+        }
+        ExprKind::UncheckedCast {
+            from_ty,
+            to_ty,
+            value,
+            ..
+        } => {
+            walk_type_expr(from_ty, registry, params_in_scope, errors);
+            walk_type_expr(to_ty, registry, params_in_scope, errors);
+            walk_expr_for_type_exprs(value, registry, params_in_scope, errors);
+        }
+        ExprKind::UncheckedOffset { ty, ptr, n } => {
+            walk_type_expr(ty, registry, params_in_scope, errors);
+            walk_expr_for_type_exprs(ptr, registry, params_in_scope, errors);
+            walk_expr_for_type_exprs(n, registry, params_in_scope, errors);
+        }
+        ExprKind::Call { callee, args } => {
+            walk_expr_for_type_exprs(callee, registry, params_in_scope, errors);
+            for a in args {
+                walk_expr_for_type_exprs(a, registry, params_in_scope, errors);
+            }
+        }
+        ExprKind::MethodCall { obj, args, .. } => {
+            walk_expr_for_type_exprs(obj, registry, params_in_scope, errors);
+            for a in args {
+                walk_expr_for_type_exprs(a, registry, params_in_scope, errors);
+            }
+        }
+        ExprKind::Binary { lhs, rhs, .. } => {
+            walk_expr_for_type_exprs(lhs, registry, params_in_scope, errors);
+            walk_expr_for_type_exprs(rhs, registry, params_in_scope, errors);
+        }
+        ExprKind::Unary { operand, .. } | ExprKind::Ref { operand, .. } => {
+            walk_expr_for_type_exprs(operand, registry, params_in_scope, errors);
+        }
+        ExprKind::Paren(inner) => walk_expr_for_type_exprs(inner, registry, params_in_scope, errors),
+        ExprKind::Tuple(es) | ExprKind::Array(es) => {
+            for e in es {
+                walk_expr_for_type_exprs(e, registry, params_in_scope, errors);
+            }
+        }
+        ExprKind::ArrayRepeat { value, count } => {
+            walk_expr_for_type_exprs(value, registry, params_in_scope, errors);
+            walk_expr_for_type_exprs(count, registry, params_in_scope, errors);
+        }
+        ExprKind::FieldAccess { obj, .. } => {
+            walk_expr_for_type_exprs(obj, registry, params_in_scope, errors);
+        }
+        ExprKind::Index { obj, index } => {
+            walk_expr_for_type_exprs(obj, registry, params_in_scope, errors);
+            walk_expr_for_type_exprs(index, registry, params_in_scope, errors);
+        }
+        ExprKind::Range { lo, hi, .. } => {
+            walk_expr_for_type_exprs(lo, registry, params_in_scope, errors);
+            walk_expr_for_type_exprs(hi, registry, params_in_scope, errors);
+        }
+        // Atoms — no embedded type expressions.
+        _ => {}
+    }
+}
+
 /// Walker that scans an expression tree for the first `@snapshot`
 /// expression, recording its byte offset.
 ///
@@ -927,18 +1413,27 @@ impl SnapshotFinder {
 /// Build the [`TypeRegistry`] from every `Item::Type` in the program.
 ///
 /// Aliases get their target translated through [`type_from_type_expr`]
-/// (so a `@type Foo = u32;` registers as `NominalDecl::Alias(Primitive(U32))`).
-/// ADTs register as terminal nominal markers; their variant data is not
-/// captured in T4b (lands in T4c when variant-position references like
-/// `Result::Ok` need typing).
+/// (so a `@type Foo = u32;` registers as `NominalDecl::Alias { params:
+/// vec![], target: Primitive(U32) }`). Generic aliases capture their
+/// parameter names so [`TypeRegistry::unfold_one`] can substitute at
+/// instantiation time.
+///
+/// ADTs (`@type Result<T, E> = | Ok(T) | Err(E);`) register as
+/// terminal nominal markers carrying their generic-param arity; their
+/// variant data is not captured (variant-position resolution like
+/// `Result::Ok` is T4d+ work).
 fn build_type_registry(program: &Program) -> TypeRegistry {
     use clifford_ast::TypeBody;
     let mut decls: HashMap<String, NominalDecl> = HashMap::new();
     for item in &program.items {
         if let Item::Type(td) = item {
+            let params: Vec<String> = td.generic_params.iter().map(|p| p.name.clone()).collect();
             let entry = match &td.body {
-                TypeBody::Alias(te) => NominalDecl::Alias(type_from_type_expr(te)),
-                TypeBody::Adt(_) => NominalDecl::Adt,
+                TypeBody::Alias(te) => NominalDecl::Alias {
+                    params,
+                    target: type_from_type_expr(te),
+                },
+                TypeBody::Adt(_) => NominalDecl::Adt { params },
             };
             // First-wins on duplicate names. Resolver E0401 already reports
             // the duplicate; we just don't overwrite the registration.
@@ -2960,10 +3455,13 @@ mod tests {
         let mut decls = HashMap::new();
         decls.insert(
             "A".to_owned(),
-            NominalDecl::Alias(Type::Nominal {
-                path: vec!["A".to_owned()],
-                args: vec![],
-            }),
+            NominalDecl::Alias {
+                params: vec![],
+                target: Type::Nominal {
+                    path: vec!["A".to_owned()],
+                    args: vec![],
+                },
+            },
         );
         let registry = TypeRegistry { decls };
         let result = registry.unalias(&Type::Nominal {
@@ -2982,17 +3480,23 @@ mod tests {
         let mut decls = HashMap::new();
         decls.insert(
             "A".to_owned(),
-            NominalDecl::Alias(Type::Nominal {
-                path: vec!["B".to_owned()],
-                args: vec![],
-            }),
+            NominalDecl::Alias {
+                params: vec![],
+                target: Type::Nominal {
+                    path: vec!["B".to_owned()],
+                    args: vec![],
+                },
+            },
         );
         decls.insert(
             "B".to_owned(),
-            NominalDecl::Alias(Type::Nominal {
-                path: vec!["A".to_owned()],
-                args: vec![],
-            }),
+            NominalDecl::Alias {
+                params: vec![],
+                target: Type::Nominal {
+                    path: vec!["A".to_owned()],
+                    args: vec![],
+                },
+            },
         );
         let registry = TypeRegistry { decls };
         let result = registry.unalias(&Type::Nominal {
@@ -3007,15 +3511,19 @@ mod tests {
 
     #[test]
     fn t4b_generic_args_block_alias_unfolding() {
-        // T4b deliberately punts on generic alias instantiation (T4c
-        // work). A nominal *with* generic args therefore does NOT
-        // unfold even if a same-named alias is registered. This is
-        // the conservative choice: a future `Vec<T> = …` alias is
-        // additive, not breaking, when generic substitution lands.
+        // T4b semantics: a non-generic alias (`params=[]`) given args
+        // (`Vec<u8>` in the test) is an arity mismatch — `unfold_one`
+        // returns None so the nominal stays as-is. T4c's `unalias`
+        // preserves this conservative behaviour at the unfold site;
+        // the validation pass (`validate_nominal_paths`) is what now
+        // surfaces the diagnostic (E0519) at the source level.
         let mut decls = HashMap::new();
         decls.insert(
             "Vec".to_owned(),
-            NominalDecl::Alias(Type::Primitive(PrimitiveType::U32)),
+            NominalDecl::Alias {
+                params: vec![],
+                target: Type::Primitive(PrimitiveType::U32),
+            },
         );
         let registry = TypeRegistry { decls };
         let with_args = Type::Nominal {
@@ -3023,7 +3531,8 @@ mod tests {
             args: vec![Type::Primitive(PrimitiveType::U8)],
         };
         let result = registry.unalias(&with_args);
-        // No unfolding — args block it.
+        // Arity mismatch (alias has 0 params, call site has 1 arg) →
+        // no unfolding.
         assert_eq!(result, with_args);
     }
 
@@ -3469,5 +3978,267 @@ mod tests {
             }
         }
         panic!("expected E0550, got {errors:?}");
+    }
+
+    // ─── Slice T4c: generic alias substitution + E0518 + E0519 ──────────
+
+    #[test]
+    fn t4c_generic_alias_substitutes_to_underlying() {
+        // The headline T4c case: a generic alias `Pair<T> = (T, T)`
+        // substituted with `Pair<u32>` unfolds to `(u32, u32)`.
+        let src = "\
+            @type Pair<T> = (T, T);\n\
+            @fn f() { let _p: Pair<u32> = (1u32, 2u32); return; }\n\
+        ";
+        let res = infer_str(src);
+        assert!(
+            res.is_ok(),
+            "expected Pair<u32> to unfold to (u32, u32); got {res:?}"
+        );
+    }
+
+    #[test]
+    fn t4c_generic_alias_two_params() {
+        // Two generic params, two args.
+        let src = "\
+            @type Both<A, B> = (A, B);\n\
+            @fn f() { let _p: Both<u32, bool> = (1u32, true); return; }\n\
+        ";
+        let res = infer_str(src);
+        assert!(res.is_ok(), "expected two-param substitution; got {res:?}");
+    }
+
+    #[test]
+    fn t4c_generic_alias_arity_mismatch_too_many() {
+        let src = "\
+            @type Pair<T> = (T, T);\n\
+            @fn f() { let _p: Pair<u32, bool> = (1u32, true); return; }\n\
+        ";
+        let errors = infer_str(src).expect_err("expected E0519");
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            TypeError::GenericArityMismatch { name, expected, actual, .. }
+                if name == "Pair" && *expected == 1 && *actual == 2
+        ));
+        assert!(saw, "expected E0519 expected=1 actual=2; got {errors:?}");
+    }
+
+    #[test]
+    fn t4c_generic_alias_arity_mismatch_too_few() {
+        let src = "\
+            @type Pair<T> = (T, T);\n\
+            @fn f() { let _p: Pair = (1u32, 2u32); return; }\n\
+        ";
+        let errors = infer_str(src).expect_err("expected E0519");
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            TypeError::GenericArityMismatch { name, expected, actual, .. }
+                if name == "Pair" && *expected == 1 && *actual == 0
+        ));
+        assert!(saw, "expected E0519 expected=1 actual=0; got {errors:?}");
+    }
+
+    #[test]
+    fn t4c_unknown_nominal_emits_e0518() {
+        // T4b just propagated unknown nominals as `Type::Nominal` and
+        // let downstream mismatch. T4c surfaces the dedicated E0518
+        // diagnostic at signature time.
+        let src = "@fn f(x: NotARealType) -> u32 { return 0u32; }";
+        let errors = infer_str(src).expect_err("expected E0518");
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            TypeError::UnknownNominalType { name, .. } if name == "NotARealType"
+        ));
+        assert!(saw, "expected E0518 for `NotARealType`; got {errors:?}");
+    }
+
+    #[test]
+    fn t4c_unknown_nominal_in_return_type() {
+        let src = "@fn f() -> Phantom { return 0u32; }";
+        let errors = infer_str(src).expect_err("expected E0518");
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            TypeError::UnknownNominalType { name, .. } if name == "Phantom"
+        ));
+        assert!(saw, "expected E0518 in return type; got {errors:?}");
+    }
+
+    #[test]
+    fn t4c_unknown_nominal_in_let_annotation() {
+        let src = "@fn f() { let _x: Mystery = 0u32; return; }";
+        let errors = infer_str(src).expect_err("expected E0518 in let annotation");
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            TypeError::UnknownNominalType { name, .. } if name == "Mystery"
+        ));
+        assert!(saw, "expected E0518 in let annotation; got {errors:?}");
+    }
+
+    #[test]
+    fn t4c_unknown_nominal_inside_compound_position() {
+        // Unknown nominal nested inside a tuple type. The walker
+        // recurses through tuple elements and reports each unknown.
+        let src = "@fn f(p: (NotReal, AlsoNotReal)) -> u32 { return 0u32; }";
+        let errors = infer_str(src).expect_err("expected E0518 for nested unknowns");
+        let unknown_names: Vec<&str> = errors
+            .iter()
+            .filter_map(|e| match e {
+                TypeError::UnknownNominalType { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(unknown_names.contains(&"NotReal"));
+        assert!(unknown_names.contains(&"AlsoNotReal"));
+    }
+
+    #[test]
+    fn t4c_unknown_nominal_inside_generic_args() {
+        // `Vec<NotReal>` — registry doesn't know `NotReal`. The walker
+        // visits generic args before validating the outer name, so
+        // even when the outer name is also unknown, the inner one
+        // reports too.
+        let src = "@fn f() { let _x: Container<NotReal> = 0u32; return; }";
+        let errors = infer_str(src).expect_err("expected E0518 for nested unknown");
+        let unknown_names: Vec<&str> = errors
+            .iter()
+            .filter_map(|e| match e {
+                TypeError::UnknownNominalType { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        // Both `Container` and `NotReal` are unknown; both should
+        // surface.
+        assert!(unknown_names.contains(&"Container"));
+        assert!(unknown_names.contains(&"NotReal"));
+    }
+
+    #[test]
+    fn t4c_known_alias_with_correct_arity_silent() {
+        // Positive control: a registered, correctly-arity'd alias
+        // should NOT trigger E0518 or E0519.
+        let src = "\
+            @type Foo = u32;\n\
+            @type Pair<T> = (T, T);\n\
+            @fn f(x: Foo, p: Pair<u32>) -> Foo { return x; }\n\
+        ";
+        let res = infer_str(src);
+        assert!(
+            res.is_ok(),
+            "expected known aliases with correct arity to be silent; got {res:?}"
+        );
+    }
+
+    #[test]
+    fn t4c_known_adt_with_correct_arity_silent() {
+        // ADTs also participate in arity checking. `@type Result<T, E>
+        // = | Ok(T) | Err(E);` with `Result<u32, bool>` has arity 2 and
+        // should be accepted.
+        let src = "\
+            @type Result<T, E> = | Ok(T) | Err(E);\n\
+            @fn f(r: Result<u32, bool>) -> bool { return true; }\n\
+        ";
+        let res = infer_str(src);
+        assert!(
+            res.is_ok(),
+            "expected ADT with correct arity to be silent; got {res:?}"
+        );
+    }
+
+    #[test]
+    fn t4c_adt_arity_mismatch_emits_e0519() {
+        let src = "\
+            @type Result<T, E> = | Ok(T) | Err(E);\n\
+            @fn f(r: Result<u32>) -> bool { return true; }\n\
+        ";
+        let errors = infer_str(src).expect_err("expected E0519 on ADT");
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            TypeError::GenericArityMismatch { name, expected, actual, .. }
+                if name == "Result" && *expected == 2 && *actual == 1
+        ));
+        assert!(saw, "expected E0519 for `Result<u32>` (need 2); got {errors:?}");
+    }
+
+    #[test]
+    fn t4c_substitute_replaces_leaf_nominals() {
+        // Direct unit test for `Type::substitute`: leaf `Nominal["T"]`
+        // substitutes; `Nominal["Other"]` (not in mapping) doesn't.
+        let mapping_owner: HashMap<&str, Type> =
+            [("T", Type::Primitive(PrimitiveType::U32))].into_iter().collect();
+        let mapping: HashMap<&str, &Type> =
+            mapping_owner.iter().map(|(k, v)| (*k, v)).collect();
+
+        let t_leaf = Type::Nominal {
+            path: vec!["T".to_owned()],
+            args: vec![],
+        };
+        assert_eq!(t_leaf.substitute(&mapping), Type::Primitive(PrimitiveType::U32));
+
+        let other_leaf = Type::Nominal {
+            path: vec!["Other".to_owned()],
+            args: vec![],
+        };
+        // Not in mapping → unchanged.
+        assert_eq!(other_leaf.substitute(&mapping), other_leaf);
+    }
+
+    #[test]
+    fn t4c_substitute_recurses_into_compound_types() {
+        let mapping_owner: HashMap<&str, Type> =
+            [("T", Type::Primitive(PrimitiveType::U32))].into_iter().collect();
+        let mapping: HashMap<&str, &Type> =
+            mapping_owner.iter().map(|(k, v)| (*k, v)).collect();
+
+        // Tuple([T, T]) → Tuple([u32, u32])
+        let tuple = Type::Tuple(vec![
+            Type::Nominal {
+                path: vec!["T".to_owned()],
+                args: vec![],
+            },
+            Type::Nominal {
+                path: vec!["T".to_owned()],
+                args: vec![],
+            },
+        ]);
+        let expected = Type::Tuple(vec![
+            Type::Primitive(PrimitiveType::U32),
+            Type::Primitive(PrimitiveType::U32),
+        ]);
+        assert_eq!(tuple.substitute(&mapping), expected);
+
+        // &T → &u32
+        let r = Type::Ref {
+            mutable: false,
+            inner: Box::new(Type::Nominal {
+                path: vec!["T".to_owned()],
+                args: vec![],
+            }),
+        };
+        assert_eq!(
+            r.substitute(&mapping),
+            Type::Ref {
+                mutable: false,
+                inner: Box::new(Type::Primitive(PrimitiveType::U32)),
+            }
+        );
+    }
+
+    #[test]
+    fn t4c_generic_alias_used_in_call_arg() {
+        // `Pair<u32>` unfolded should be compatible at call sites.
+        let src = "\
+            @type Pair<T> = (T, T);\n\
+            @fn take(p: Pair<u32>) -> u32 { return 0u32; }\n\
+            @fn caller() {\n  \
+              let p: Pair<u32> = (1u32, 2u32);\n  \
+              let _y: u32 = take(p);\n  \
+              return;\n\
+            }\n\
+        ";
+        let res = infer_str(src);
+        assert!(
+            res.is_ok(),
+            "expected Pair<u32> to be compatible at call site; got {res:?}"
+        );
     }
 }
