@@ -35,36 +35,37 @@
 - [Chapter 23: Decision #23 — Tighten `@fn` toward Haskell-clean](./part2/23-d23-haskell-clean-fn.md)
 - [Chapter 24: Decision #24 — `@snapshot` boundary operator](./part2/24-d24-snapshot-operator.md)
 - [Chapter 25: Decision #25 — `#hidden` field encapsulation](./part2/25-d25-hidden.md)
+- [Chapter 26: Decision #26 — Rotor-based plane-confined locks](./part2/26-d26-rotor-plane-locks.md)
 
 # Part III — The Mathematics
 
-- [Chapter 26: Type theory primer](./part3/22-type-theory.md)
-- [Chapter 27: Category theory primer](./part3/23-category-theory.md)
-- [Chapter 28: Geometric algebra primer](./part3/24-geometric-algebra.md)
-- [Chapter 29: Two categorical layers](./part3/25-two-layers.md)
-- [Chapter 30: The orthogonality theorem](./part3/26-orthogonality.md)
-- [Chapter 31: The mixed-metric extension](./part3/27-mixed-metric.md)
-- [Chapter 32: Rotors and same-priority tiebreaks](./part3/28-rotors.md)
-- [Chapter 33: Stanley–Reisner — the road not taken](./part3/29-stanley-reisner.md)
+- [Chapter 27: Type theory primer](./part3/22-type-theory.md)
+- [Chapter 28: Category theory primer](./part3/23-category-theory.md)
+- [Chapter 29: Geometric algebra primer](./part3/24-geometric-algebra.md)
+- [Chapter 30: Two categorical layers](./part3/25-two-layers.md)
+- [Chapter 31: The orthogonality theorem](./part3/26-orthogonality.md)
+- [Chapter 32: The mixed-metric extension](./part3/27-mixed-metric.md)
+- [Chapter 33: Rotors and same-priority tiebreaks](./part3/28-rotors.md)
+- [Chapter 34: Stanley–Reisner — the road not taken](./part3/29-stanley-reisner.md)
 
 # Part IV — The Compiler
 
-- [Chapter 34: Lexer architecture](./part4/30-lexer.md)
-- [Chapter 35: Parser (recursive descent + Pratt)](./part4/31-parser.md)
-- [Chapter 36: AST design](./part4/32-ast.md)
-- [Chapter 37: Resolver](./part4/33-resolver.md)
-- [Chapter 38: Type checker](./part4/34-types.md)
-- [Chapter 39: Layer-boundary checker](./part4/35-check.md)
-- [Chapter 40: GA orthogonality engine](./part4/36-ortho.md)
-- [Chapter 41: LLVM IR emission](./part4/37-codegen.md)
+- [Chapter 35: Lexer architecture](./part4/30-lexer.md)
+- [Chapter 36: Parser (recursive descent + Pratt)](./part4/31-parser.md)
+- [Chapter 37: AST design](./part4/32-ast.md)
+- [Chapter 38: Resolver](./part4/33-resolver.md)
+- [Chapter 39: Type checker](./part4/34-types.md)
+- [Chapter 40: Layer-boundary checker](./part4/35-check.md)
+- [Chapter 41: GA orthogonality engine](./part4/36-ortho.md)
+- [Chapter 42: LLVM IR emission](./part4/37-codegen.md)
 
 # Part V — Practice
 
-- [Chapter 42: Your first Clifford program](./part5/38-first-program.md)
-- [Chapter 43: Embedded firmware patterns](./part5/39-firmware.md)
-- [Chapter 44: Kernel patterns (the Wari connection)](./part5/40-kernel.md)
-- [Chapter 45: Migration from Rust](./part5/41-migration-rust.md)
-- [Chapter 46: Migration from C](./part5/42-migration-c.md)
+- [Chapter 43: Your first Clifford program](./part5/38-first-program.md)
+- [Chapter 44: Embedded firmware patterns](./part5/39-firmware.md)
+- [Chapter 45: Kernel patterns (the Wari connection)](./part5/40-kernel.md)
+- [Chapter 46: Migration from Rust](./part5/41-migration-rust.md)
+- [Chapter 47: Migration from C](./part5/42-migration-c.md)
 
 ---
 

@@ -1,8 +1,10 @@
 # Chapter 24: Decision #24 — `@snapshot` boundary operator
 
-> **Status:** DESIGN-IN-PROGRESS. ADR forthcoming:
-> `docs/adr/0004-snapshot-boundary-operator.md`. This chapter is a
-> placeholder; full content lands once the ADR concludes.
+> **Status:** ✓ LOCKED 2026-05-05. Tracking ADR:
+> `docs/adr/0004-snapshot-boundary-operator.md` (Accepted 2026-05-05).
+> This chapter is a placeholder; full text lands with the v0.2-α
+> implementation PR (`@snapshot` lexer + AST + `Readable`-row gating
+> in `clifford-types`).
 
 ## 24.1 The one-line direction
 

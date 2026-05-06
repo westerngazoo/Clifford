@@ -1,10 +1,10 @@
 # ADR 0004: `@snapshot` Boundary Operator
 
-**Status:** Proposed (2026-05-04)
-**Date:** 2026-05-04
+**Status:** Accepted (2026-05-05)
+**Date:** 2026-05-04 (proposed) → 2026-05-05 (accepted; architect sign-off "yes to all" on the propositions)
 **Deciders:** Goose (architect)
 **Spec impact:** §2 (Grammar — new `@snapshot` expression form), §4 (Type System — snapshot-typed values), §5 (Type Checker — boundary verification), §10 (Error codes — E0550 family)
-**DECISIONS.md:** Decision #24 ✓ DESIGN-IN-PROGRESS — locks once this ADR closes.
+**DECISIONS.md:** Decision #24 ✓ LOCKED (2026-05-05) per this ADR.
 **Refines:** Decision #1 (sigil layering), Decision #21 (shared automata).
 **Companion:** ADR 0003 (Haskell-clean `@fn` discipline) — the `Readable` trait that ADR 0003 introduces is what `@snapshot` discharges.
 **Branch:** `adr/0003-0004-haskell-clean-fn-and-snapshot`.
@@ -356,12 +356,30 @@ Decision #21.
 
 ## Decision
 
-**Status: Proposed.** Resolves Decision #24's four open questions
-with concrete proposed answers. The four resolutions in §"TL;DR"
-are the core question; the additional five resolutions in §6 close
-the implementation details.
+**Status: Accepted (2026-05-05).** Architect signed off "yes to all"
+on the four core resolutions (P1–P4) and all five sub-resolutions
+(Q1–Q5).
 
-**Action items if accepted:**
+**Locked resolutions:**
+
+| # | Question | Locked resolution |
+|---|---|---|
+| P1 | Expression vs statement | **Expression.** `let v := @snapshot Counter.value;` composes in any expression position. |
+| P2 | Copy-by-value vs ref-to-snapshot | **Copy-by-value** for `Copy` types in v0.2. `@snapshot_ref` borrow form deferred to v0.4+. |
+| P3 | Interaction with `#shared` (Decision #21) | **Lock-holding proof required.** From `@fn` in v0.2: `E0552 SnapshotNeedsLockProof` (snapshot of `#shared` only from `#`-layer). Holds<L> capability row deferred to v0.4+. |
+| P4 | Backward compat with implicit-read | **Two-phase migration**: v0.2 deprecation warning (`W0001 ImplicitFieldRead`); v0.4+ hard `E0101`. |
+| Q1 | Is `@snapshot` itself "pure"? | **Not pure** — controlled effect. `Readable` trait is the marker. Two `@snapshot`s of the same field MAY observe different values; user binds to local for coherence. |
+| Q2 | `@snapshot Self.field` inside `#transition` | **`E0553 SnapshotInImperative`** — use bare `Self.field` instead. One canonical way per context. |
+| Q3 | Composite reads (`@snapshot Auto.field[expr]`) | **Single field path only** in v0.2. Indexing forms deferred to v0.4+. |
+| Q4 | Migration timing | **v0.2 warn (W0001), v0.4+ hard E0101.** Matches P4. |
+| Q5 | Explicit memory ordering on `@snapshot` | **Defer.** v0.2 implies `Acquire` for `#shared` field snapshots. Explicit `@snapshot Auto.field with_ordering(SeqCst)` deferred to v0.7+. |
+
+Atomicity rule (locked): only word-size `Copy` fields snapshot
+atomically; larger types → `E0551 SnapshotNotAtomic` (use `#shared`
++ lock). The `Readable` trait from ADR 0003 is the gate for
+`@snapshot` from `@fn` (`E0550 SnapshotInUnreadableFn`).
+
+**Action items (v0.2 implementation):**
 1. Update DECISIONS.md Decision #24 from DESIGN-IN-PROGRESS to
    ✓ LOCKED with a one-paragraph summary referencing this ADR.
 2. Reserve `@snapshot` token in the lexer.
@@ -370,7 +388,8 @@ the implementation details.
 5. Add W0001 (deprecation warning) to the warning table.
 6. Update book Ch. 24 (Decision #24 chapter) from stub to full
    chapter mirroring Ch. 25's quality bar.
-7. Update book Ch. 39's SPSC example to use `@snapshot` + `Readable`.
+7. Update book Ch. 43's (formerly Ch. 39) SPSC example to use
+   `@snapshot` + `Readable`.
 
 ---
 

@@ -1,8 +1,10 @@
 # Chapter 23: Decision #23 — Tighten `@fn` toward Haskell-clean
 
-> **Status:** DESIGN-IN-PROGRESS. ADR forthcoming:
-> `docs/adr/0003-haskell-clean-fn-discipline.md`. This chapter is a
-> placeholder; full content lands once the ADR concludes.
+> **Status:** ✓ LOCKED 2026-05-05. Tracking ADR:
+> `docs/adr/0003-haskell-clean-fn-discipline.md` (Accepted 2026-05-05).
+> This chapter is a placeholder; full text lands with the v0.2-α
+> implementation PR (totality + effect rows + sigma-bound refinements
+> on function arguments).
 
 ## 23.1 The direction
 

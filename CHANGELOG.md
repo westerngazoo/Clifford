@@ -7,6 +7,142 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Locked — Decisions #23, #24, #26 + Proposed ADR 0006 runtime distributed engine (2026-05-05)
+
+Architect signed off "yes to all" on the propositions in ADRs 0003,
+0004, and 0005. Three ADRs flip from **Proposed** to **Accepted**;
+two existing Decisions transition from DESIGN-IN-PROGRESS to
+**LOCKED**; one new Decision (#26) is added.
+
+**Decision #23 — Tighten `@fn` toward Haskell-clean.** ✓ LOCKED
+2026-05-05 per ADR 0003.
+
+- **Totality required by default** (`@partial @fn` opt-out;
+  Idris-style structural-recursion check; non-structural recursion
+  → `E0540`).
+- **First-class effect rows** as `$ [TraitList]` extension:
+  `Readable`, `Observable`, `Pure`, `Opaque` with row-composition
+  checking (`E0541`). `@fn → @fn` row check is one-directional;
+  `#`-layer freely calls any `@fn`.
+- **Limited refinement types** via §5.8 sigma-bound (Decision #14)
+  extension to function arguments. **No SMT in v0.2** (`E0542`);
+  SMT-backed refinements deferred to v1.0+ separate ADR.
+- `Result<_, E>` only in v0.2 (no `Throws<E>`); `Diverges` trait
+  dropped (`@partial` covers it).
+- Implementation v0.2-α: totality skeleton in `clifford-check`;
+  rows in `clifford-types`; book Ch. 23 graduates from stub.
+
+**Decision #24 — `@snapshot` boundary operator.** ✓ LOCKED
+2026-05-05 per ADR 0004.
+
+- **Expression form** (`let v := @snapshot Counter.value;`).
+- **Copy-by-value** for `Copy` types in v0.2; `@snapshot_ref`
+  borrow form deferred to v0.4+. Larger types → `E0551
+  SnapshotNotAtomic`.
+- **`#shared` snapshots require lock-holding proof** — from `@fn`
+  in v0.2: `E0552 SnapshotNeedsLockProof` (only from `#`-layer).
+- **Two-phase migration**: v0.2 deprecation warning `W0001
+  ImplicitFieldRead`; v0.4+ hard `E0101`.
+- **Not pure** — `Readable` row (from ADR 0003) is the marker.
+  `@snapshot Self.field` inside transitions → `E0553
+  SnapshotInImperative` (use bare `Self.field`).
+- Implementation v0.2-α: `@snapshot` lexer + AST; `Readable`-row
+  gating; E0550–E0553 + W0001 in §10; book Ch. 24 graduates from
+  stub; Ch. 43 (formerly Ch. 39) SPSC example migrates.
+
+**Decision #26 — Rotor-based plane-confined locks (refines #21).**
+✓ LOCKED 2026-05-05 per ADR 0005. New entry in DECISIONS.md.
+
+- Reframes rotors from same-priority *tiebreak* to *acquisition
+  primitive itself*. A `#rotor_lock L` is conceptually a multivector
+  cell; acquire is `M ← R_t · M` where `R_t = exp(-θ_t · B_t / 2)`.
+- Mutual exclusion + wrong-thread-release detection + re-entrancy
+  all fall out of the algebra. Static check is the existing wedge
+  primitive (`caller.thread_plane ∧ lock.plane`).
+- **Runtime cost is zero `exp`** — lowered code is a normal CAS
+  spinlock with integer owner-ID + depth counter. GA is the proof
+  system, not the runtime.
+- Five locked resolutions: pool-based plane assignment for v0.7
+  (default `p=16` → 8 planes); counted re-entry (POSIX-style);
+  hard error `E0539 DuplicateThreadPlane`; lock owns its full
+  state including `θ`; rotor-as-acquisition supersedes Decision
+  #21's priority-ordering proof (priority becomes derived total
+  order on planes).
+- Diagnostic family: `E0535 PlaneeMismatch`, `E0536
+  NoThreadPlane`, `E0537 SharedFieldOutsideLock`, `E0538
+  ReEntryViolation`, `E0539 DuplicateThreadPlane`.
+- Implementation gated to **v0.7+** alongside Decision #21's
+  shared-state machinery; lexer reservations land alongside the
+  existing #21 reservations.
+
+**ADRs flipped to Accepted:**
+- `docs/adr/0003-haskell-clean-fn-discipline.md` (Decision #23)
+- `docs/adr/0004-snapshot-boundary-operator.md` (Decision #24)
+- `docs/adr/0005-rotor-plane-confined-locks.md` (Decision #26)
+
+Each gains a "Locked resolutions" table in its `## Decision`
+section recording the architect's specific answers to each open
+question, so future readers see exactly what was decided and why.
+
+**DECISIONS.md updates:**
+- Decision #23, #24 transitioned from 🔬 DESIGN-IN-PROGRESS → ✓
+  LOCKED with locked-resolutions sections.
+- Decision #26 added (full entry; refines #21).
+- Decision Matrix table extended with #26.
+- Status header updated: "Decisions #1–#26 LOCKED."
+- Open Questions section text refreshed to remove obsolete
+  references to #23/#24 being in-progress.
+
+**Book updates:**
+- Ch. 23 (Haskell-clean `@fn`) status → LOCKED stub awaiting v0.2-α.
+- Ch. 24 (`@snapshot`) status → LOCKED stub awaiting v0.2-α.
+- New Ch. 26 (rotor plane locks) stub awaiting v0.7-α.
+- SUMMARY.md: Part II gains Ch. 26; Part III/IV/V renumbered by +1
+  (now 27-34 / 35-42 / 43-47).
+- decision-index.md: #23/#24 status flipped to LOCKED with ADR
+  references; #26 row added.
+
+### Proposed — ADR 0006: Runtime distributed race & deadlock detection via dynamic multivector check (2026-05-05)
+
+New ADR formalising the user's distributed-engine intuition: extend
+the GA wedge-product primitive from compile-time static check to
+runtime distributed check, scoped to **plugin / debug mode only**.
+
+The compile-time engine cannot reason about distributed peers,
+dynamic resource sharding, or cross-process coordination. This ADR
+proposes a runtime check using the *same wedge primitive*: each node
+publishes its current `Behaviour` multivector; a coordinator
+computes pairwise wedges on every join/mutation; any collapse is a
+race detected at runtime with a source-level diagnostic.
+
+Same algebra as §7. Same `&` instruction. Same diagnostic shape
+("nodes N₁ and N₂ both wrote `Resource.slice_42`"). Only the
+*lifecycle* changes — static → dynamic.
+
+**Crucial constraint:** zero impact on release builds. The runtime
+check is opt-in via `#[cliffordc::dist_check]` attribute or
+`cliffordc test --dist-check` flag; release builds elide the
+publish/check/retract instrumentation entirely.
+
+**Status remains Proposed** until the five open questions in ADR
+§6 close:
+1. Coordinator topology (proposed: central for v0.4-α, gossip
+   pluggable for v0.5+).
+2. Behaviour publication scope (proposed: per-transaction).
+3. Race response (proposed: configurable `Log | Abort | Quarantine`,
+   default `Log`).
+4. Resource basis assignment in distributed (proposed: pre-agreed
+   schema at link time; `E0702 SchemaIncompatible`).
+5. Interaction with Decision #21 / #26 (proposed: `#dist_shared`
+   field opt-in; in-process `#shared` resources unchanged).
+
+Implementation is **Phase 5+ work** (v0.4 / v0.5 alongside
+`clifford::core::sync` and networking stdlib). New crate
+`crates/dist-check`; new error-code range `E07xx` reserved in
+spec §10. Compile-time engine unchanged.
+
+This is a pure documentation ADR — no code, no spec edits yet.
+
 ### Added — Decision #25: `#hidden` field encapsulation (parser + resolver + book Ch. 25) (2026-05-04)
 
 First implementation of Decision #25 (locked 2026-05-03): a per-field
