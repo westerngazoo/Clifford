@@ -1078,12 +1078,41 @@ impl<'a> Walker<'a> {
             // ── Snapshot (Decision #24 / ADR 0004): validate the
             // automaton + field both exist; hidden-field visibility
             // (Decision #25) is enforced by `require_field` for free.
-            // Lock-holding proof for `#shared` fields (E0552) and the
-            // `Readable`-row gate from `@fn` callers (E0550) are
-            // `clifford-check` work — land in subsequent v0.2 slices.
+            // Lock-holding proof for `#shared` fields (E0552) is
+            // `clifford-check` v0.7+ work; the `Readable`-row gate
+            // (E0550) is `clifford-types` work; the
+            // inside-transition redundancy check (E0553) is
+            // `clifford-check` v0.2-β work.
+            //
+            // Special-case: when the source uses `Self` as the
+            // automaton (parser stores literal `"Self"`), resolve it
+            // to the enclosing transition's owning automaton so the
+            // existence + hidden-visibility checks operate on the
+            // real automaton name. Outside a transition (`@fn`,
+            // `#effect`, `#interrupt`), `Self` is meaningless —
+            // `require_automaton("Self", …)` correctly emits
+            // `NotAnAutomaton` for those positions.
             ExprKind::Snapshot { automaton, field } => {
-                self.require_automaton(automaton, expr.span);
-                self.require_field(automaton, field, expr.span);
+                if automaton == "Self" {
+                    if let Some(EnclosingContext {
+                        transition_of: Some(owner),
+                        ..
+                    }) = &self.enclosing
+                    {
+                        let owner = owner.clone();
+                        self.require_automaton(&owner, expr.span);
+                        self.require_field(&owner, field, expr.span);
+                    } else {
+                        self.errors.push(ResolveError::NotAnAutomaton {
+                            name: "Self".to_owned(),
+                            at: expr.span.start,
+                            found: "undefined",
+                        });
+                    }
+                } else {
+                    self.require_automaton(automaton, expr.span);
+                    self.require_field(automaton, field, expr.span);
+                }
             }
 
             // ── Compound forms: recurse ──

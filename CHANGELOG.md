@@ -7,6 +7,84 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Decision #24: `@snapshot Self.field` inside `#transition` rejected as E0553 (2026-05-05)
+
+Third slice of the v0.2-β batch. Closes the last open piece from
+Decision #24 / ADR 0004's locked Q2: `@snapshot Self.field` (or
+`@snapshot Owner.field`) inside a `#transition` body is now
+diagnosed as `E0553 SnapshotInImperative`, with the diagnostic
+suggesting the canonical bare `Self.field` form.
+
+**Parser (`crates/parser`):**
+
+- `parse_snapshot_expr` now accepts `Self` as the first segment
+  alongside ordinary `Ident`s. The parser stores the literal
+  string `"Self"` on the AST so downstream crates can pattern-match
+  on it. (Previously `@snapshot Self.field` failed to parse with
+  "expected automaton name" — meaning users hit a bare parse error
+  rather than the intended E0553.)
+- New parser test `snapshot_self_field_parses_with_self_recorded`
+  asserting the `Self` form lands as `Snapshot { automaton: "Self",
+  field: ... }`.
+
+**Resolver (`crates/resolve`):**
+
+- The `ExprKind::Snapshot` arm now special-cases `automaton ==
+  "Self"`: inside a transition body, resolves it to the enclosing
+  transition's owning automaton so the existence + hidden-field
+  checks operate on the real automaton name. Outside a transition
+  (`@fn`, `#effect`, `#interrupt`), `Self` is meaningless and
+  produces `NotAnAutomaton`.
+
+**Check (`crates/check`):**
+
+- New `CheckError::SnapshotInImperative { automaton, field,
+  transition_name, owner, at }` variant (`E0553`). Diagnostic
+  identifies the offending automaton (`"Self"` or the owner name
+  literally), the field, the enclosing transition, and the owner;
+  message reminds the user that bare `Self.field` is the canonical
+  form.
+- New `SelfSnapshotScanner` walker invoked from
+  `walk_transition_decl`. Scans the transition body for
+  `@snapshot` expressions whose automaton is `"Self"` or matches
+  the transition's owner; emits one E0553 per occurrence (unlike
+  E0540 which is first-call-wins, E0553 reports every redundant
+  snapshot since each is independently fixable).
+- Snapshots of *sibling* automata from inside a transition (e.g.
+  `@snapshot OtherAutomaton.field`) are *not* flagged — observing
+  external state is legitimate.
+
+**Semantics enforced:**
+
+- `@snapshot Self.field` in `#transition Counter::tick` → E0553
+  (canonical: bare `Self.value`).
+- `@snapshot Counter.field` in `#transition Counter::tick` → also
+  E0553 (same redundancy with explicit owner name).
+- `@snapshot OtherAutomaton.field` in any transition → silent.
+- `@snapshot Self.field` in `@fn` body → resolver emits
+  `NotAnAutomaton` (`Self` is meaningless there).
+- `@snapshot` inside `#effect` / `#interrupt` bodies → silent
+  (E0553 is transition-specific per ADR 0004 Q2).
+
+**Tests:**
+
+- *Parser*: 1 new test (236 total, was 235).
+- *Check*: 7 new tests (68 total, was 53 — earlier this batch we
+  added 13 totality tests). Coverage: `Self` field inside transition
+  → E0553; owner-name field inside transition → E0553; sibling
+  automaton silent; multiple redundant snapshots all reported;
+  snapshot in `#> proc()` arg-position caught; snapshot in
+  mutate-short RHS caught; `#effect` body snapshots silent;
+  diagnostic carries full context (`automaton`, `field`,
+  `transition_name`, `owner`, `at`).
+
+Workspace remains green; clippy clean.
+
+This closes the third of three planned slices (totality →
+snapshot typing/gating → E0553 inside transitions). Decision #24
+parser + type-inference + check support is now complete for v0.2-α/β
+scope.
+
 ### Added — Decision #24: `@snapshot` type inference + `Readable`-row gating (E0550) (2026-05-05)
 
 Second slice of v0.2-α follow-up work. The parser slice (`feat/v0.2a-

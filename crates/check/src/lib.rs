@@ -157,6 +157,42 @@ pub enum CheckError {
         at: usize,
     },
 
+    /// A `#transition` body contains `@snapshot Self.field` (or
+    /// `@snapshot Owner.field` where `Owner` is the transition's
+    /// own automaton). Per Decision #24 / ADR 0004 Q2, the canonical
+    /// inside-transition read is **bare `Self.field`**, not the
+    /// `@snapshot` form. The boundary-crossing operator exists for
+    /// `@fn`-side reads, where the imperative state crosses into
+    /// pure analysis; from inside the imperative layer, the read is
+    /// already in the imperative context and `@snapshot` adds noise
+    /// without changing semantics.
+    ///
+    /// One canonical way per context: pure-side reads → `@snapshot`;
+    /// imperative-side reads → bare `Self.field` / `Auto.field`.
+    /// Mixing them is rejected here.
+    ///
+    /// The diagnostic names the offending transition + automaton, the
+    /// snapshot byte offset, and reminds users that bare `Self.field`
+    /// is the canonical form. Snapshots of *other* automata from
+    /// within a transition (e.g. observing a sibling automaton's
+    /// state) are *not* rejected — only same-automaton snapshots,
+    /// where the redundancy is exact.
+    #[error("E0553: `@snapshot {automaton}.{field}` inside `#transition {transition_name}` of `#automaton {owner}` is redundant; use bare `Self.{field}` instead (snapshot at byte {at})")]
+    SnapshotInImperative {
+        /// Automaton named in the snapshot (literally `"Self"`, or the
+        /// transition's owner name).
+        automaton: String,
+        /// The field being snapshot.
+        field: String,
+        /// The enclosing transition's name.
+        transition_name: String,
+        /// The owning automaton's name (so the diagnostic identifies
+        /// both the transition and its owner).
+        owner: String,
+        /// Byte offset of the offending `@snapshot` expression.
+        at: usize,
+    },
+
     /// A non-`@partial` `@fn` contains a recursive call to itself
     /// (direct recursion) without satisfying any of the structural-
     /// recursion rules from ADR 0003 Q1's three-rule cut.
@@ -303,6 +339,116 @@ fn check_totality(program: &Program, errors: &mut Vec<CheckError>) {
                     decl_at: decl.span.start,
                 });
             }
+        }
+    }
+}
+
+/// Scanner that walks a `#transition` body emitting `E0553
+/// SnapshotInImperative` for every `@snapshot Self.field` or
+/// `@snapshot Owner.field` (same automaton) it finds. Snapshots of
+/// other automata from inside the transition are *not* flagged.
+///
+/// Unlike `SelfRecursionFinder`, this scanner does **not** stop at
+/// the first hit — every same-automaton snapshot in the transition
+/// gets its own diagnostic (the user might have written several and
+/// each is independently fixable).
+struct SelfSnapshotScanner<'a, 'errs> {
+    owner: &'a str,
+    transition_name: &'a str,
+    errors: &'errs mut Vec<CheckError>,
+}
+
+impl<'a, 'errs> SelfSnapshotScanner<'a, 'errs> {
+    fn walk_block(&mut self, block: &Block) {
+        for s in &block.stmts {
+            self.walk_stmt(s);
+        }
+    }
+
+    fn walk_stmt(&mut self, stmt: &Stmt) {
+        match &stmt.kind {
+            StmtKind::Let { value, .. } | StmtKind::LetShort { value, .. } => {
+                self.walk_expr(value);
+            }
+            StmtKind::Expr(e) => self.walk_expr(e),
+            StmtKind::Return(Some(e)) => self.walk_expr(e),
+            StmtKind::Mutate { assigns, .. } => {
+                // `#mutate Auto { f = expr }` — expr can contain a
+                // snapshot in its RHS (e.g. `Self.field` is fine but
+                // `@snapshot Self.field` on the RHS is also redundant).
+                for fa in assigns {
+                    if let Some(idx) = &fa.index {
+                        self.walk_expr(idx);
+                    }
+                    self.walk_expr(&fa.value);
+                }
+            }
+            StmtKind::MutateShort { value, .. } => self.walk_expr(value),
+            StmtKind::ProcCall { args, .. } => {
+                for a in args {
+                    self.walk_expr(a);
+                }
+            }
+            // Other statement kinds either don't contain expressions
+            // or aren't legal inside a transition body in well-formed
+            // source. Fall through silently.
+            _ => {}
+        }
+    }
+
+    fn walk_expr(&mut self, expr: &Expr) {
+        match &expr.kind {
+            ExprKind::Snapshot { automaton, field } => {
+                if automaton == "Self" || automaton == self.owner {
+                    self.errors.push(CheckError::SnapshotInImperative {
+                        automaton: automaton.clone(),
+                        field: field.clone(),
+                        transition_name: self.transition_name.to_owned(),
+                        owner: self.owner.to_owned(),
+                        at: expr.span.start,
+                    });
+                }
+            }
+            ExprKind::Call { callee, args } => {
+                self.walk_expr(callee);
+                for a in args {
+                    self.walk_expr(a);
+                }
+            }
+            ExprKind::MethodCall { obj, args, .. } => {
+                self.walk_expr(obj);
+                for a in args {
+                    self.walk_expr(a);
+                }
+            }
+            ExprKind::Binary { lhs, rhs, .. } => {
+                self.walk_expr(lhs);
+                self.walk_expr(rhs);
+            }
+            ExprKind::Unary { operand, .. } | ExprKind::Ref { operand, .. } => {
+                self.walk_expr(operand);
+            }
+            ExprKind::Paren(inner) => self.walk_expr(inner),
+            ExprKind::Tuple(es) | ExprKind::Array(es) => {
+                for e in es {
+                    self.walk_expr(e);
+                }
+            }
+            ExprKind::ArrayRepeat { value, count } => {
+                self.walk_expr(value);
+                self.walk_expr(count);
+            }
+            ExprKind::FieldAccess { obj, .. } => self.walk_expr(obj),
+            ExprKind::Index { obj, index } => {
+                self.walk_expr(obj);
+                self.walk_expr(index);
+            }
+            ExprKind::Cast { value, .. } => self.walk_expr(value),
+            ExprKind::Range { lo, hi, .. } => {
+                self.walk_expr(lo);
+                self.walk_expr(hi);
+            }
+            _ => {}
         }
     }
 }
@@ -486,6 +632,19 @@ impl<'a> Walker<'a> {
             cannot_mutate: &no_cannot_mutate,
         };
         self.walk_imperative_block(&decl.body, &ctx);
+
+        // Decision #24 / ADR 0004 Q2: scan this transition's body for
+        // `@snapshot Self.field` or `@snapshot Owner.field` (same
+        // automaton). Both shapes are E0553 — bare `Self.field` /
+        // `Owner.field` is the canonical inside-transition read.
+        // Snapshots of *other* automata from this transition are
+        // permitted (they observe sibling state).
+        let mut snap_scanner = SelfSnapshotScanner {
+            owner,
+            transition_name: &decl.name,
+            errors: &mut self.errors,
+        };
+        snap_scanner.walk_block(&decl.body);
     }
 
     /// Walk a `#`-layer body in mutation-authorisation mode. Statement-form
@@ -1549,5 +1708,164 @@ mod tests {
             saw_total && saw_boundary,
             "expected both E0540 and E0101; got {errors:?}"
         );
+    }
+
+    // ─── Decision #24 / ADR 0004 Q2: E0553 SnapshotInImperative ──────────
+
+    #[test]
+    fn snapshot_self_field_inside_transition_emits_e0553() {
+        // The headline E0553 case: `@snapshot Self.field` inside a
+        // transition. Should be diagnosed as redundant per ADR 0004 Q2.
+        let src = "\
+            #automaton Counter { value: u32; \
+              #transition tick { let _v := @snapshot Self.value; } \
+            }\
+        ";
+        let errors = check_str(src).expect_err("expected E0553");
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            CheckError::SnapshotInImperative { automaton, field, transition_name, owner, .. }
+                if automaton == "Self" && field == "value"
+                    && transition_name == "tick" && owner == "Counter"
+        ));
+        assert!(saw, "expected E0553 with Self/value/tick/Counter; got {errors:?}");
+    }
+
+    #[test]
+    fn snapshot_owner_field_inside_transition_also_emits_e0553() {
+        // Equivalent shape: writing the owner's name explicitly instead
+        // of `Self`. Same automaton ⇒ same redundancy ⇒ same E0553.
+        let src = "\
+            #automaton Counter { value: u32; \
+              #transition tick { let _v := @snapshot Counter.value; } \
+            }\
+        ";
+        let errors = check_str(src).expect_err("expected E0553");
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            CheckError::SnapshotInImperative { automaton, .. } if automaton == "Counter"
+        ));
+        assert!(saw, "expected E0553 for owner-name snapshot; got {errors:?}");
+    }
+
+    #[test]
+    fn snapshot_other_automaton_inside_transition_silent() {
+        // Snapshotting a *sibling* automaton's field from inside a
+        // transition is permitted — the user is observing external
+        // state, not redundantly snapshotting their own.
+        let src = "\
+            #automaton A { x: u32; \
+              #transition observe { let _v := @snapshot B.y; } \
+            } \
+            #automaton B { y: u32; }\
+        ";
+        let res = check_str(src);
+        assert!(
+            res.is_ok(),
+            "snapshotting sibling automaton from transition should be silent; got {res:?}"
+        );
+    }
+
+    #[test]
+    fn multiple_self_snapshots_each_emit_e0553() {
+        // Unlike E0540 (totality) where first-call wins, E0553 reports
+        // every occurrence — each snapshot is independently fixable.
+        let src = "\
+            #automaton C { x: u32; y: u32; \
+              #transition tick { \
+                let _a := @snapshot Self.x; \
+                let _b := @snapshot Self.y; \
+              } \
+            }\
+        ";
+        let errors = check_str(src).expect_err("expected multiple E0553");
+        let count = errors
+            .iter()
+            .filter(|e| matches!(e, CheckError::SnapshotInImperative { .. }))
+            .count();
+        assert_eq!(count, 2, "expected exactly two E0553s; got {count}: {errors:?}");
+    }
+
+    #[test]
+    fn snapshot_in_arg_position_inside_transition_caught() {
+        // Snapshot buried in a `#> proc(arg)` call's argument is still
+        // detected by the body-walker.
+        let src = "\
+            #automaton C { v: u32; \
+              #transition step { #> helper(@snapshot Self.v); } \
+            } \
+            #effect helper(x: u32) #mutates: [] { }\
+        ";
+        let errors = check_str(src).expect_err("expected E0553");
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            CheckError::SnapshotInImperative { automaton, .. } if automaton == "Self"
+        ));
+        assert!(saw, "expected E0553 in proc-call arg; got {errors:?}");
+    }
+
+    #[test]
+    fn snapshot_in_mutate_short_rhs_inside_transition_caught() {
+        // `Auto.field <op>= @snapshot Self.field` — the RHS expr.
+        let src = "\
+            #automaton C { v: u32; \
+              #transition step { C.v = @snapshot Self.v; } \
+            }\
+        ";
+        let errors = check_str(src).expect_err("expected E0553");
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            CheckError::SnapshotInImperative { automaton, .. } if automaton == "Self"
+        ));
+        assert!(saw, "expected E0553 in mutate-short RHS; got {errors:?}");
+    }
+
+    #[test]
+    fn snapshot_in_effect_body_silent() {
+        // ADR 0004 Q2 is *transition-specific*. `#effect` bodies are
+        // not transitions and don't get the E0553 redundancy check —
+        // they may legitimately want `@snapshot` for boundary clarity.
+        let src = "\
+            #automaton C { v: u32; } \
+            #effect e() #mutates: [C] { let _v := @snapshot C.v; C.v = _v; }\
+        ";
+        // Whatever else may diagnose, it must NOT be E0553.
+        if let Err(errors) = check_str(src) {
+            let saw_e0553 = errors
+                .iter()
+                .any(|e| matches!(e, CheckError::SnapshotInImperative { .. }));
+            assert!(
+                !saw_e0553,
+                "E0553 should not fire inside #effect bodies; got {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostic_carries_full_context() {
+        let src = "\
+            #automaton Counter { value: u32; \
+              #transition tick { let _v := @snapshot Self.value; } \
+            }\
+        ";
+        let errors = check_str(src).expect_err("expected E0553");
+        for e in &errors {
+            if let CheckError::SnapshotInImperative {
+                automaton,
+                field,
+                transition_name,
+                owner,
+                at,
+            } = e
+            {
+                assert_eq!(automaton, "Self");
+                assert_eq!(field, "value");
+                assert_eq!(transition_name, "tick");
+                assert_eq!(owner, "Counter");
+                assert!(*at < src.len());
+                return;
+            }
+        }
+        panic!("expected E0553, got {errors:?}");
     }
 }

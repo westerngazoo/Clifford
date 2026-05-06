@@ -2746,15 +2746,39 @@ impl<'t> Parser<'t> {
 
     /// Parse `@snapshot Auto.field` per Decision #24 / ADR 0004.
     ///
-    /// Single-segment automaton name + dot + field name. Composite
-    /// reads (`@snapshot Auto.field[i]`) and `Self.field` snapshots
-    /// inside transitions (E0553) are out of scope for v0.2-α.
-    /// Multi-segment automaton paths (`mod::Auto.field`) are deferred
-    /// alongside module resolution.
+    /// Single-segment automaton name + dot + field name. The
+    /// "automaton" position accepts either an `Ident` (e.g.
+    /// `@snapshot Counter.value`) or the `Self` keyword (`@snapshot
+    /// Self.field`); the literal string `"Self"` is recorded on the
+    /// AST node for the latter so `clifford-check` can emit E0553
+    /// when a transition body uses this form (per ADR 0004 Q2 — the
+    /// canonical inside-transition read is bare `Self.field`, not
+    /// `@snapshot Self.field`).
+    ///
+    /// Composite reads (`@snapshot Auto.field[i]`) and multi-segment
+    /// automaton paths (`mod::Auto.field`) are out of scope for
+    /// v0.2-α (deferred per ADR 0004 Q3 and post-T4d module work).
     fn parse_snapshot_expr(&mut self, start: usize) -> Result<Expr, ParseError> {
         self.advance(); // `@snapshot`
-        let (automaton, _) =
-            self.expect_ident("automaton name after `@snapshot` (e.g. `@snapshot Counter.value`)")?;
+        let tok = self.peek().clone();
+        let automaton = match tok.kind {
+            TokenKind::Ident(s) => {
+                self.advance();
+                s
+            }
+            TokenKind::KwSelfType => {
+                self.advance();
+                "Self".to_owned()
+            }
+            other => {
+                return Err(ParseError::Expected {
+                    expected:
+                        "automaton name or `Self` after `@snapshot` (e.g. `@snapshot Counter.value`)",
+                    found: other,
+                    at: tok.span.start,
+                });
+            }
+        };
         self.expect(TokenKind::Dot, "`.` between automaton name and field in `@snapshot`")?;
         let (field, field_span) = self.expect_ident("field name after `.` in `@snapshot`")?;
         Ok(Expr {
@@ -6213,6 +6237,34 @@ mod tests {
             err,
             ParseError::Expected { expected: "field name after `.` in `@snapshot`", .. }
         ));
+    }
+
+    #[test]
+    fn snapshot_self_field_parses_with_self_recorded() {
+        // ADR 0004 Q2: @snapshot Self.field is *parsed*, then
+        // diagnosed by clifford-check as E0553 (inside transition).
+        // The parser stores the literal string "Self" so downstream
+        // crates can pattern-match on it.
+        let p = parse_str(
+            "#automaton Counter { value: u32; \
+                #transition tick { let _v := @snapshot Self.value; } \
+              }",
+        )
+        .expect("parse @snapshot Self.value");
+        match &p.items[0] {
+            Item::Automaton(AutomatonDecl { transitions, .. }) => {
+                let stmt = &transitions[0].body.stmts[0];
+                if let StmtKind::LetShort { value, .. } = &stmt.kind {
+                    if let ExprKind::Snapshot { automaton, field } = &value.kind {
+                        assert_eq!(automaton, "Self");
+                        assert_eq!(field, "value");
+                        return;
+                    }
+                }
+                panic!("expected LetShort -> Snapshot {{ Self, value }}");
+            }
+            other => panic!("expected Automaton, got {:?}", other),
+        }
     }
 
     #[test]
