@@ -345,6 +345,8 @@ sequential_attr  := '@sequential' '(' ident ',' ident ')' ';'
 
   These traits are *recorded by the parser verbatim* (the parser does not validate names — that's `clifford-types` semantic work). The orthogonality engine (§7) ignores `trait_list` entirely; codegen uses memory-ordering markers (`Acquire` / `Release` / `SeqCst`) to emit appropriate fences; `cliffordc audit --traits` and certification artefacts consume the rest. User-defined traits (non-predeclared identifiers) are accepted by the parser; whether they have downstream meaning is determined by the consuming tool. See `DECISIONS.md` Decision #22 for the locked design.
 
+  **Layer-aware validation (E0544):** the predeclared traits are *layer-tagged*. The pure-side traits (`Pure`, `Readable`, `Observable`, `Opaque` — Decision #2 + ADR 0003 P2) are valid only on `@fn` declarations; using one on `#effect` / `#interrupt` / `#transition` is `E0544 TraitLayerMismatch`. The imperative-side traits in the table above are valid only on `#effect` / `#interrupt` / `#transition`; using one on `@fn` is `E0544`. User-defined `@trait Name { … }` declarations are *layer-universal* in v0.2-β — they validate on either side. (A future slice may attach explicit layer tags to `@trait` if use cases surface.) The check is independent of the unknown-trait check (`E0541`); a typo in a layer-only trait name surfaces as E0541, not E0544.
+
 ### 2.6 Statements and Expressions
 
 ```

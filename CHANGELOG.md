@@ -7,6 +7,93 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Decision #22: layer-aware trait validation (E0544 TraitLayerMismatch) (2026-05-05)
+
+Closes the layer-direction gap from the earlier Decision #22
+trait-validation slice. The previous slice validated trait names
+universally — `Realtime` on a `@fn` was accepted, `Pure` on a
+`#effect` was accepted. ADR 0003 Q2's pure-side / imperative-side
+distinction now has compile-time enforcement.
+
+**Implementation (`crates/types/src/lib.rs`):**
+
+- New `TraitLayer` enum: `Pure`, `Imperative`, `Universal`. The first
+  two correspond to the existing `PREDECLARED_PURE_TRAITS` /
+  `PREDECLARED_IMPERATIVE_TRAITS` constants; `Universal` covers
+  user-defined `@trait` declarations.
+- `TraitLayer::is_usable_on(callable_layer)` answers "may a trait
+  with this layer appear on a callable in *that* layer?":
+  - `Universal → *` always allowed.
+  - `Pure → Pure` only.
+  - `Imperative → Imperative` only.
+- `TraitRegistry` upgraded from `HashSet<String>` of known names to
+  `HashMap<String, TraitLayer>` so each name carries its layer
+  classification.
+- New `TraitRegistry::layer_of(name) -> Option<TraitLayer>`.
+- `check_traits` now takes the callable's layer, and emits the right
+  diagnostic per case:
+  - Unknown name → `E0541 UnknownTrait` (existing).
+  - Known name, wrong layer → `E0544 TraitLayerMismatch` (new).
+  - Known name, correct layer → silent.
+- New `TypeError::TraitLayerMismatch { trait_name, expected_layer,
+  callable, actual_kind, at }` variant. The diagnostic names the
+  trait, its required layer (`"pure"` / `"imperative"`), the callable,
+  the callable's syntactic kind (`"@fn"` / `"#effect"` / etc.), and
+  the byte offset.
+
+**Spec (`docs/CLIFFORD_SPEC.md` §2.5):**
+
+- Added a normative paragraph after the imperative-traits table
+  describing the layer-aware validation rule and its diagnostic
+  shape.
+
+**Semantics enforced:**
+
+- `Pure` / `Readable` / `Observable` / `Opaque` on `#effect` /
+  `#interrupt` / `#transition` → E0544.
+- `Hardware` / `Realtime` / `Acquire` / `Release` / `SeqCst` /
+  `LockingDiscipline` / `PureState` / `Encapsulated` on `@fn` →
+  E0544.
+- User-defined `@trait MyTrait { … }` valid on both layers (no
+  E0544; the trait is `Universal`).
+- Unknown name → E0541 only (no double-report; we don't know the
+  layer).
+- Mixed-layer list (`$ [Pure, Realtime]` on `@fn`): each entry
+  checked independently — `Pure` validates, `Realtime` triggers
+  E0544.
+
+**Tests (11 new layer-mismatch tests, types crate now 154 total,
+was 143):**
+
+- Pure-side trait on `#effect` / `#interrupt` / `#transition` →
+  E0544 (one test per kind).
+- Imperative trait on `@fn` → E0544; per-name smoke test for
+  `Acquire` / `Release` / `SeqCst`.
+- Per-name iteration over both predeclared sets: every imperative
+  trait on `@fn` rejected; every pure trait on `#effect` rejected
+  — guards against accidental misclassification if someone adds
+  a new predeclared trait.
+- User-defined `@trait` validates on both layers (Universal).
+- Unknown trait → E0541 only, NOT E0544.
+- Mixed-layer list: correct-layer entries validate, wrong-layer
+  entries get E0544 independently.
+- Smoke test enumerating every predeclared name on its correct
+  layer remains silent (regression guard for the per-set
+  classification).
+
+What's still deferred (future slices):
+- Explicit layer tags on `@trait` declarations (currently
+  Universal). Would need a new syntactic form like `@trait MyTrait
+  $ [Pure] { … }` or similar.
+- Trait-bound checking on generic parameters (`@fn f<T: Realtime>`
+  — needs full HM unification anyway).
+- Cross-layer call row inheritance (ADR 0003 Q2's "`@fn → @fn`
+  one-directional row check") — this is the *call-site* check, a
+  separate concern from the *declaration-site* layer check this
+  slice adds.
+
+Workspace remains green; clippy clean.
+
 ### Added — Decision #23: mutual-recursion detection via Tarjan SCC (E0543) (2026-05-05)
 
 Closes the documented gap from the v0.2-β totality slice. Direct
