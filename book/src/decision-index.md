@@ -32,4 +32,5 @@ The complete Decision → chapter map.
 | #24 | `@snapshot Auto.field` boundary operator | **Ch. 24** | ✓ LOCKED 2026-05-05 (ADR 0004), impl v0.2 |
 | #25 | **`#hidden` field encapsulation** (basis vector private to owning automaton) | **Ch. 25** | ✓ LOCKED, impl v0.2 |
 | #26 | **Rotor-based plane-confined locks** (refines #21; rotor-as-acquisition) | **Ch. 26** | ✓ LOCKED 2026-05-05 (ADR 0005), impl v0.7+ |
+| #27 | **GA across scales** — distributed runtime race detection via plugin-layer dist-check | (book chapter pending v0.4-γ) | ✓ LOCKED 2026-05-05 (ADR 0006), impl v0.4+ |
 

@@ -1,10 +1,10 @@
 # ADR 0006: Runtime Distributed Race & Deadlock Detection via Dynamic Multivector Check
 
-**Status:** Proposed (2026-05-05)
-**Date:** 2026-05-05
+**Status:** Accepted (2026-05-05)
+**Date:** 2026-05-05 (proposed and accepted same day; architect sign-off "lock it in" on the cost-model + utility analysis)
 **Deciders:** Goose (architect)
-**Spec impact:** None on the core language. New plugin crate (`crates/dist-check`) and a runtime instrumentation hook in `crates/codegen`. Spec §10 gains a new error-code range (E07xx — runtime diagnostics) reserved for plugin consumers.
-**DECISIONS.md:** No new Decision number; this is plugin-layer infrastructure that consumes the existing GA primitives.
+**Spec impact:** None on the core language semantics. Adds `#dist_shared` field qualifier (lexer + parser + AST). New plugin crate (`crates/dist-check`) and a runtime instrumentation hook in `crates/codegen`. Spec §10 gains a new error-code range (E07xx — runtime diagnostics) reserved for plugin consumers.
+**DECISIONS.md:** Locked as **Decision #27** (2026-05-05) — formal commitment to extend GA's reach from compile-time to runtime via plugin-layer infrastructure. This ADR is the locked operational plan.
 **Predecessor ADRs:** ADR 0002 (mixed-metric GA, Decision #21), ADR 0005 (rotor-plane locks, Decision #26).
 **Branch:** `adr/0006-runtime-distributed-multivector-engine`.
 
@@ -405,13 +405,33 @@ runtime cost paid only by the resources that actually need it.
 
 ## Decision
 
-**Status: Proposed.** Lock after the five open questions in §"Open
-questions" close in conversation with the architect. Targeted
-close: by 2026-07-01.
+**Status: Accepted (2026-05-05).** Architect signed off "lock it in"
+after confirming (a) opt-in really means zero cost when off, (b) the
+strategic value of extending GA's reach across compile-time,
+in-process runtime, and distributed runtime under one algebraic
+framework. Locked as **Decision #27** in DECISIONS.md.
 
-Implementation is **Phase 5+ work** (per CLAUDE.md §10's release
-roadmap) — no v0.1 / v0.2 dependency. The compile-time engine
-ships unaware of this ADR's existence.
+The locking is *strategic commitment*, not immediate work — implementation is **Phase 5+** (v0.4 / v0.5 alongside `clifford::core::sync` and networking stdlib). The compile-time engine ships unaware of this ADR; v0.1 and v0.2 milestones are unaffected.
+
+**Locked resolutions:**
+
+| # | Question | Locked resolution |
+|---|---|---|
+| Q1 | Coordinator topology | **Central coordinator for v0.4-α**, gossip backend pluggable via trait in v0.5+. Production-grade gossip / consensus deferred until users surface specific need. |
+| Q2 | Behaviour publication scope | **Per-transaction.** A "transaction" is a contiguous mutation phase inside an `#effect` body or an explicit `@dist_phase("name") { … }` block. Per-mutation rejected as too noisy; per-session rejected as too lossy. |
+| Q3 | Race response | **Configurable per `#rotor_lock`** via `#on_dist_race: Log \| Abort \| Quarantine` annotation. **Default `Log`** — least-disruptive for debug; surfaces in `cliffordc audit --dist-trace`. Production users override per-lock. |
+| Q4 | Resource basis assignment | **Pre-agreed schema at link time.** Each program emits a `clifford::dist::Schema` artefact derived from its `#shared` / `#dist_shared` declarations; schemas exchanged at deployment. Mismatches → `E0702 SchemaIncompatible`. Runtime registration deferred to v0.6+ (separate ADR). |
+| Q5 | Interaction with Decisions #21 / #26 | **(b) Replace selectively.** New `#dist_shared` field qualifier opts into the cross-node check; in-process `#shared` resources guarded by Decision #26 rotor-plane locks remain untouched. Cost paid only by resources that need cross-node visibility. |
+
+**Action items (v0.4+ implementation):**
+
+1. Add Decision #27 to `docs/DECISIONS.md` (this PR).
+2. Update Decision Matrix and decision-index to reflect locked status.
+3. Reserve `#dist_shared`, `#dist_phase`, `#on_dist_race` tokens at the lexer (lands with Decision #21 / #26 lexer reservations or independently in v0.4-α).
+4. New crate `crates/dist-check` skeleton: `Coordinator` trait, `Behaviour` type, central-coordinator backend.
+5. Codegen hook for publish/check/retract instrumentation behind `#[cliffordc::dist_check]` attribute and `cliffordc test --dist-check` flag.
+6. Add E0701 (DistributedRace), E0702 (SchemaIncompatible) to spec §10 error-code table.
+7. Book chapter slot reserved (Part V, alongside Ch. 45 kernel patterns) — full chapter lands with v0.4-γ implementation PR.
 
 ---
 

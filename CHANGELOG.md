@@ -7,6 +7,80 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Locked — Decision #27: GA across scales + ADR 0006 Accepted (2026-05-05)
+
+Architect signed off "lock it in" on ADR 0006 after reviewing the
+cost-model + utility analysis. ADR 0006 flips from **Proposed** to
+**Accepted**; new **Decision #27** added to DECISIONS.md elevating
+the strategic commitment.
+
+**The unifying claim Decision #27 makes explicit:**
+
+> GA is the unifying *algebra*; standard primitives (CAS spinlocks,
+> flags, RPCs, atomics) are the *implementation*.
+
+The same `outer_product` operation now runs at three scales:
+
+| Scale | When | Algebra carries | Runtime carries |
+|---|---|---|---|
+| Compile-time, single-process | `cliffordc` invocation | Static `actual_writes` per callable | (none — pure proof) |
+| In-process runtime (#21/#26) | Lock acquire/release | `lock(L) = pri(L) + e_L` | Normal CAS spinlock + owner-ID + depth counter |
+| Distributed runtime (#27) | Mutation phase publish/retract | `Behaviour { (resource, slice) bits }` | RPC publish + central coordinator + RPC retract; `&` op on coordinator |
+
+The architect's framing during the lock-in: *"rotors that could be
+designed via single locks and flags"* — the GA is the framework, the
+runtime is whatever's already cheap. Same pattern Decisions #21 and
+#26 already validated.
+
+**ADR 0006 Accepted with five locked resolutions:**
+
+- **Q1** Coordinator topology: central for v0.4-α; gossip pluggable
+  for v0.5+.
+- **Q2** Publication scope: per-transaction (`#effect` body or
+  explicit `@dist_phase("name") { … }` block).
+- **Q3** Race response: configurable per `#rotor_lock` via
+  `#on_dist_race: Log | Abort | Quarantine`; default `Log`.
+- **Q4** Resource basis assignment: pre-agreed schema at link time;
+  `E0702 SchemaIncompatible` for mismatches.
+- **Q5** Interaction with #21/#26: opt-in per resource via
+  `#dist_shared` field qualifier; in-process resources unchanged.
+
+**Cost model (verified during lock-in):**
+
+| Setup | Compile time | Binary size | Runtime |
+|---|---|---|---|
+| No `#dist_shared`, no flag | 0 | 0 | 0 |
+| Has `#dist_shared`, no flag | epsilon (parser sees keyword) | 0 | 0 |
+| Has `#dist_shared`, flag on | small (codegen hook) | ~few KB | ~10–100× write cost on marked resources only |
+
+Three layers of opt-in (per-resource via `#dist_shared`, per-build
+via `--dist-check`, per-program via Cargo feature flag). Programs
+that don't opt in pay nothing. Mirrors Rust's allocator hooks /
+sanitizers / miri.
+
+**DECISIONS.md updates:**
+- New entry for Decision #27 (full text covering the unifying claim,
+  the three-scale table, locked resolutions, and the rationale for
+  why this is a Decision and not just an ADR).
+- Decision Matrix extended with #27.
+- Status header: "Decisions #1–#27 LOCKED."
+- Open Questions text refreshed.
+
+**ADR 0006 update:**
+- Status flipped to Accepted (2026-05-05).
+- `## Decision` section gains the locked-resolutions table and
+  action items for v0.4+ implementation.
+
+**decision-index.md:** #27 row added.
+
+**Implementation status:** Phase 5+ work. v0.1, v0.2, v0.3
+unaffected. Lexer reservations land alongside Decision #21/#26 or
+in v0.4-α; plugin crate `crates/dist-check` and central-coordinator
+backend in v0.4; gossip backend / dynamic schema in v0.5+/v0.6+.
+
+The compile-time engine ships entirely unaware of Decision #27;
+programs that don't use `#dist_shared` are unaffected.
+
 ### Locked — Decisions #23, #24, #26 + Proposed ADR 0006 runtime distributed engine (2026-05-05)
 
 Architect signed off "yes to all" on the propositions in ADRs 0003,

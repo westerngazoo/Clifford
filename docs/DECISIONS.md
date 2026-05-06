@@ -1,6 +1,6 @@
 # Clifford Language: Critical Design Decisions
 
-**Status:** Decisions #1–#26 LOCKED. Implementation gating: #12 and #18 designed but deferred to v0.2; #21 design locked, implementation gated to v0.7; #22, #23, #24, #25 design locked, implementation slated for v0.2; #26 (rotor-plane locks, refines #21) implementation gated to v0.7. Refinement #1a LOCKED. Phase 1 implementation underway.
+**Status:** Decisions #1–#27 LOCKED. Implementation gating: #12 and #18 designed but deferred to v0.2; #21 design locked, implementation gated to v0.7; #22, #23, #24, #25 design locked, implementation slated for v0.2; #26 (rotor-plane locks, refines #21) implementation gated to v0.7; #27 (GA across scales / distributed runtime check) implementation gated to v0.4+ (Phase 5+ plugin work). Refinement #1a LOCKED. Phase 1 implementation underway.
 **Dates:** see footer below for the full chronological log.
 **Owner:** Goose (Gustavo Delgadillo)
 **Positioning:** General-purpose systems language; embedded firmware is the canonical first target but not the only target. Decisions are language-level and apply across domains.
@@ -1427,6 +1427,59 @@ Implementation gated to **v0.7+** alongside the rest of Decision #21's mixed-met
 
 ---
 
+## Decision #27: GA Across Scales — Distributed Runtime Race Detection ✓ LOCKED
+
+**Date locked:** 2026-05-05 (architect sign-off "lock it in" on ADR 0006's cost-model + utility analysis)
+**Tracking ADR:** `docs/adr/0006-runtime-distributed-multivector-engine.md` (Accepted 2026-05-05).
+**Spec impact:** None on core language semantics. New `#dist_shared` field qualifier (lexer/parser/AST). Spec §10 reserves `E07xx` error-code range for runtime diagnostics.
+**Refines / extends:** §7 orthogonality engine (algebra reused, not modified); Decisions #21 and #26 (cross-node visibility layered on top, opt-in via `#dist_shared`).
+
+### Summary — the unifying claim
+
+Decisions #21 and #26 already established that the GA wedge product proves race-freedom for in-process state — first compile-time, then in-process locking. Decision #27 commits to extending the *same wedge primitive* to **runtime distributed race detection**, scoped to plugin / debug mode.
+
+This is the unifying architectural pattern across #21, #26, and now #27:
+
+> **GA is the unifying algebra; standard primitives (CAS spinlocks, flags, RPCs, atomics) are the implementation.**
+
+Same `outer_product` operation runs at three scales:
+
+| Scale | When | What carries the algebra | What carries the runtime |
+|---|---|---|---|
+| Compile-time, single-process | `cliffordc` invocation | Static `actual_writes` per callable | (none — pure proof) |
+| In-process runtime (Decisions #21/#26) | Lock acquire/release | `lock(L) = pri(L) + e_L` multivector cell | Normal CAS spinlock with owner-ID + depth counter |
+| Distributed runtime (this Decision) | Mutation phase publish/retract | `Behaviour { (resource, slice) bits }` | RPC publish + central coordinator + RPC retract; `&` op on coordinator |
+
+The user explicitly named this pattern in the conversation that locked the Decision: *"rotors that could be designed via single locks and flags."* The algebra is the *framework*; the runtime is whatever's already cheap.
+
+### Why this is a Decision (and not just an ADR-only thing)
+
+ADR 0006 alone documents the operational plan. Decision #27 elevates it to a language-level commitment: Clifford promises that the GA framework reaches across scales, not just the static check. This positioning matters for the language's pitch (the GA isn't an incidental compile-time trick; it's fundamental and uniformly applicable) and for downstream users planning distributed Clifford services (the framework is a stable feature roadmap, not a maybe).
+
+### Locked resolutions (per ADR 0006 §"Decision")
+
+- **Q1** Coordinator topology: central for v0.4-α; gossip pluggable for v0.5+.
+- **Q2** Publication scope: per-transaction (`#effect` body or `@dist_phase("name") { … }` block).
+- **Q3** Race response: configurable per `#rotor_lock` via `#on_dist_race: Log | Abort | Quarantine`; default `Log`.
+- **Q4** Resource basis assignment: pre-agreed schema at link time; `E0702 SchemaIncompatible` for mismatches; runtime registration deferred to v0.6+.
+- **Q5** Interaction with #21/#26: opt-in per resource via `#dist_shared` field qualifier; in-process `#shared` resources unchanged.
+
+### Why locked now
+
+1. **Cost model is genuinely zero-impact when off.** Per-resource opt-in (`#dist_shared`), per-build opt-in (`cliffordc test --dist-check`), per-program opt-in (Cargo feature flag). Programs that never use it pay nothing — compile-time, binary-size, runtime.
+2. **Strategic continuity.** Locking commits to "GA scales from single-IRQ to multi-machine" as a language-level claim, not just a research direction. Users designing systems can plan for this without uncertainty.
+3. **Architectural pattern is proven.** Decisions #21 and #26 already validated the GA-as-framework / standard-primitives-as-runtime split. ADR 0006 applies the same pattern at one more scale; no new architectural risk.
+
+### Implementation status
+
+**Phase 5+ work** — v0.4 / v0.5 alongside `clifford::core::sync` and any networking stdlib. v0.1, v0.2, v0.3 milestones unaffected.
+
+Lexer reservations (`#dist_shared`, `#dist_phase`, `#on_dist_race`) may land alongside the Decision #21 / #26 reservations or independently in v0.4-α. Plugin crate `crates/dist-check`, codegen instrumentation hook, central-coordinator reference implementation: v0.4. Gossip backend, dynamic schema registration: v0.5+ / v0.6+.
+
+The compile-time engine (§7) ships unaware of Decision #27; programs that don't opt in are entirely unaffected.
+
+---
+
 ## Decision Matrix
 
 | # | Aspect | Question | Chosen | Impact |
@@ -1457,6 +1510,7 @@ Implementation gated to **v0.7+** alongside the rest of Decision #21's mixed-met
 | #24 | Boundary crossing | Convention-based snapshot pattern vs `@snapshot Auto.field` operator | **Explicit `@snapshot` expression**; copy-by-value for Copy types in v0.2; lock-holding proof for `#shared` snapshots | Reading mutable state into pure analysis becomes a visible, named act gated by the `Readable` row; supports future read-tracking |
 | #25 | Encapsulation | Re-add `#hidden` per-field modifier with algebraic-trivial-orthogonality interpretation | **`#hidden` on automaton fields** | Implementation hiding by construction; field never appears in outside callables' basis sets, so wedge never collapses against it from outside |
 | #26 | Lock acquisition (refines #21) | Rotor-as-tiebreak vs rotor-as-acquisition primitive | **Rotor-as-acquisition** with counted re-entry, lock-owns-θ, plane-uniqueness enforced as `E0539` | Mutual exclusion + wrong-thread-release detection + re-entrancy all fall out of GA wedge product; runtime is normal CAS spinlock; static check is the engine's existing wedge primitive |
+| #27 | GA across scales (distributed runtime) | Compile-time only vs same wedge primitive lifted to runtime via plugin/debug mode | **Plugin-layer dist-check** with `#dist_shared` opt-in field qualifier | Same `outer_product` runs at three scales (compile-time, in-process runtime, distributed runtime); zero cost when off; strategic claim that GA is fundamental, not incidental |
 
 ---
 
@@ -1525,7 +1579,7 @@ Implementation gated to **v0.7+** alongside the rest of Decision #21's mixed-met
 
 ## Open Questions
 
-Decisions #1–#26 are all locked alongside six emergent rules and Refinement #1a. Implementation gating per the status header at the top of this file: #12 and #18 deferred to v0.2; #21 and #26 implementation gated to v0.7; #22, #23, #24, #25 design locked with implementation slated for v0.2. Items previously listed as open in `CLIFFORD_SPEC.md §12` and resolved here:
+Decisions #1–#27 are all locked alongside six emergent rules and Refinement #1a. Implementation gating per the status header at the top of this file: #12 and #18 deferred to v0.2; #21 and #26 implementation gated to v0.7; #22, #23, #24, #25 design locked with implementation slated for v0.2; #27 (distributed runtime check) gated to v0.4+ Phase 5 plugin work. Items previously listed as open in `CLIFFORD_SPEC.md §12` and resolved here:
 
 - ~~Effect/state/transition coupling~~ — Resolved by Decision #5.
 - ~~`#hardware` capabilities~~ — Resolved by Decision #6 (subsumed into `#automaton` with hardware annotations).
