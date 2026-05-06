@@ -170,6 +170,35 @@ pub enum TypeError {
         at: usize,
     },
 
+    /// An `@fn` body contains a `@snapshot Auto.field` expression but
+    /// the function's `$ [TraitList]` does not include `Readable` (the
+    /// row that gates `@snapshot` per Decision #24 / ADR 0004).
+    ///
+    /// Per ADR 0004 Q1, `@snapshot` is **not pure** — two snapshots of
+    /// the same field may observe different values; the operator is a
+    /// controlled effect. The `Readable` trait (introduced in ADR 0003
+    /// P2 as one of the predeclared row labels) is the marker for "this
+    /// `@fn` is allowed to read mutable automaton state via `@snapshot`."
+    /// Functions without `Readable` in their row are rejected here.
+    ///
+    /// `#`-layer callables (`#effect`, `#interrupt`, `#transition`)
+    /// are *not* gated — they are imperative and may always observe
+    /// state. The gate exists only on the pure side.
+    ///
+    /// The diagnostic names the offending `@fn`, points at the first
+    /// `@snapshot` site in the body, and reminds users that adding
+    /// `$ [Readable]` to the signature is the fix.
+    #[error("E0550: `@fn {fn_name}` uses `@snapshot` but its trait list does not include `Readable`; add `$ [Readable]` to the signature (snapshot at byte {at}, fn declared at byte {decl_at})")]
+    SnapshotInUnreadableFn {
+        /// Name of the offending `@fn`.
+        fn_name: String,
+        /// Byte offset of the first `@snapshot` in the body.
+        at: usize,
+        /// Byte offset of the `@fn` declaration (so users can find
+        /// where to add the `$ [Readable]` clause).
+        decl_at: usize,
+    },
+
     /// A `$ [TraitList]` clause references a trait name that is neither
     /// predeclared (per Decision #2 + Decision #22 / ADR 0003) nor
     /// declared via a top-level `@trait Name { … }` item.
@@ -471,6 +500,11 @@ pub fn infer(program: &Program, resolution: &Resolution) -> Result<Typing, Vec<T
     // collected in one pass).
     validate_trait_lists(program, &trait_registry, &mut walker.errors);
 
+    // Decision #24 / ADR 0004 Q1: validate every `@fn` whose body
+    // contains a `@snapshot` carries the `Readable` row. `#`-layer
+    // callables are not gated.
+    validate_snapshot_row_gates(program, &mut walker.errors);
+
     if walker.errors.is_empty() {
         Ok(Typing {
             types: walker.types,
@@ -755,6 +789,141 @@ fn check_traits(
     }
 }
 
+/// Decision #24 / ADR 0004 Q1: `@snapshot` is a controlled effect
+/// (not pure). An `@fn` body that uses `@snapshot` must carry the
+/// `Readable` row in its `$ [TraitList]`; otherwise emit
+/// `E0550 SnapshotInUnreadableFn`.
+///
+/// `#`-layer callables (`#effect`, `#interrupt`, `#transition`) are
+/// *not* gated — they are imperative and may always observe automaton
+/// state. The gate is purely a pure-side discipline.
+///
+/// One E0550 per offending `@fn`: the walker stops at the first
+/// `@snapshot` it finds, since one missing `Readable` covers all the
+/// snapshots in the body.
+fn validate_snapshot_row_gates(program: &Program, errors: &mut Vec<TypeError>) {
+    for item in &program.items {
+        if let Item::Fn(decl) = item {
+            let mut finder = SnapshotFinder { found_at: None };
+            finder.walk_block(&decl.body);
+            let Some(at) = finder.found_at else {
+                continue;
+            };
+            let has_readable = decl.trait_list.iter().any(|t| t.name == "Readable");
+            if !has_readable {
+                errors.push(TypeError::SnapshotInUnreadableFn {
+                    fn_name: decl.name.clone(),
+                    at,
+                    decl_at: decl.span.start,
+                });
+            }
+        }
+    }
+}
+
+/// Walker that scans an expression tree for the first `@snapshot`
+/// expression, recording its byte offset.
+///
+/// Mirrors the structure of `clifford-check`'s `SelfRecursionFinder`.
+/// Stops at the first hit; subsequent walks short-circuit. Visits all
+/// the same compound forms — every place an expression can hide a
+/// `@snapshot` (Call args, Binary ops, Index, FieldAccess receiver,
+/// etc.).
+struct SnapshotFinder {
+    found_at: Option<usize>,
+}
+
+impl SnapshotFinder {
+    fn walk_block(&mut self, block: &Block) {
+        for s in &block.stmts {
+            if self.found_at.is_some() {
+                return;
+            }
+            self.walk_stmt(s);
+        }
+    }
+
+    fn walk_stmt(&mut self, stmt: &Stmt) {
+        if self.found_at.is_some() {
+            return;
+        }
+        match &stmt.kind {
+            StmtKind::Let { value, .. } | StmtKind::LetShort { value, .. } => {
+                self.walk_expr(value);
+            }
+            StmtKind::Expr(e) => self.walk_expr(e),
+            StmtKind::Return(Some(e)) => self.walk_expr(e),
+            // `@fn` bodies cannot contain `#`-layer statements
+            // (Decision #1 / Emergent Rule 4 enforced by `clifford-check`
+            // S1) so the mutation / proc-call / unsafe-store arms of
+            // `StmtKind` are absent in well-formed `@fn` source. Fall
+            // through silently for any other shape.
+            _ => {}
+        }
+    }
+
+    fn walk_expr(&mut self, expr: &Expr) {
+        if self.found_at.is_some() {
+            return;
+        }
+        match &expr.kind {
+            ExprKind::Snapshot { .. } => {
+                self.found_at = Some(expr.span.start);
+            }
+            ExprKind::Call { callee, args } => {
+                self.walk_expr(callee);
+                for a in args {
+                    self.walk_expr(a);
+                    if self.found_at.is_some() {
+                        return;
+                    }
+                }
+            }
+            ExprKind::MethodCall { obj, args, .. } => {
+                self.walk_expr(obj);
+                for a in args {
+                    self.walk_expr(a);
+                    if self.found_at.is_some() {
+                        return;
+                    }
+                }
+            }
+            ExprKind::Binary { lhs, rhs, .. } => {
+                self.walk_expr(lhs);
+                self.walk_expr(rhs);
+            }
+            ExprKind::Unary { operand, .. } | ExprKind::Ref { operand, .. } => {
+                self.walk_expr(operand);
+            }
+            ExprKind::Paren(inner) => self.walk_expr(inner),
+            ExprKind::Tuple(es) | ExprKind::Array(es) => {
+                for e in es {
+                    self.walk_expr(e);
+                    if self.found_at.is_some() {
+                        return;
+                    }
+                }
+            }
+            ExprKind::ArrayRepeat { value, count } => {
+                self.walk_expr(value);
+                self.walk_expr(count);
+            }
+            ExprKind::FieldAccess { obj, .. } => self.walk_expr(obj),
+            ExprKind::Index { obj, index } => {
+                self.walk_expr(obj);
+                self.walk_expr(index);
+            }
+            ExprKind::Cast { value, .. } => self.walk_expr(value),
+            ExprKind::Range { lo, hi, .. } => {
+                self.walk_expr(lo);
+                self.walk_expr(hi);
+            }
+            // Atoms and `#`-only forms don't contain snapshots.
+            _ => {}
+        }
+    }
+}
+
 /// Build the [`TypeRegistry`] from every `Item::Type` in the program.
 ///
 /// Aliases get their target translated through [`type_from_type_expr`]
@@ -977,6 +1146,20 @@ impl<'a> Inferer<'a> {
 
             // StateRead — should be a state-tag enum type per §4. Slice 2.
             ExprKind::StateRead(_) => Type::Unknown("state-tag typing is slice T2 work"),
+
+            // Snapshot — Decision #24 / ADR 0004. The expression yields
+            // an owned copy of the named field at the snapshot site, so
+            // its type is the field's declared type (looked up via the
+            // automaton-field registry). If the automaton/field doesn't
+            // resolve, return Unknown — the resolver already reported
+            // E0403 / E0405, no need for a parallel diagnostic here.
+            ExprKind::Snapshot { automaton, field } => self
+                .automaton_field_types
+                .get(automaton)
+                .and_then(|fs| fs.get(field).cloned())
+                .unwrap_or(Type::Unknown(
+                    "snapshot of unresolved automaton/field (resolver reported)",
+                )),
 
             ExprKind::Paren(inner) => self.infer_expr(inner),
 
@@ -3077,5 +3260,214 @@ mod tests {
                 "predeclared imperative trait `{name}` should be recognised"
             );
         }
+    }
+
+    // ─── Decision #24 / ADR 0004: @snapshot typing + E0550 row gate ──────
+
+    #[test]
+    fn snapshot_yields_field_type() {
+        // The snapshot expression's inferred type is the field's
+        // declared type. Verified by binding the snapshot to a typed
+        // `let` and checking no E0512 fires (the types match).
+        let src = "\
+            #automaton Counter { value: u32; }\n\
+            @fn read_value() -> u32 $ [Readable] {\n  \
+              let v: u32 = @snapshot Counter.value;\n  \
+              return v;\n\
+            }\n\
+        ";
+        let res = infer_str(src);
+        assert!(
+            res.is_ok(),
+            "expected snapshot to type-as-field-type (u32); got {res:?}"
+        );
+    }
+
+    #[test]
+    fn snapshot_type_mismatch_diagnosed() {
+        // Wrong annotation: snapshotting a u32 field into a bool let.
+        // The compatibility check uses the field's actual type (u32),
+        // so E0512 fires correctly.
+        let src = "\
+            #automaton Counter { value: u32; }\n\
+            @fn bad() -> bool $ [Readable] {\n  \
+              let v: bool = @snapshot Counter.value;\n  \
+              return v;\n\
+            }\n\
+        ";
+        let errors = infer_str(src).expect_err("expected E0512 mismatch");
+        let saw = errors.iter().any(|e| {
+            matches!(e, TypeError::LetTypeMismatch { declared, actual, .. }
+                if declared == "bool" && actual == "u32")
+        });
+        assert!(
+            saw,
+            "expected LetTypeMismatch declared=bool actual=u32; got {errors:?}"
+        );
+    }
+
+    // ── Readable-row gate (E0550) ────────────────────────────────────────
+
+    #[test]
+    fn snapshot_in_fn_with_readable_row_passes() {
+        let src = "\
+            #automaton C { v: u32; }\n\
+            @fn r() -> u32 $ [Readable] { let v := @snapshot C.v; return v; }\n\
+        ";
+        assert!(
+            infer_str(src).is_ok(),
+            "@fn with Readable should accept @snapshot"
+        );
+    }
+
+    #[test]
+    fn snapshot_in_fn_without_readable_row_emits_e0550() {
+        // The headline E0550 case: @fn body uses @snapshot but the
+        // signature has no `Readable` row. Empty trait list defaults
+        // to [Pure] per Emergent Rule 2 — no Readable row present.
+        let src = "\
+            #automaton C { v: u32; }\n\
+            @fn p() -> u32 { let v := @snapshot C.v; return v; }\n\
+        ";
+        let errors = infer_str(src).expect_err("expected E0550");
+        let saw = errors.iter().any(|e| {
+            matches!(e, TypeError::SnapshotInUnreadableFn { fn_name, .. } if fn_name == "p")
+        });
+        assert!(
+            saw,
+            "expected E0550 SnapshotInUnreadableFn for `p`; got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn snapshot_in_fn_with_pure_row_only_emits_e0550() {
+        // Explicit `$ [Pure]` — Pure does NOT include Readable.
+        let src = "\
+            #automaton C { v: u32; }\n\
+            @fn p() -> u32 $ [Pure] { let v := @snapshot C.v; return v; }\n\
+        ";
+        let errors = infer_str(src).expect_err("expected E0550 with $ [Pure]");
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            TypeError::SnapshotInUnreadableFn { fn_name, .. } if fn_name == "p"
+        )));
+    }
+
+    #[test]
+    fn snapshot_in_fn_with_observable_row_only_emits_e0550() {
+        // Observable is its own row label and does NOT subsume Readable
+        // in v0.2-α. Snapshot still requires Readable explicitly.
+        let src = "\
+            #automaton C { v: u32; }\n\
+            @fn p() -> u32 $ [Observable] { let v := @snapshot C.v; return v; }\n\
+        ";
+        let errors = infer_str(src).expect_err("expected E0550 with $ [Observable]");
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            TypeError::SnapshotInUnreadableFn { fn_name, .. } if fn_name == "p"
+        )));
+    }
+
+    #[test]
+    fn snapshot_in_arg_position_caught() {
+        // Snapshot buried inside a call arg — E0550 fires regardless.
+        let src = "\
+            #automaton C { v: u32; }\n\
+            @fn id(x: u32) -> u32 { return x; }\n\
+            @fn use_snap() -> u32 { return id(@snapshot C.v); }\n\
+        ";
+        let errors = infer_str(src).expect_err("expected E0550 with snapshot in arg");
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            TypeError::SnapshotInUnreadableFn { fn_name, .. } if fn_name == "use_snap"
+        )));
+    }
+
+    #[test]
+    fn snapshot_in_binary_position_caught() {
+        let src = "\
+            #automaton C { v: u32; }\n\
+            @fn diff() -> u32 { return @snapshot C.v - 1u32; }\n\
+        ";
+        let errors = infer_str(src).expect_err("expected E0550 with snapshot in binary");
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            TypeError::SnapshotInUnreadableFn { fn_name, .. } if fn_name == "diff"
+        )));
+    }
+
+    #[test]
+    fn fn_without_snapshot_silent_regardless_of_row() {
+        // No snapshot in the body → no E0550 regardless of trait list.
+        let src1 = "@fn p() -> u32 { return 0u32; }";
+        let src2 = "@fn p() -> u32 $ [Readable] { return 0u32; }";
+        let src3 = "@fn p() -> u32 $ [Pure] { return 0u32; }";
+        for src in [src1, src2, src3] {
+            assert!(
+                infer_str(src).is_ok(),
+                "no snapshot in body should be silent regardless of row; failed on: {src}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_e0550_per_offending_fn() {
+        // Multiple snapshots in the same body → still only one E0550.
+        let src = "\
+            #automaton C { v: u32; }\n\
+            @fn p() -> u32 { \
+              let a := @snapshot C.v; \
+              let b := @snapshot C.v; \
+              let c := @snapshot C.v; \
+              return a; \
+            }\n\
+        ";
+        let errors = infer_str(src).expect_err("expected E0550");
+        let count = errors
+            .iter()
+            .filter(|e| matches!(e, TypeError::SnapshotInUnreadableFn { fn_name, .. } if fn_name == "p"))
+            .count();
+        assert_eq!(count, 1, "expected exactly one E0550; got {count}: {errors:?}");
+    }
+
+    #[test]
+    fn snapshot_in_imperative_layer_silent() {
+        // ADR 0004 P3: `#`-layer (effects, interrupts, transitions)
+        // are NOT row-gated; they may always observe automaton state.
+        // The E0550 check skips them entirely.
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #effect e() #mutates: [C] { \
+              let v := @snapshot C.v; \
+              C.v = v; \
+            }\n\
+        ";
+        // The body-walker may still report something else, but no E0550.
+        let res = infer_str(src);
+        if let Err(errors) = &res {
+            let saw_e0550 = errors.iter().any(|e| matches!(
+                e,
+                TypeError::SnapshotInUnreadableFn { .. }
+            ));
+            assert!(!saw_e0550, "imperative-layer should not trigger E0550; got {errors:?}");
+        }
+    }
+
+    #[test]
+    fn diagnostic_carries_decl_and_snapshot_offsets() {
+        let src = "\
+            #automaton C { v: u32; }\n\
+            @fn p() -> u32 { let v := @snapshot C.v; return v; }\n\
+        ";
+        let errors = infer_str(src).expect_err("expected E0550");
+        for e in &errors {
+            if let TypeError::SnapshotInUnreadableFn { fn_name, at, decl_at } = e {
+                assert_eq!(fn_name, "p");
+                assert!(*decl_at < *at, "decl_at must precede snapshot at");
+                assert!(*at < src.len());
+                return;
+            }
+        }
+        panic!("expected E0550, got {errors:?}");
     }
 }
