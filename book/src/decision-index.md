@@ -28,7 +28,8 @@ The complete Decision → chapter map.
 | #20 | First-class bitfield access | Ch. 20 | ✓ LOCKED |
 | #21 | **Shared automata via mutator multivectors** | **Ch. 21** | ✓ LOCKED v0.6, impl v0.7 |
 | #22 | **Kinds of imperative** (extend `$ [TraitList]` to `#effect`/`#interrupt`/`#transition`) | **Ch. 22** | ✓ LOCKED, impl v0.2 |
-| #23 | Tighten `@fn` toward Haskell-clean (totality, effect rows, refinements) | **Ch. 23** | DESIGN-IN-PROGRESS (ADR 0003) |
-| #24 | `@snapshot Auto.field` boundary operator | **Ch. 24** | DESIGN-IN-PROGRESS (ADR 0004) |
+| #23 | Tighten `@fn` toward Haskell-clean (totality, effect rows, refinements) | **Ch. 23** | ✓ LOCKED 2026-05-05 (ADR 0003), impl v0.2 |
+| #24 | `@snapshot Auto.field` boundary operator | **Ch. 24** | ✓ LOCKED 2026-05-05 (ADR 0004), impl v0.2 |
 | #25 | **`#hidden` field encapsulation** (basis vector private to owning automaton) | **Ch. 25** | ✓ LOCKED, impl v0.2 |
+| #26 | **Rotor-based plane-confined locks** (refines #21; rotor-as-acquisition) | **Ch. 26** | ✓ LOCKED 2026-05-05 (ADR 0005), impl v0.7+ |
 

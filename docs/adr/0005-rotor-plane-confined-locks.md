@@ -1,10 +1,10 @@
 # ADR 0005: Rotor-Based Plane-Confined Locks
 
-**Status:** Proposed (2026-05-04)
-**Date:** 2026-05-04
+**Status:** Accepted (2026-05-05)
+**Date:** 2026-05-04 (proposed) → 2026-05-05 (accepted; architect sign-off "yes to all" on the five open questions)
 **Deciders:** Goose (architect)
 **Spec impact:** §7 (Orthogonality Engine — extends Decision #21's mixed-metric machinery), §2 (Grammar — `#rotor_lock` declaration form, `#thread_plane` clause), §4 (Type System — plane-typed lock identifiers)
-**DECISIONS.md:** Refines Decision #21. Targeted as a v0.7+ addition.
+**DECISIONS.md:** Locked as Decision #26 (2026-05-05) — formal *refinement* of Decision #21's lock formulation.
 **Predecessor ADRs:** ADR 0002 (mixed-metric GA, Decision #21).
 **Branch:** `adr/0005-rotor-plane-confined-locks`.
 
@@ -461,20 +461,33 @@ planes); the rotor framing is the more general one.
 
 ## Decision
 
-**Status: Proposed.** Lock after the five open questions in §6 close
-in conversation with the architect. Targeted close: by 2026-06-15.
-Implementation gated to v0.7+ alongside the rest of Decision #21.
+**Status: Accepted (2026-05-05).** Architect signed off on all five
+proposed resolutions in §6 with "yes to all". Implementation gated to
+v0.7+ alongside the rest of Decision #21's mixed-metric machinery.
+Locked as **Decision #26** in `DECISIONS.md` — formal *refinement* of
+Decision #21's `lock(L) = pri(L) + e_L` formulation.
 
-**Action items if accepted:**
+**Resolutions of §6 open questions (locked):**
+
+| # | Question | Locked resolution |
+|---|---|---|
+| Q1 | Thread-plane assignment | **Pool-based at link time for v0.7.** Default pool: `p = 16` shared basis vectors → 8 distinct thread planes (covers typical Cortex-M / RISC-V IRQ counts). Larger pools opt-in. RTOS dynamic case deferred to v0.8+. |
+| Q2 | Re-entrancy semantics | **Counted re-entry** (matches POSIX expectations). Lock owns owner-ID + depth counter at runtime; algebra describes `M_L = R_t(nθ)` for re-entry depth `n`. |
+| Q3 | Same-plane uniqueness | **Hard error `E0539 DuplicateThreadPlane`.** Plane-assignment pass enforces uniqueness. |
+| Q4 | Who carries `θ` for release | **Lock owns its full state.** Threads check "am I owner?" on release. Matches normal-lock runtime model; keeps `θ_t` out of thread-local data. |
+| Q5 | Relation to Decision #21's priority-ordering | **Rotor-as-acquisition supersedes** rotor-as-tiebreak. ADR 0002 §5.5's priority-ordering deadlock-freedom proof is re-derived in terms of plane-acquisition order; priority becomes the canonical strict total order on planes. The two formulations are equivalent; the rotor framing is the more general one. |
+
+**Action items (v0.7+ implementation):**
 1. Add `#rotor_lock`, `#thread_plane`, `#guarded_by`, `#with_lock`
    tokens to the lexer (most are already reserved per Decision #21).
 2. Extend the AST with `RotorLockDecl` and `ThreadPlane` clauses.
 3. Implement the plane-assignment pass (mirror of §7.1 basis assignment).
 4. Implement the static lock-confinement check (E0535–E0539 family).
-5. Lower to standard CAS spinlocks in codegen.
-6. Book chapter (Part II: Decision #21 § supplement, or a separate
-   chapter in Part III adjacent to Ch. 28 "Rotors and same-priority
-   tiebreaks").
+5. Lower to standard CAS spinlocks in codegen (with depth counter
+   for Q2 counted re-entry).
+6. Book chapter slot reserved (likely a Part-III chapter adjacent
+   to Ch. 32 "Rotors and same-priority tiebreaks") — full chapter
+   lands with implementation PR.
 
 ---
 

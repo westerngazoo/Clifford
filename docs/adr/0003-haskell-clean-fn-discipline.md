@@ -1,10 +1,10 @@
 # ADR 0003: Haskell-Clean `@fn` Discipline
 
-**Status:** Proposed (2026-05-04)
-**Date:** 2026-05-04
+**Status:** Accepted (2026-05-05)
+**Date:** 2026-05-04 (proposed) → 2026-05-05 (accepted; architect sign-off "yes to all" on the propositions)
 **Deciders:** Goose (architect)
 **Spec impact:** §4 (Type System), §5 (Type Checker), §2 (Grammar — possibly), §10 (Error codes — E05xx range expansion)
-**DECISIONS.md:** Decision #23 ✓ DESIGN-IN-PROGRESS — locks once this ADR closes.
+**DECISIONS.md:** Decision #23 ✓ LOCKED (2026-05-05) per this ADR.
 **Refines:** Decision #1 (sigil layering), Refinement #1a (local-stack mutation in `@fn`).
 **Branch:** `adr/0003-0004-haskell-clean-fn-and-snapshot`.
 
@@ -395,21 +395,36 @@ firmware case to justify the no-solver decision.
 
 ## Decision
 
-**Status: Proposed.** The four-axis trade table in §"TL;DR" is the
-core question; the proposed-resolutions in §6 close out the
-implementation details once the core is locked.
+**Status: Accepted (2026-05-05).** Architect signed off "yes to all"
+on the four core trade-offs (P1–P4) and all five sub-resolutions
+(Q1–Q5).
 
-**Action items if accepted:**
+**Locked resolutions:**
+
+| # | Question | Locked resolution |
+|---|---|---|
+| P1 | Totality | **Required by default**; `@partial @fn` opt-out (Idris-style structural-recursion check; non-structural recursion → `E0540`). |
+| P2 | Effect rows | **First-class** via `$ [TraitList]` extension: `Readable`, `Observable`, `Pure`, `Opaque` with row-composition checking (`E0541`). |
+| P3 | Refinement types | **Limited** via §5.8 sigma-bound (Decision #14) extension to function arguments. **No SMT solver in v0.2**. `E0542 RefinementNotDischarged` for failures. SMT-backed refinements deferred to v1.0+ separate ADR. |
+| P4 | Local mutation | Refinement #1a unchanged. |
+| Q1 | v0.2 structural-recursion rule | **Three-rule cut**: (1) pattern-matched constructor args, (2) sigma-bounded indexing, (3) tail recursion. Ackermann-style well-founded relations deferred to v0.4+. |
+| Q2 | `#`-layer caller of `@fn` row inheritance | **No.** `@fn → @fn` row check is one-directional; `#effect`/`#interrupt`/`#transition` may freely call any `@fn`. Matches Decision #1's sigil-layer asymmetry. |
+| Q3 | `Throws<E>` vs `Result<_, E>` | **`Result` only** in v0.2. Koka-style `@throw`/`try` deferred to v0.4+. |
+| Q4 | `Diverges` trait | **Drop.** `@partial` already covers non-termination. |
+| Q5 | SMT-backed refinements timeline | **v1.0+ separate ADR.** |
+
+**Action items (v0.2 implementation):**
 1. Update DECISIONS.md Decision #23 from DESIGN-IN-PROGRESS to
    ✓ LOCKED with a one-paragraph summary referencing this ADR.
 2. Add the totality-check skeleton to `clifford-check` (parser
-   accepts `@partial`; check walks the AST).
+   accepts `@partial`; check walks the AST applying the three-rule
+   structural-recursion cut from Q1).
 3. Extend `$ [TraitList]` semantics in `clifford-types` to include
-   `Readable`, `Observable`, `Diverges` removed.
+   `Readable`, `Observable` rows; `Diverges` removed.
 4. Introduce E0540, E0541, E0542 to spec §10 error-code table.
 5. Update book Ch. 23 (Decision #23 chapter) from stub to full
    chapter mirroring the structure of book Ch. 25 (Decision #25 — the
-   reference quality bar).
+   reference quality bar) — happens with the implementation PR.
 
 ---
 

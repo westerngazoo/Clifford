@@ -1,6 +1,6 @@
 # Clifford Language: Critical Design Decisions
 
-**Status:** Decisions #1–#22 and #25 LOCKED; Decisions #23 and #24 DESIGN-IN-PROGRESS (ADRs forthcoming). Implementation gating: #12 and #18 designed but deferred to v0.2; #21 design locked, implementation gated to v0.7; #22 and #25 design locked, implementation slated for v0.2. Refinement #1a LOCKED. Phase 1 implementation underway.
+**Status:** Decisions #1–#26 LOCKED. Implementation gating: #12 and #18 designed but deferred to v0.2; #21 design locked, implementation gated to v0.7; #22, #23, #24, #25 design locked, implementation slated for v0.2; #26 (rotor-plane locks, refines #21) implementation gated to v0.7. Refinement #1a LOCKED. Phase 1 implementation underway.
 **Dates:** see footer below for the full chronological log.
 **Owner:** Goose (Gustavo Delgadillo)
 **Positioning:** General-purpose systems language; embedded firmware is the canonical first target but not the only target. Decisions are language-level and apply across domains.
@@ -1226,11 +1226,12 @@ Spec edit + parser + AST extension lands in a follow-up Phase-1 work item; no ru
 
 ---
 
-## Decision #23: Tighten `@fn` Toward Haskell-Clean Discipline 🔬 DESIGN-IN-PROGRESS
+## Decision #23: Tighten `@fn` Toward Haskell-Clean Discipline ✓ LOCKED
 
 **Date proposed:** 2026-05-03
-**Status:** Direction agreed; ADR pending.
-**Tracking ADR:** `docs/adr/0003-haskell-clean-fn-discipline.md` (forthcoming).
+**Date locked:** 2026-05-05 (architect sign-off "yes to all" on ADR 0003 propositions)
+**Status:** Locked.
+**Tracking ADR:** `docs/adr/0003-haskell-clean-fn-discipline.md` (Accepted 2026-05-05).
 
 ### Summary
 
@@ -1254,21 +1255,29 @@ The ADR will:
 - Decide whether refinement types ride on top of an SMT call (F* style) or stay decidable-by-structural-induction.
 - Identify which subset is in scope for v0.2 vs deferred to v0.3+.
 
-### Why locked the direction now
+### Locked resolutions (per ADR 0003, accepted 2026-05-05)
 
-The user has committed to "the pure side becomes Haskell-clean." Without recording the direction, future ad-hoc `@fn` extensions risk drifting away from the goal. ADR #0003 nails down the specifics; this entry locks the *intent*.
+The four core trade-offs and five sub-questions all carry their proposed resolutions verbatim from ADR 0003 §"Decision":
+
+- **P1 Totality:** required by default; `@partial @fn` opt-out via Idris-style structural recursion (three-rule cut: pattern-matched constructor args, sigma-bounded indexing, tail recursion). Non-structural recursion → `E0540`.
+- **P2 Effect rows:** first-class via `$ [TraitList]` extension — `Readable`, `Observable`, `Pure`, `Opaque` with row-composition checking (`E0541`). `@fn → @fn` row check is one-directional; `#`-layer callers freely call any `@fn`.
+- **P3 Refinement types:** limited via §5.8 sigma-bound (Decision #14) extension to function arguments. **No SMT in v0.2** (`E0542 RefinementNotDischarged`); SMT-backed refinements deferred to v1.0+ separate ADR.
+- **P4 Local mutation:** Refinement #1a unchanged.
+- **Q3:** `Result<_, E>` only in v0.2; Koka-style `@throw`/`try` deferred to v0.4+.
+- **Q4:** `Diverges` trait dropped; `@partial` covers non-termination.
 
 ### Implementation status
 
-ADR drafting → spec amendments → implementation, in that order. v0.2-or-later target.
+v0.2: totality skeleton in `clifford-check`; `Readable`/`Observable` rows in `clifford-types`; `@partial` parser support; `Diverges` removed. Subsequent slices: refinements on function arguments. The book Ch. 23 chapter graduates from stub to full text alongside the implementation PR (target: v0.2-α).
 
 ---
 
-## Decision #24: Explicit Boundary-Crossing via `@snapshot` 🔬 DESIGN-IN-PROGRESS
+## Decision #24: Explicit Boundary-Crossing via `@snapshot` ✓ LOCKED
 
 **Date proposed:** 2026-05-03
-**Status:** Direction agreed; ADR pending.
-**Tracking ADR:** `docs/adr/0004-snapshot-boundary-operator.md` (forthcoming).
+**Date locked:** 2026-05-05 (architect sign-off "yes to all" on ADR 0004 propositions)
+**Status:** Locked.
+**Tracking ADR:** `docs/adr/0004-snapshot-boundary-operator.md` (Accepted 2026-05-05).
 
 ### Summary
 
@@ -1302,13 +1311,20 @@ Subtleties to nail down:
 - Does it desugar to a function call (so `cliffordc audit` can grep for it) or does it need first-class AST representation?
 - Backward-compatibility with the existing snapshot-by-convention pattern in book Ch. 39: do existing programs need to be rewritten, or does the convention become syntactic sugar for `@snapshot`?
 
-### Why locked the direction now
+### Locked resolutions (per ADR 0004, accepted 2026-05-05)
 
-Same reasoning as #23: the user committed to "boundary crossings should be visible." ADR #0004 specifies the surface; this entry locks the intent.
+- **P1 Form:** Expression. `let v := @snapshot Counter.value;` composes anywhere.
+- **P2 Copy semantics:** Copy-by-value for `Copy` types in v0.2; `@snapshot_ref` borrow form deferred to v0.4+. Larger-than-word types → `E0551 SnapshotNotAtomic` (use `#shared` + lock).
+- **P3 Interaction with `#shared` (Decision #21):** lock-holding proof required. From `@fn` in v0.2: `E0552 SnapshotNeedsLockProof` — only from `#`-layer.
+- **P4 Migration:** Two-phase. v0.2: deprecation warning `W0001 ImplicitFieldRead`. v0.4+: hard `E0101`.
+- **Q1:** `@snapshot` is **not pure** — controlled effect. `Readable` trait is the marker. Two snapshots of the same field MAY observe different values.
+- **Q2:** `@snapshot Self.field` inside `#transition` → `E0553 SnapshotInImperative` (use bare `Self.field`).
+- **Q3:** Single field path only in v0.2; composite reads (`@snapshot Auto.field[expr]`) deferred to v0.4+.
+- **Q5 Memory ordering:** v0.2 implies `Acquire` for `#shared` snapshots; explicit ordering deferred to v0.7+.
 
 ### Implementation status
 
-ADR drafting → parser support → spec amendments → tooling integration. v0.2 target.
+v0.2: `@snapshot` lexer token; `SnapshotExpr` AST; the `Readable` row from Decision #23 gates `@snapshot` usage from `@fn` (`E0550`); E0550–E0553 + W0001 enter the §10 error-code table. Book Ch. 24 graduates from stub to full text alongside the implementation PR. Book Ch. 43 (formerly Ch. 39) SPSC example migrates to `@snapshot` + `Readable` form.
 
 ---
 
@@ -1372,6 +1388,45 @@ Spec amendment + parser/resolve extension lands in a follow-up Phase-1 work item
 
 ---
 
+## Decision #26: Rotor-Based Plane-Confined Locks (refines #21) ✓ LOCKED
+
+**Date locked:** 2026-05-05 (architect sign-off "yes to all" on ADR 0005's five open questions)
+**Tracking ADR:** `docs/adr/0005-rotor-plane-confined-locks.md` (Accepted 2026-05-05).
+**Spec impact:** §7 (Orthogonality Engine — extends Decision #21's mixed-metric machinery), §2 (Grammar — `#rotor_lock`, `#thread_plane`, `#guarded_by`, `#with_lock`), §10 (Error codes — E0535 family).
+**Refines:** Decision #21 (shared automata via mutator multivectors).
+
+### Summary
+
+Decision #21 / ADR 0002 already established that locks are multivectors `lock(L) = pri(L) + e_L` in a mixed-metric Clifford algebra, with rotors playing a *tiebreak* role for same-priority locks. Decision #26 reframes rotors from tiebreak machinery to the **acquisition primitive itself**.
+
+A `#rotor_lock L` is conceptually a multivector cell `M`. Initially `M = 1` (scalar identity, "unlocked"). To acquire `L`, a thread `t` whose signature bivector is `B_t` rotates the cell: `M ← R_t · M` where `R_t = exp(-θ_t · B_t / 2)`.
+
+Three properties fall out of the algebra for free:
+
+1. **Mutual exclusion.** Cross-plane acquire produces a non-rotor multivector (odd-grade components) → reject.
+2. **Wrong-thread release detection.** `R̃_t' · R_t ≠ 1` for `t' ≠ t` → reject.
+3. **Re-entrancy by the same thread.** `R_t · R_t = exp(-2θ_t · B_t / 2)` is still a rotor in plane `B_t`.
+
+The static-analysis check is the same wedge-product the orthogonality engine already runs (`caller.thread_plane ∧ lock.plane`). Runtime cost is a normal CAS-based spinlock with an integer owner-ID — `exp` does not appear in generated code.
+
+### Locked resolutions (per ADR 0005, accepted 2026-05-05)
+
+- **Q1 Thread-plane assignment:** Pool-based at link time for v0.7 (default `p = 16` shared basis vectors → 8 distinct planes). RTOS dynamic case deferred to v0.8+.
+- **Q2 Re-entrancy:** Counted (matches POSIX expectations); lock owns owner-ID + depth counter at runtime.
+- **Q3 Same-plane uniqueness:** Hard error `E0539 DuplicateThreadPlane`.
+- **Q4 Who carries θ for release:** Lock owns its full state; thread checks "am I owner?".
+- **Q5 Relation to #21's priority-ordering proof:** Rotor-as-acquisition supersedes; ADR 0002 §5.5's deadlock-freedom proof re-derived in terms of plane-acquisition order. Priority becomes the canonical strict total order on planes; the two formulations are equivalent.
+
+### Diagnostic family
+
+`E0535 PlaneeMismatch`, `E0536 NoThreadPlane`, `E0537 SharedFieldOutsideLock`, `E0538 ReEntryViolation`, `E0539 DuplicateThreadPlane`.
+
+### Implementation status
+
+Implementation gated to **v0.7+** alongside the rest of Decision #21's mixed-metric machinery. v0.1–v0.6: tokens reserved at the lexer (`#shared`, `#lock`, `#with_lock`, `#reads`, `#rotor` already reserved per Decision #21; `#rotor_lock`, `#thread_plane`, `#guarded_by` join them); parser/AST/check work begins when v0.7 milestone opens.
+
+---
+
 ## Decision Matrix
 
 | # | Aspect | Question | Chosen | Impact |
@@ -1398,9 +1453,10 @@ Spec amendment + parser/resolve extension lands in a follow-up Phase-1 work item
 | #20 | Bitfield access | `#mutate Reg { f = (self.f & ~M) \| (v << S) }` vs First-class `Reg.f.bit = v` | **First-class `#bits` annotation with target-atomic RMW** | Eliminates bit-twiddling boilerplate; atomic RMW where a concurrent writer exists, plain RMW otherwise; subfield-level GA basis vectors |
 | #21 | Shared state | Audit-block escape vs Mixed-metric Cl(p,0,n) algebra with priority-as-scalar lock multivectors and rotor tiebreaks | **Mixed-metric Cl(p,0,n) + §5.5 rotor formulation** | Kernels (Wari, seL4-shape) become typecheckable; lock-ordering safety, deadlock-freedom, and interrupt/lock unification all fall out of the algebra; design locked v0.7, scaffolding lands now |
 | #22 | Imperative kinds | Flat `#effect` everywhere vs effect-traits classifying mutation kind | **`$ [TraitList]` on effects** (Hardware, Realtime, Acquire, Release, SeqCst, LockingDiscipline, PureState, Encapsulated) | Imperative side becomes legible without engine impact; codegen / audit / certification consume the traits |
-| #23 | Functional discipline | Status quo `@fn` (excludes `#`-constructs) vs Haskell-clean (total + effect rows + refinement types) | **Haskell-clean direction locked; ADR pending** | Pure side commits fully to its math; brings Idris/Liquid-Haskell/Koka properties to the systems-language tier |
-| #24 | Boundary crossing | Convention-based snapshot pattern vs `@snapshot Auto.field` operator | **Explicit `@snapshot` operator; ADR pending** | Reading mutable state into pure analysis becomes a visible, named act; supports future read-tracking |
+| #23 | Functional discipline | Status quo `@fn` (excludes `#`-constructs) vs Haskell-clean (total + effect rows + refinement types) | **Haskell-clean (totality + Readable/Observable rows + sigma-bound refinements)** | Pure side commits fully to its math; brings Idris-style totality + Koka-style rows to the systems-language tier; SMT-backed refinements deferred to v1.0+ |
+| #24 | Boundary crossing | Convention-based snapshot pattern vs `@snapshot Auto.field` operator | **Explicit `@snapshot` expression**; copy-by-value for Copy types in v0.2; lock-holding proof for `#shared` snapshots | Reading mutable state into pure analysis becomes a visible, named act gated by the `Readable` row; supports future read-tracking |
 | #25 | Encapsulation | Re-add `#hidden` per-field modifier with algebraic-trivial-orthogonality interpretation | **`#hidden` on automaton fields** | Implementation hiding by construction; field never appears in outside callables' basis sets, so wedge never collapses against it from outside |
+| #26 | Lock acquisition (refines #21) | Rotor-as-tiebreak vs rotor-as-acquisition primitive | **Rotor-as-acquisition** with counted re-entry, lock-owns-θ, plane-uniqueness enforced as `E0539` | Mutual exclusion + wrong-thread-release detection + re-entrancy all fall out of GA wedge product; runtime is normal CAS spinlock; static check is the engine's existing wedge primitive |
 
 ---
 
@@ -1469,7 +1525,7 @@ Spec amendment + parser/resolve extension lands in a follow-up Phase-1 work item
 
 ## Open Questions
 
-Decisions #1–#22 and #25 are locked alongside six emergent rules and Refinement #1a; Decisions #23 and #24 are DESIGN-IN-PROGRESS pending their respective ADRs (`0003-haskell-clean-fn-discipline.md`, `0004-snapshot-boundary-operator.md`). Implementation gating per the status header at the top of this file: #12 and #18 deferred to v0.2; #21 implementation gated to v0.7; #22 and #25 design locked, implementation slated for v0.2. Items previously listed as open in `CLIFFORD_SPEC.md §12` and resolved here:
+Decisions #1–#26 are all locked alongside six emergent rules and Refinement #1a. Implementation gating per the status header at the top of this file: #12 and #18 deferred to v0.2; #21 and #26 implementation gated to v0.7; #22, #23, #24, #25 design locked with implementation slated for v0.2. Items previously listed as open in `CLIFFORD_SPEC.md §12` and resolved here:
 
 - ~~Effect/state/transition coupling~~ — Resolved by Decision #5.
 - ~~`#hardware` capabilities~~ — Resolved by Decision #6 (subsumed into `#automaton` with hardware annotations).
