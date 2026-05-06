@@ -7,6 +7,73 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Decision #24: `@snapshot` type inference + `Readable`-row gating (E0550) (2026-05-05)
+
+Second slice of v0.2-α follow-up work. The parser slice (`feat/v0.2a-
+partial-snapshot-readable`) landed `@snapshot` AST nodes; this PR
+gives them types and enforces ADR 0004 Q1's "controlled effect"
+discipline by gating `@snapshot` from `@fn` bodies behind the
+`Readable` row.
+
+**Type inference (`crates/types/src/lib.rs`):**
+
+- New `infer_expr` arm for `ExprKind::Snapshot { automaton, field }`:
+  returns the field's declared type via the existing
+  `automaton_field_types` registry. If the lookup fails (unresolved
+  automaton or field), returns `Type::Unknown` — the resolver
+  already reported E0403 / E0405 for that case, so a parallel
+  E0xxx from the type checker would be noise.
+
+**Readable-row gate (`crates/types/src/lib.rs`):**
+
+- New `TypeError::SnapshotInUnreadableFn { fn_name, at, decl_at }`
+  variant (`E0550`). Diagnostic names the offending `@fn`, the
+  byte offset of the first `@snapshot` in the body, and the
+  declaration site so users see where to add `$ [Readable]`.
+- New `validate_snapshot_row_gates(program, errors)` pass walks
+  every `Item::Fn`, runs a `SnapshotFinder` over the body, and if
+  any `@snapshot` is found, verifies the function's `trait_list`
+  contains `Readable`. Otherwise emits E0550. Per ADR 0004 P3,
+  `#`-layer callables (`#effect` / `#interrupt` / `#transition`)
+  are *not* gated — they are imperative and may always observe
+  state.
+- New `SnapshotFinder` walker mirroring `clifford-check`'s
+  `SelfRecursionFinder`: visits Call args, MethodCall, Binary,
+  Unary, Ref, Paren, Tuple, Array, ArrayRepeat, FieldAccess,
+  Index, Cast, Range — every place a snapshot could hide.
+  First-snapshot-wins → one E0550 per `@fn`.
+
+**Semantics enforced:**
+
+- `Pure` and `Observable` rows do *not* subsume `Readable` —
+  `@snapshot` requires the explicit `Readable` row label per
+  ADR 0003 P2's row design.
+- Empty `$ []` and absent trait list both default to `[Pure]`
+  (Emergent Rule 2), which lacks `Readable` — so they correctly
+  emit E0550 when the body uses `@snapshot`.
+- `@fn`s without any `@snapshot` are silent regardless of trait
+  list (no spurious diagnostics).
+- The diagnostic invariant `decl_at < snapshot_at < src.len()`
+  holds.
+
+**Tests (12 new tests, types crate now 128 total, was 116):**
+
+- Snapshot yields field type (positive control); type-mismatch
+  via wrong annotation correctly fires E0512.
+- `$ [Readable]` accepted; missing/`$ [Pure]`/`$ [Observable]` →
+  E0550.
+- Snapshot in arg position / binary expression / let RHS — all
+  caught by the SnapshotFinder.
+- `@fn` without snapshot silent regardless of row.
+- One E0550 per offending fn (multiple snapshots → one error).
+- `#`-layer (`#effect`) snapshot silent (ADR 0004 P3).
+- Diagnostic offset invariant verified.
+
+Workspace remains green; clippy clean.
+
+This is the second of three planned slices in the v0.2-β batch
+(totality → snapshot typing/gating → E0553 inside transitions).
+
 ### Added — Check Slice 3: Decision #23 totality check (E0540) (2026-05-05)
 
 First implementation of Decision #23 / ADR 0003's totality
