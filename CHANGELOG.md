@@ -7,6 +7,92 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Decision #23: mutual-recursion detection via Tarjan SCC (E0543) (2026-05-05)
+
+Closes the documented gap from the v0.2-β totality slice. Direct
+self-recursion was already caught (E0540 TotalityViolation); the
+canary test `mutual_recursion_not_yet_caught` flagged that mutual
+recursion was deliberately deferred. This PR replaces the singleton
+direct-recursion finder with a unified SCC-based pass that catches
+both shapes.
+
+**Implementation (`crates/check/src/lib.rs`):**
+
+- New `CheckError::MutualRecursionViolation { fn_names, decl_at_first }`
+  variant (E0543). One diagnostic per SCC; member names listed in
+  lex-smallest-first canonical order so the same cycle isn't reported
+  twice from different starting points.
+- `check_totality` rewritten around Tarjan's strongly-connected-
+  components algorithm:
+  1. Build the `@fn` call graph (`HashMap<String, HashSet<String>>`)
+     by walking each `@fn` body and recording direct calls to other
+     `@fn`s. `#`-layer callees are deliberately excluded (the
+     boundary checker rejects cross-layer calls separately;
+     totality is a pure-side discipline).
+  2. Run Tarjan SCC. The implementation is textbook Tarjan with
+     deterministic neighbour ordering (sorted) and deterministic
+     entry-point ordering (sorted) so SCC contents and order are
+     stable across hash-iteration runs.
+  3. For each SCC: skip non-cyclic singletons; skip cycles whose
+     every member is `@partial`; emit E0540 for self-loop singletons
+     (preserving the existing direct-recursion diagnostic shape) or
+     E0543 for size-≥-2 cycles (new mutual-recursion diagnostic).
+- New helpers: `build_fn_call_graph`, `collect_fn_calls_in_block` /
+  `_in_stmt` / `_in_expr` (walk `@fn` bodies for direct calls),
+  `tarjan_scc` (the SCC algorithm).
+- Existing `SelfRecursionFinder` retained — it's now used to find
+  the *first* self-call site within a singleton SCC so the E0540
+  diagnostic still points at the actual call expression rather than
+  just the declaration.
+
+**Semantics (closes ADR 0003 v0.2-β + this slice):**
+
+- `@fn even → odd → even` (size-2 cycle, no `@partial`) → E0543
+  with `fn_names = ["even", "odd"]`.
+- `@fn a → b → c → a` (size-3 cycle) → one E0543 with
+  `["a", "b", "c"]`.
+- `@partial @fn even → @partial @fn odd → even` (all-`@partial`
+  cycle) → silent.
+- `@partial @fn even → @fn odd → even` (subset `@partial`) →
+  E0543 still fires; users must mark *every* member.
+- `@fn loop_me(n) { return loop_me(n); }` (size-1 cycle / self-loop)
+  → E0540 (existing direct-recursion shape, preserved).
+- `@fn h → g → f` (linear chain, no cycle) → silent.
+- Two disjoint cycles → two E0543s, one per SCC.
+
+**What this slice deliberately defers:**
+
+- Structural-recursion three-rule cut (ADR 0003 Q1: pattern-matched
+  constructor args, sigma-bounded indexing, tail position) — common
+  total recursions still need `@partial` today; v0.4+ slice will
+  accept them automatically.
+- `#`-layer callees in the graph — totality is pure-side only;
+  cross-layer is the boundary checker's job.
+- Bound-aware totality (e.g. recursing on a sigma-bounded index)
+  — same v0.4+ slice as above.
+
+**Tests (10 new, check crate now 70 total, was 61):**
+
+- 2-member cycle → E0543 with both names lex-sorted.
+- 3-member cycle reported as one E0543 with all members.
+- All-`@partial` cycle → silent.
+- Subset-`@partial` cycle → E0543 still fires.
+- One E0543 per SCC, not per member (no triple-reporting on size-3
+  cycles).
+- Two disjoint cycles → two E0543s.
+- Linear non-cyclic chain → silent.
+- Self-loop (size-1 cycle) → E0540, NOT E0543 (distinct shapes
+  preserved).
+- Diagnostic carries `decl_at_first` pointing at the lex-smallest
+  member's declaration byte.
+- Isolated `@fn` (no calls) → silent.
+
+The pre-slice canary test `mutual_recursion_not_yet_caught` was
+flipped to `mutual_recursion_now_caught_as_e0543` and asserts the
+new behaviour — the documented gap is closed.
+
+Workspace remains green; clippy clean.
+
 ### Type Checker — Slice T4c: generic alias substitution + E0518/E0519 path validation (2026-05-05)
 
 Third slice of type-checker path-resolution work. T4a translated

@@ -56,6 +56,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+use std::collections::HashMap;
+
 use clifford_ast::{
     AutomatonDecl, Block, EffectDecl, Expr, ExprKind, FnDecl, InterruptDecl, Item, Program, Stmt,
     StmtKind, TransitionDecl,
@@ -193,6 +195,36 @@ pub enum CheckError {
         at: usize,
     },
 
+    /// A set of two or more non-`@partial` `@fn`s form a *mutual-
+    /// recursion cycle* in the call graph. Per Decision #23 / ADR 0003,
+    /// every `@fn` is total by default, and that includes participants
+    /// in mutual-recursion cycles — totality must be witnessed by *all*
+    /// members of an SCC, otherwise the cycle is non-terminating.
+    ///
+    /// One E0543 per SCC: the diagnostic lists every member name in
+    /// canonical (lex-smallest first, then ordered) order so the same
+    /// cycle isn't reported multiple times from different starting
+    /// points.
+    ///
+    /// As with E0540, the first-cut fix is to mark *every* member of
+    /// the cycle `@partial`. A future slice will add the structural-
+    /// recursion three-rule cut from ADR 0003 Q1, which will accept
+    /// some mutually-recursive bodies (e.g. recursing on a structurally-
+    /// smaller constructor arg through both fns).
+    ///
+    /// The diagnostic carries the cycle members and the byte offset of
+    /// the first member's declaration so editors can navigate to it.
+    #[error("E0543: mutual-recursion cycle among non-`@partial` `@fn`s `{fn_names:?}`; mark each member `@partial @fn` to opt out of the totality check (first member declared at byte {decl_at_first})")]
+    MutualRecursionViolation {
+        /// Cycle members in canonical order (lex-smallest first, then
+        /// the cycle traversal order). Always size ≥ 2 — single-fn
+        /// cycles (self-loops) are reported as `TotalityViolation`
+        /// (E0540) instead.
+        fn_names: Vec<String>,
+        /// Byte offset of the first member's `@fn` declaration.
+        decl_at_first: usize,
+    },
+
     /// A non-`@partial` `@fn` contains a recursive call to itself
     /// (direct recursion) without satisfying any of the structural-
     /// recursion rules from ADR 0003 Q1's three-rule cut.
@@ -300,47 +332,307 @@ pub fn check(program: &Program, resolution: &Resolution) -> Result<(), Vec<Check
     }
 }
 
-/// Decision #23 / ADR 0003 totality check (Slice 3 minimum-viable form).
+/// Decision #23 / ADR 0003 totality check.
 ///
-/// Walks every non-`@partial` `@fn` and reports `E0540 TotalityViolation`
-/// if the body contains a direct recursive call (a `Call { callee:
-/// Path([fn.name]), … }` expression). This is the most conservative form
-/// of the totality rule: any direct self-recursion is rejected unless
-/// the function is marked `@partial`.
+/// Builds the `@fn` call graph (vertex per `@fn` declaration; edge per
+/// direct call to another `@fn`), then runs Tarjan's strongly-connected-
+/// components algorithm to find every recursion cycle:
+///
+/// - **Self-loop SCC** (size 1 with edge to self) — direct recursion.
+///   Emits `E0540 TotalityViolation` naming the offending `@fn` and
+///   the byte offset of the first self-call site.
+/// - **Multi-member SCC** (size ≥ 2) — mutual recursion. Emits
+///   `E0543 MutualRecursionViolation` listing every cycle member; one
+///   diagnostic per SCC.
+/// - **Acyclic singletons** — no recursion, no diagnostic.
+///
+/// Both shapes are gated by the `@partial` opt-out. A cycle whose
+/// members are *all* `@partial` is silent; if *any* member is
+/// non-`@partial`, the cycle reports.
 ///
 /// Slice scope (per ADR 0003 implementation milestones):
 ///
-/// - **This slice (v0.2-β):** direct recursion → E0540 unless `@partial`.
+/// - **v0.2-β + this refactor:** direct + mutual recursion via SCC →
+///   E0540 / E0543 unless every cycle member is `@partial`.
 /// - **v0.4+:** layered three-rule cut so common total recursions
 ///   (recursing on a constructor arg, sigma-bound index, tail position)
-///   are accepted without `@partial`.
-/// - **Future:** mutual recursion via Tarjan SCC over the `@fn`
-///   call graph; today mutual recursion slips through.
-///
-/// First-recursive-call wins: only one E0540 is emitted per function,
-/// pointing at the first self-call the walker encounters in source
-/// order. This matches rustc's "report each error once" convention and
-/// keeps the output noise-free when a fn has many recursive call sites.
+///   are accepted without `@partial` even when they appear in a cycle.
 fn check_totality(program: &Program, errors: &mut Vec<CheckError>) {
+    let graph = build_fn_call_graph(program);
+    let sccs = tarjan_scc(&graph);
+
+    // Index `@fn` declarations by name for span / partial lookup.
+    let mut fn_by_name: HashMap<&str, &FnDecl> = HashMap::new();
     for item in &program.items {
         if let Item::Fn(decl) = item {
-            if decl.partial {
-                continue;
-            }
+            fn_by_name.insert(decl.name.as_str(), decl);
+        }
+    }
+
+    for scc in sccs {
+        // Every cycle member must be present in fn_by_name (we built
+        // the graph from declarations). Skip any orphan defensively.
+        let members: Vec<&FnDecl> = scc
+            .iter()
+            .filter_map(|name| fn_by_name.get(name.as_str()).copied())
+            .collect();
+        if members.is_empty() {
+            continue;
+        }
+
+        // SCC size 1 with no self-edge → not a cycle (Tarjan returns
+        // singletons regardless of self-edges; we only care here about
+        // self-edges OR multi-member SCCs).
+        let is_cycle = members.len() > 1
+            || graph
+                .get(scc[0].as_str())
+                .is_some_and(|callees| callees.contains(&scc[0]));
+        if !is_cycle {
+            continue;
+        }
+
+        // If *every* member is `@partial`, the cycle is opted out.
+        if members.iter().all(|d| d.partial) {
+            continue;
+        }
+
+        if members.len() == 1 {
+            // Direct recursion. Re-find the first self-call site so the
+            // diagnostic points at the actual call (not just the decl).
+            let decl = members[0];
             let mut finder = SelfRecursionFinder {
                 target: &decl.name,
                 found_at: None,
             };
             finder.walk_block(&decl.body);
-            if let Some(call_at) = finder.found_at {
-                errors.push(CheckError::TotalityViolation {
-                    fn_name: decl.name.clone(),
-                    call_at,
-                    decl_at: decl.span.start,
-                });
-            }
+            let call_at = finder.found_at.unwrap_or(decl.span.start);
+            errors.push(CheckError::TotalityViolation {
+                fn_name: decl.name.clone(),
+                call_at,
+                decl_at: decl.span.start,
+            });
+        } else {
+            // Mutual recursion. List members in canonical (already-
+            // canonicalised by tarjan_scc) order so the same cycle
+            // doesn't surface twice. Use the lex-smallest member's
+            // declaration span as `decl_at_first` so editors land at
+            // a stable offset.
+            let names: Vec<String> = members.iter().map(|d| d.name.clone()).collect();
+            let decl_at_first = members
+                .iter()
+                .map(|d| d.span.start)
+                .min()
+                .unwrap_or(0);
+            errors.push(CheckError::MutualRecursionViolation {
+                fn_names: names,
+                decl_at_first,
+            });
         }
     }
+}
+
+/// Build the `@fn` direct-call graph: vertex per `@fn` declaration,
+/// edge per direct call expression whose callee is a single-segment
+/// path matching another `@fn` name.
+///
+/// Cross-layer calls (`#effect` / `#interrupt` / `#transition`) are
+/// *not* edges in this graph — the totality discipline is a pure-side
+/// property; `#`-layer callables are always partial-by-construction
+/// per ADR 0003. (Today the boundary checker would already reject a
+/// `@fn → #effect` call; the graph just doesn't track those edges
+/// even when present.)
+fn build_fn_call_graph(program: &Program) -> HashMap<String, std::collections::HashSet<String>> {
+    let fn_names: std::collections::HashSet<String> = program
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Fn(d) => Some(d.name.clone()),
+            _ => None,
+        })
+        .collect();
+
+    let mut graph: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+    for item in &program.items {
+        if let Item::Fn(decl) = item {
+            let mut callees = std::collections::HashSet::new();
+            collect_fn_calls_in_block(&decl.body, &fn_names, &mut callees);
+            graph.insert(decl.name.clone(), callees);
+        }
+    }
+    graph
+}
+
+fn collect_fn_calls_in_block(
+    block: &Block,
+    fn_names: &std::collections::HashSet<String>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    for s in &block.stmts {
+        collect_fn_calls_in_stmt(s, fn_names, out);
+    }
+}
+
+fn collect_fn_calls_in_stmt(
+    stmt: &Stmt,
+    fn_names: &std::collections::HashSet<String>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    match &stmt.kind {
+        StmtKind::Let { value, .. } | StmtKind::LetShort { value, .. } => {
+            collect_fn_calls_in_expr(value, fn_names, out);
+        }
+        StmtKind::Expr(e) => collect_fn_calls_in_expr(e, fn_names, out),
+        StmtKind::Return(Some(e)) => collect_fn_calls_in_expr(e, fn_names, out),
+        _ => {}
+    }
+}
+
+fn collect_fn_calls_in_expr(
+    expr: &Expr,
+    fn_names: &std::collections::HashSet<String>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    match &expr.kind {
+        ExprKind::Call { callee, args } => {
+            // Single-segment Path callee matching a known @fn name.
+            if let ExprKind::Path(segs) = &callee.kind {
+                if segs.len() == 1 && fn_names.contains(&segs[0]) {
+                    out.insert(segs[0].clone());
+                }
+            }
+            collect_fn_calls_in_expr(callee, fn_names, out);
+            for a in args {
+                collect_fn_calls_in_expr(a, fn_names, out);
+            }
+        }
+        ExprKind::Binary { lhs, rhs, .. } => {
+            collect_fn_calls_in_expr(lhs, fn_names, out);
+            collect_fn_calls_in_expr(rhs, fn_names, out);
+        }
+        ExprKind::Unary { operand, .. } | ExprKind::Ref { operand, .. } => {
+            collect_fn_calls_in_expr(operand, fn_names, out);
+        }
+        ExprKind::Paren(inner) => collect_fn_calls_in_expr(inner, fn_names, out),
+        ExprKind::Tuple(es) | ExprKind::Array(es) => {
+            for e in es {
+                collect_fn_calls_in_expr(e, fn_names, out);
+            }
+        }
+        ExprKind::ArrayRepeat { value, count } => {
+            collect_fn_calls_in_expr(value, fn_names, out);
+            collect_fn_calls_in_expr(count, fn_names, out);
+        }
+        ExprKind::FieldAccess { obj, .. } => collect_fn_calls_in_expr(obj, fn_names, out),
+        ExprKind::Index { obj, index } => {
+            collect_fn_calls_in_expr(obj, fn_names, out);
+            collect_fn_calls_in_expr(index, fn_names, out);
+        }
+        ExprKind::MethodCall { obj, args, .. } => {
+            collect_fn_calls_in_expr(obj, fn_names, out);
+            for a in args {
+                collect_fn_calls_in_expr(a, fn_names, out);
+            }
+        }
+        ExprKind::Cast { value, .. } => collect_fn_calls_in_expr(value, fn_names, out),
+        ExprKind::Range { lo, hi, .. } => {
+            collect_fn_calls_in_expr(lo, fn_names, out);
+            collect_fn_calls_in_expr(hi, fn_names, out);
+        }
+        _ => {}
+    }
+}
+
+/// Tarjan's strongly-connected-components algorithm.
+///
+/// Returns SCCs in reverse-topological order (sinks first). Within each
+/// SCC, members are ordered lex-smallest first so cycle-reporting is
+/// stable across runs (matching the canonicalisation `clifford-effect`
+/// uses for its proc-call cycle reports).
+///
+/// Implementation: textbook Tarjan with explicit index/lowlink/onstack
+/// state. ~30 lines core logic; the bulk of the function is the visitor
+/// recursion. Cite: Tarjan 1972, "Depth-First Search and Linear Graph
+/// Algorithms."
+fn tarjan_scc(graph: &HashMap<String, std::collections::HashSet<String>>) -> Vec<Vec<String>> {
+    use std::collections::HashSet;
+
+    struct State<'g> {
+        graph: &'g HashMap<String, HashSet<String>>,
+        index_counter: usize,
+        index_of: HashMap<String, usize>,
+        lowlink: HashMap<String, usize>,
+        on_stack: HashSet<String>,
+        stack: Vec<String>,
+        sccs: Vec<Vec<String>>,
+    }
+
+    fn strongconnect(state: &mut State, v: &str) {
+        let v_index = state.index_counter;
+        state.index_of.insert(v.to_owned(), v_index);
+        state.lowlink.insert(v.to_owned(), v_index);
+        state.index_counter += 1;
+        state.stack.push(v.to_owned());
+        state.on_stack.insert(v.to_owned());
+
+        // Visit neighbours in deterministic (sorted) order so SCC
+        // contents are stable across hash-map iteration runs.
+        let mut neighbours: Vec<String> = state
+            .graph
+            .get(v)
+            .into_iter()
+            .flat_map(|s| s.iter().cloned())
+            .collect();
+        neighbours.sort();
+        for w in neighbours {
+            if !state.index_of.contains_key(&w) {
+                strongconnect(state, &w);
+                let w_low = *state.lowlink.get(&w).unwrap_or(&usize::MAX);
+                let v_low = *state.lowlink.get(v).unwrap_or(&usize::MAX);
+                state.lowlink.insert(v.to_owned(), v_low.min(w_low));
+            } else if state.on_stack.contains(&w) {
+                let w_idx = *state.index_of.get(&w).unwrap_or(&usize::MAX);
+                let v_low = *state.lowlink.get(v).unwrap_or(&usize::MAX);
+                state.lowlink.insert(v.to_owned(), v_low.min(w_idx));
+            }
+        }
+
+        let v_low = *state.lowlink.get(v).unwrap();
+        if v_low == v_index {
+            let mut scc = Vec::new();
+            loop {
+                let w = state.stack.pop().expect("non-empty SCC");
+                state.on_stack.remove(&w);
+                let is_root = w == v;
+                scc.push(w);
+                if is_root {
+                    break;
+                }
+            }
+            scc.sort();
+            state.sccs.push(scc);
+        }
+    }
+
+    let mut state = State {
+        graph,
+        index_counter: 0,
+        index_of: HashMap::new(),
+        lowlink: HashMap::new(),
+        on_stack: HashSet::new(),
+        stack: Vec::new(),
+        sccs: Vec::new(),
+    };
+
+    // Visit vertices in deterministic (sorted) order for reproducible
+    // SCC list ordering.
+    let mut all_vertices: Vec<String> = graph.keys().cloned().collect();
+    all_vertices.sort();
+    for v in all_vertices {
+        if !state.index_of.contains_key(&v) {
+            strongconnect(&mut state, &v);
+        }
+    }
+    state.sccs
 }
 
 /// Scanner that walks a `#transition` body emitting `E0553
@@ -1666,25 +1958,24 @@ mod tests {
     }
 
     #[test]
-    fn mutual_recursion_not_yet_caught() {
-        // Documenting the slice-scope deferral: mutual recursion (call
-        // graph cycles of size ≥ 2) is NOT detected in this slice. The
-        // future slice that adds Tarjan SCC analysis will catch it.
-        // For now, two non-`@partial` `@fn`s that call each other
-        // pass without diagnostic — a documented gap, not a soundness
-        // bug.
+    fn mutual_recursion_now_caught_as_e0543() {
+        // Was the v0.2-β canary "mutual recursion not yet caught"; the
+        // SCC slice flips it to detection. Two non-`@partial` `@fn`s
+        // calling each other form a 2-member SCC; E0543
+        // MutualRecursionViolation reports the cycle once with both
+        // names listed in lex order.
         let src = "\
             @fn even(n: u32) -> bool { return odd(n); }\n\
             @fn odd(n: u32) -> bool { return even(n); }\n\
         ";
-        // Expect the boundary check to not flag this — neither fn is
-        // self-recursive, so direct-recursion detection passes silently.
-        // If a future slice flips this, the test becomes the canonical
-        // "mutual recursion now detected" canary.
-        let res = check_str(src);
+        let errors = check_str(src).expect_err("expected E0543");
+        let saw = errors.iter().any(|e| {
+            matches!(e, CheckError::MutualRecursionViolation { fn_names, .. }
+                if fn_names == &vec!["even".to_owned(), "odd".to_owned()])
+        });
         assert!(
-            res.is_ok(),
-            "mutual recursion intentionally not detected this slice; got {res:?}"
+            saw,
+            "expected E0543 with cycle [even, odd]; got {errors:?}"
         );
     }
 
@@ -1867,5 +2158,157 @@ mod tests {
             }
         }
         panic!("expected E0553, got {errors:?}");
+    }
+
+    // ─── Decision #23 / ADR 0003: mutual-recursion detection (E0543) ─────
+
+    #[test]
+    fn three_member_mutual_recursion_caught() {
+        // Cycle a → b → c → a. All three reported in one E0543
+        // (lex-sorted: [a, b, c]).
+        let src = "\
+            @fn a(n: u32) -> u32 { return b(n); }\n\
+            @fn b(n: u32) -> u32 { return c(n); }\n\
+            @fn c(n: u32) -> u32 { return a(n); }\n\
+        ";
+        let errors = check_str(src).expect_err("expected E0543");
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            CheckError::MutualRecursionViolation { fn_names, .. }
+                if fn_names == &vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]
+        ));
+        assert!(saw, "expected E0543 [a, b, c]; got {errors:?}");
+    }
+
+    #[test]
+    fn mutual_recursion_silent_when_all_partial() {
+        // ADR 0003: `@partial` opt-out. A cycle whose every member is
+        // `@partial` is silent.
+        let src = "\
+            @partial @fn even(n: u32) -> bool { return odd(n); }\n\
+            @partial @fn odd(n: u32) -> bool { return even(n); }\n\
+        ";
+        assert!(
+            check_str(src).is_ok(),
+            "all-@partial cycle should be silent"
+        );
+    }
+
+    #[test]
+    fn mutual_recursion_partial_subset_still_emits() {
+        // If *any* member is non-`@partial`, the cycle reports. The
+        // user must mark every member to opt out.
+        let src = "\
+            @partial @fn even(n: u32) -> bool { return odd(n); }\n\
+            @fn odd(n: u32) -> bool { return even(n); }\n\
+        ";
+        let errors = check_str(src).expect_err("expected E0543 (subset partial)");
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            CheckError::MutualRecursionViolation { .. }
+        )));
+    }
+
+    #[test]
+    fn one_e0543_per_scc_not_per_member() {
+        // Even a 3-member cycle reports exactly ONE E0543, not three.
+        let src = "\
+            @fn a(n: u32) -> u32 { return b(n); }\n\
+            @fn b(n: u32) -> u32 { return c(n); }\n\
+            @fn c(n: u32) -> u32 { return a(n); }\n\
+        ";
+        let errors = check_str(src).expect_err("expected E0543");
+        let count = errors
+            .iter()
+            .filter(|e| matches!(e, CheckError::MutualRecursionViolation { .. }))
+            .count();
+        assert_eq!(count, 1, "expected exactly one E0543; got {count}: {errors:?}");
+    }
+
+    #[test]
+    fn separate_cycles_each_emit_e0543() {
+        // Two disjoint cycles → two E0543s, one per SCC.
+        let src = "\
+            @fn a(n: u32) -> u32 { return b(n); }\n\
+            @fn b(n: u32) -> u32 { return a(n); }\n\
+            @fn x(n: u32) -> u32 { return y(n); }\n\
+            @fn y(n: u32) -> u32 { return x(n); }\n\
+        ";
+        let errors = check_str(src).expect_err("expected two E0543s");
+        let cycles: Vec<&Vec<String>> = errors
+            .iter()
+            .filter_map(|e| match e {
+                CheckError::MutualRecursionViolation { fn_names, .. } => Some(fn_names),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cycles.len(), 2, "expected two SCCs; got {cycles:?}");
+    }
+
+    #[test]
+    fn non_recursive_fns_in_call_chain_silent() {
+        // `f → g → h` (linear chain, no cycle) is silent.
+        let src = "\
+            @fn h(n: u32) -> u32 { return n; }\n\
+            @fn g(n: u32) -> u32 { return h(n); }\n\
+            @fn f(n: u32) -> u32 { return g(n); }\n\
+        ";
+        assert!(
+            check_str(src).is_ok(),
+            "non-cyclic call chain should be silent; got {:?}",
+            check_str(src)
+        );
+    }
+
+    #[test]
+    fn direct_recursion_still_emits_e0540_not_e0543() {
+        // Self-loops (singleton SCC with self-edge) report as E0540
+        // DirectRecursion, not E0543. The two diagnostics are distinct
+        // shapes for distinct cycle topologies.
+        let src = "@fn loop_me(n: u32) -> u32 { return loop_me(n); }";
+        let errors = check_str(src).expect_err("expected E0540");
+        let saw_e0540 = errors
+            .iter()
+            .any(|e| matches!(e, CheckError::TotalityViolation { fn_name, .. } if fn_name == "loop_me"));
+        let saw_e0543 = errors
+            .iter()
+            .any(|e| matches!(e, CheckError::MutualRecursionViolation { .. }));
+        assert!(saw_e0540, "expected E0540 for self-loop; got {errors:?}");
+        assert!(!saw_e0543, "self-loop should not also emit E0543");
+    }
+
+    #[test]
+    fn mutual_recursion_diagnostic_carries_decl_at_first() {
+        let src = "\
+            @fn even(n: u32) -> bool { return odd(n); }\n\
+            @fn odd(n: u32) -> bool { return even(n); }\n\
+        ";
+        let errors = check_str(src).expect_err("expected E0543");
+        for e in &errors {
+            if let CheckError::MutualRecursionViolation { fn_names, decl_at_first } = e {
+                assert_eq!(fn_names, &vec!["even".to_owned(), "odd".to_owned()]);
+                // `even` is declared first (byte 0), so decl_at_first
+                // should be 0.
+                assert_eq!(*decl_at_first, 0, "expected lex-smallest member's decl byte");
+                return;
+            }
+        }
+        panic!("expected E0543, got {errors:?}");
+    }
+
+    #[test]
+    fn calls_through_imperative_layer_not_in_graph() {
+        // The graph only tracks `@fn → @fn` edges. A `@fn` that doesn't
+        // directly call any other `@fn` (and isn't called by one) is a
+        // singleton SCC with no self-edge → silent.
+        //
+        // This test documents that the graph edge set is *deliberately*
+        // pure-side only; cross-layer call detection is the boundary
+        // checker's job (Slice 1).
+        let src = "@fn helper(n: u32) -> u32 { return n; }";
+        assert!(
+            check_str(src).is_ok(),
+            "isolated `@fn` should be silent"
+        );
     }
 }
