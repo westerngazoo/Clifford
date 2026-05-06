@@ -247,6 +247,44 @@ pub enum TypeError {
         decl_at: usize,
     },
 
+    /// A predeclared trait was used on a callable in the *wrong* sigil
+    /// layer. Decision #22 / ADR 0003 partition the predeclared traits
+    /// into:
+    ///
+    /// - **Pure-side traits** (`@fn` only): `Pure`, `Readable`,
+    ///   `Observable`, `Opaque`. Per ADR 0003 P2 these are the row
+    ///   labels for purity and observation effects.
+    /// - **Imperative-side traits** (`#effect` / `#interrupt` /
+    ///   `#transition` only): `Hardware`, `Realtime`, `Acquire`,
+    ///   `Release`, `SeqCst`, `LockingDiscipline`, `PureState`,
+    ///   `Encapsulated`. Per Decision #22 these are mutation-kind
+    ///   classification + memory-ordering markers.
+    ///
+    /// Putting `Realtime` on an `@fn` (or `Pure` on a `#effect`) is
+    /// rejected here. User-defined `@trait Name { … }` declarations
+    /// are *layer-universal* in v0.2-β — they validate on either side.
+    /// (A future slice may add a layer tag to `@trait` if use cases
+    /// surface; for now the conservative-permissive choice is the
+    /// right one.)
+    ///
+    /// The diagnostic names the offending trait, the callable, the
+    /// expected layer, and the actual layer so users see exactly
+    /// which side of the boundary is wrong.
+    #[error("E0544: trait `{trait_name}` is `{expected_layer}`-only but used on `{actual_kind} {callable}` (at byte {at}); pure-side traits go on `@fn`, imperative-side traits go on `#effect` / `#interrupt` / `#transition`")]
+    TraitLayerMismatch {
+        /// The misused trait name.
+        trait_name: String,
+        /// Which layer the trait belongs to (`"pure"` or `"imperative"`).
+        expected_layer: &'static str,
+        /// The callable's name.
+        callable: String,
+        /// The callable's actual kind (`"@fn"`, `"#effect"`, etc.) so
+        /// the diagnostic shows the user's syntactic form.
+        actual_kind: &'static str,
+        /// Byte offset of the trait reference.
+        at: usize,
+    },
+
     /// A `$ [TraitList]` clause references a trait name that is neither
     /// predeclared (per Decision #2 + Decision #22 / ADR 0003) nor
     /// declared via a top-level `@trait Name { … }` item.
@@ -870,46 +908,98 @@ const PREDECLARED_IMPERATIVE_TRAITS: &[&str] = &[
     "Encapsulated",
 ];
 
+/// Which sigil layer a known trait belongs to.
+///
+/// - `Pure` — pure-side trait (Decision #2 / ADR 0003 P2). Valid on
+///   `@fn` declarations only; using on `#effect` / `#interrupt` /
+///   `#transition` is `E0544 TraitLayerMismatch`.
+/// - `Imperative` — imperative-side trait (Decision #22). Valid on
+///   `#effect` / `#interrupt` / `#transition`; using on `@fn` is
+///   `E0544`.
+/// - `Universal` — user-defined `@trait Name { … }`. Valid on either
+///   layer in v0.2-β. (A future slice may attach explicit layer tags
+///   to `@trait` declarations.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TraitLayer {
+    Pure,
+    Imperative,
+    Universal,
+}
+
+impl TraitLayer {
+    /// Source-form name of this layer for diagnostics.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pure => "pure",
+            Self::Imperative => "imperative",
+            Self::Universal => "universal",
+        }
+    }
+
+    /// Is this trait usable on a callable in `callable_layer`?
+    fn is_usable_on(self, callable_layer: Self) -> bool {
+        match self {
+            // Universal user-defined traits always validate.
+            Self::Universal => true,
+            // Predeclared pure-side: callable must be Pure.
+            Self::Pure => callable_layer == Self::Pure,
+            // Predeclared imperative-side: callable must be Imperative.
+            Self::Imperative => callable_layer == Self::Imperative,
+        }
+    }
+}
+
 /// Registry of every recognised trait name in the program — predeclared
-/// (per Decision #2 + Decision #22) plus user-defined `@trait` items.
+/// (per Decision #2 + Decision #22) plus user-defined `@trait` items,
+/// each tagged with its [`TraitLayer`].
 ///
 /// Built once per `infer()` call. Used by [`validate_trait_lists`] to
-/// emit `E0541 UnknownTrait` for typos and undeclared names.
-///
-/// Slice scope: name-only validation. Generic-arg type checking on
-/// generic traits like `LockingDiscipline<RwLock>` is downstream
-/// (T4c work — needs the type registry to resolve the args).
+/// emit `E0541 UnknownTrait` for typos and `E0544 TraitLayerMismatch`
+/// for cross-layer misuse.
 #[derive(Debug)]
 struct TraitRegistry {
-    /// Set of all known trait names: predeclared + user-`@trait`.
-    known: std::collections::HashSet<String>,
+    /// Map: trait name → its layer classification.
+    known: HashMap<String, TraitLayer>,
 }
 
 impl TraitRegistry {
-    /// Build the registry: predeclared-pure ∪ predeclared-imperative ∪
-    /// user-`@trait` declarations from the program.
+    /// Build the registry: predeclared-pure (tagged `Pure`) ∪
+    /// predeclared-imperative (tagged `Imperative`) ∪ user-`@trait`
+    /// declarations (tagged `Universal`).
     fn build(program: &Program) -> Self {
-        let mut known: std::collections::HashSet<String> =
-            std::collections::HashSet::with_capacity(
-                PREDECLARED_PURE_TRAITS.len() + PREDECLARED_IMPERATIVE_TRAITS.len() + 4,
-            );
-        for &name in PREDECLARED_PURE_TRAITS
-            .iter()
-            .chain(PREDECLARED_IMPERATIVE_TRAITS.iter())
-        {
-            known.insert((*name).to_owned());
+        let mut known: HashMap<String, TraitLayer> = HashMap::with_capacity(
+            PREDECLARED_PURE_TRAITS.len() + PREDECLARED_IMPERATIVE_TRAITS.len() + 4,
+        );
+        for &name in PREDECLARED_PURE_TRAITS.iter() {
+            known.insert((*name).to_owned(), TraitLayer::Pure);
+        }
+        for &name in PREDECLARED_IMPERATIVE_TRAITS.iter() {
+            known.insert((*name).to_owned(), TraitLayer::Imperative);
         }
         for item in &program.items {
             if let Item::Trait(td) = item {
-                known.insert(td.name.clone());
+                // First-wins on collisions with predeclared names; the
+                // resolver E0401 already flags duplicates separately.
+                known
+                    .entry(td.name.clone())
+                    .or_insert(TraitLayer::Universal);
             }
         }
         Self { known }
     }
 
     /// True if `name` is a recognised trait (predeclared or user-defined).
+    /// Convenience for callers that only need the existence answer; the
+    /// layer-aware check uses [`Self::layer_of`].
+    #[allow(dead_code)] // Public-shape helper kept for future consumers
     fn is_known(&self, name: &str) -> bool {
-        self.known.contains(name)
+        self.known.contains_key(name)
+    }
+
+    /// Look up the layer classification of a known trait, or `None`
+    /// if the trait isn't recognised.
+    fn layer_of(&self, name: &str) -> Option<TraitLayer> {
+        self.known.get(name).copied()
     }
 }
 
@@ -930,14 +1020,40 @@ fn validate_trait_lists(
 ) {
     for item in &program.items {
         match item {
-            Item::Fn(d) => check_traits(&d.trait_list, &d.name, "@fn", registry, errors),
-            Item::Effect(d) => check_traits(&d.trait_list, &d.name, "#effect", registry, errors),
-            Item::Interrupt(d) => {
-                check_traits(&d.trait_list, &d.name, "#interrupt", registry, errors);
-            }
+            Item::Fn(d) => check_traits(
+                &d.trait_list,
+                &d.name,
+                "@fn",
+                TraitLayer::Pure,
+                registry,
+                errors,
+            ),
+            Item::Effect(d) => check_traits(
+                &d.trait_list,
+                &d.name,
+                "#effect",
+                TraitLayer::Imperative,
+                registry,
+                errors,
+            ),
+            Item::Interrupt(d) => check_traits(
+                &d.trait_list,
+                &d.name,
+                "#interrupt",
+                TraitLayer::Imperative,
+                registry,
+                errors,
+            ),
             Item::Automaton(d) => {
                 for t in &d.transitions {
-                    check_traits(&t.trait_list, &t.name, "#transition", registry, errors);
+                    check_traits(
+                        &t.trait_list,
+                        &t.name,
+                        "#transition",
+                        TraitLayer::Imperative,
+                        registry,
+                        errors,
+                    );
                 }
             }
             _ => {}
@@ -945,21 +1061,44 @@ fn validate_trait_lists(
     }
 }
 
+/// Check every entry in `list` against the registry. Emits two error
+/// kinds:
+/// - `E0541 UnknownTrait` when the name is not recognised at all.
+/// - `E0544 TraitLayerMismatch` (Decision #22 layer-aware check) when
+///   a predeclared trait is used on the wrong layer (e.g. `Realtime`
+///   on a `@fn`, or `Pure` on a `#effect`).
+///
+/// The two diagnostics are independent: an unknown name reports
+/// E0541 only (no layer-mismatch since we don't know the layer).
 fn check_traits(
     list: &[TraitRef],
     callable: &str,
     kind: &'static str,
+    callable_layer: TraitLayer,
     registry: &TraitRegistry,
     errors: &mut Vec<TypeError>,
 ) {
     for tr in list {
-        if !registry.is_known(&tr.name) {
-            errors.push(TypeError::UnknownTrait {
-                trait_name: tr.name.clone(),
-                callable: callable.to_owned(),
-                kind,
-                at: tr.span.start,
-            });
+        match registry.layer_of(&tr.name) {
+            None => {
+                errors.push(TypeError::UnknownTrait {
+                    trait_name: tr.name.clone(),
+                    callable: callable.to_owned(),
+                    kind,
+                    at: tr.span.start,
+                });
+            }
+            Some(trait_layer) => {
+                if !trait_layer.is_usable_on(callable_layer) {
+                    errors.push(TypeError::TraitLayerMismatch {
+                        trait_name: tr.name.clone(),
+                        expected_layer: trait_layer.as_str(),
+                        callable: callable.to_owned(),
+                        actual_kind: kind,
+                        at: tr.span.start,
+                    });
+                }
+            }
         }
     }
 }
@@ -4240,5 +4379,204 @@ mod tests {
             res.is_ok(),
             "expected Pair<u32> to be compatible at call site; got {res:?}"
         );
+    }
+
+    // ─── Decision #22 layer-aware trait checking (E0544) ─────────────────
+
+    #[test]
+    fn pure_side_trait_on_effect_emits_e0544() {
+        // `Pure` is a pure-side trait; using it on a `#effect` is a
+        // layer mismatch.
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #effect e() #mutates: [C] $ [Pure] { }\n\
+        ";
+        let errors = infer_str(src).expect_err("expected E0544");
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            TypeError::TraitLayerMismatch { trait_name, expected_layer, actual_kind, .. }
+                if trait_name == "Pure" && *expected_layer == "pure" && *actual_kind == "#effect"
+        ));
+        assert!(saw, "expected E0544 Pure on #effect; got {errors:?}");
+    }
+
+    #[test]
+    fn pure_side_trait_on_interrupt_emits_e0544() {
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #interrupt SysTick() #mutates: [C] #priority: HIGH $ [Readable] { }\n\
+        ";
+        let errors = infer_str(src).expect_err("expected E0544");
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            TypeError::TraitLayerMismatch { trait_name, actual_kind, .. }
+                if trait_name == "Readable" && *actual_kind == "#interrupt"
+        ));
+        assert!(saw, "expected E0544 Readable on #interrupt; got {errors:?}");
+    }
+
+    #[test]
+    fn pure_side_trait_on_transition_emits_e0544() {
+        let src = "\
+            #automaton C {\n  \
+              v: u32;\n  \
+              #transition tick $ [Observable] { C.v = 1u32; }\n\
+            }\n\
+        ";
+        let errors = infer_str(src).expect_err("expected E0544");
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            TypeError::TraitLayerMismatch { trait_name, actual_kind, .. }
+                if trait_name == "Observable" && *actual_kind == "#transition"
+        ));
+        assert!(saw, "expected E0544 Observable on #transition; got {errors:?}");
+    }
+
+    #[test]
+    fn imperative_trait_on_fn_emits_e0544() {
+        // `Realtime` is imperative; using it on a `@fn` is wrong-layer.
+        let src = "@fn p(x: u32) -> u32 $ [Realtime] { return x; }";
+        let errors = infer_str(src).expect_err("expected E0544");
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            TypeError::TraitLayerMismatch { trait_name, expected_layer, actual_kind, .. }
+                if trait_name == "Realtime" && *expected_layer == "imperative" && *actual_kind == "@fn"
+        ));
+        assert!(saw, "expected E0544 Realtime on @fn; got {errors:?}");
+    }
+
+    #[test]
+    fn memory_ordering_trait_on_fn_emits_e0544() {
+        // Acquire/Release/SeqCst are memory-ordering markers — only
+        // make sense on imperative callables that emit fences.
+        for name in ["Acquire", "Release", "SeqCst"] {
+            let src = format!("@fn p(x: u32) -> u32 $ [{name}] {{ return x; }}");
+            let errors = infer_str(&src).unwrap_err();
+            let saw = errors.iter().any(|e| matches!(
+                e,
+                TypeError::TraitLayerMismatch { trait_name, .. } if trait_name == name
+            ));
+            assert!(saw, "expected E0544 for `{name}` on @fn");
+        }
+    }
+
+    #[test]
+    fn each_imperative_trait_rejected_on_fn() {
+        // Smoke test: every name in PREDECLARED_IMPERATIVE_TRAITS is
+        // E0544 when used on a `@fn`. If someone adds a new imperative
+        // trait, this test catches it not being layer-tagged.
+        for &name in PREDECLARED_IMPERATIVE_TRAITS.iter() {
+            let src = format!("@fn p(x: u32) -> u32 $ [{name}] {{ return x; }}");
+            let res = infer_str(&src);
+            assert!(
+                res.is_err(),
+                "expected layer mismatch error for `{name}` on @fn, got {res:?}"
+            );
+            let saw = res.unwrap_err().iter().any(|e| {
+                matches!(e, TypeError::TraitLayerMismatch { trait_name, .. }
+                    if trait_name == name)
+            });
+            assert!(saw, "expected E0544 specifically for `{name}` on @fn");
+        }
+    }
+
+    #[test]
+    fn each_pure_trait_rejected_on_effect() {
+        for &name in PREDECLARED_PURE_TRAITS.iter() {
+            let src = format!(
+                "#automaton C {{ v: u32; }}\n\
+                 #effect e() #mutates: [C] $ [{name}] {{ }}"
+            );
+            let res = infer_str(&src);
+            assert!(
+                res.is_err(),
+                "expected layer mismatch for `{name}` on #effect"
+            );
+            let saw = res.unwrap_err().iter().any(|e| {
+                matches!(e, TypeError::TraitLayerMismatch { trait_name, .. }
+                    if trait_name == name)
+            });
+            assert!(saw, "expected E0544 specifically for `{name}` on #effect");
+        }
+    }
+
+    #[test]
+    fn user_defined_trait_universal_works_on_both_layers() {
+        // User-defined `@trait` is layer-universal in v0.2-β. Same
+        // trait name validates on both `@fn` and `#effect`.
+        let src = "\
+            @trait MyTrait { }\n\
+            @fn f(x: u32) -> u32 $ [MyTrait] { return x; }\n\
+            #automaton C { v: u32; }\n\
+            #effect e() #mutates: [C] $ [MyTrait] { }\n\
+        ";
+        let res = infer_str(src);
+        assert!(
+            res.is_ok(),
+            "user-defined @trait should be universal; got {res:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_trait_does_not_double_report_with_e0544() {
+        // An unknown name triggers E0541 only (we don't know its
+        // layer). E0544 should NOT also fire — it's layer-mismatch
+        // for *known* traits.
+        let src = "@fn p(x: u32) -> u32 $ [TotallyMadeUp] { return x; }";
+        let errors = infer_str(src).unwrap_err();
+        let saw_e0541 = errors
+            .iter()
+            .any(|e| matches!(e, TypeError::UnknownTrait { trait_name, .. } if trait_name == "TotallyMadeUp"));
+        let saw_e0544 = errors
+            .iter()
+            .any(|e| matches!(e, TypeError::TraitLayerMismatch { trait_name, .. } if trait_name == "TotallyMadeUp"));
+        assert!(saw_e0541, "expected E0541 for unknown trait");
+        assert!(!saw_e0544, "E0544 should not fire for unknown trait");
+    }
+
+    #[test]
+    fn mixed_layer_traits_in_one_list_reported_independently() {
+        // `$ [Pure, Realtime]` on a `@fn`: Pure validates fine
+        // (correct layer), Realtime triggers E0544. Each entry is
+        // checked independently.
+        let src = "@fn p(x: u32) -> u32 $ [Pure, Realtime] { return x; }";
+        let errors = infer_str(src).unwrap_err();
+        let mismatch_names: Vec<String> = errors
+            .iter()
+            .filter_map(|e| match e {
+                TypeError::TraitLayerMismatch { trait_name, .. } => Some(trait_name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(mismatch_names.contains(&"Realtime".to_owned()));
+        assert!(
+            !mismatch_names.contains(&"Pure".to_owned()),
+            "Pure on @fn is correct layer; should not appear in E0544"
+        );
+    }
+
+    #[test]
+    fn predeclared_traits_full_set_recognised_on_correct_layers() {
+        // Smoke test: every predeclared trait validates cleanly on
+        // its own layer. (This duplicates the older
+        // `predeclared_traits_full_set_recognised` test conceptually
+        // but explicitly validates *layer correctness*.)
+        for &name in PREDECLARED_PURE_TRAITS.iter() {
+            let src = format!("@fn f(x: u32) -> u32 $ [{name}] {{ return x; }}");
+            assert!(
+                infer_str(&src).is_ok(),
+                "predeclared pure trait `{name}` should validate on @fn"
+            );
+        }
+        for &name in PREDECLARED_IMPERATIVE_TRAITS.iter() {
+            let src = format!(
+                "#automaton C {{ v: u32; }}\n\
+                 #effect e() #mutates: [C] $ [{name}] {{ }}"
+            );
+            assert!(
+                infer_str(&src).is_ok(),
+                "predeclared imperative trait `{name}` should validate on #effect"
+            );
+        }
     }
 }
