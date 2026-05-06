@@ -7,6 +7,65 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Check Slice 3: Decision #23 totality check (E0540) (2026-05-05)
+
+First implementation of Decision #23 / ADR 0003's totality
+requirement. Non-`@partial` `@fn`s with direct self-recursion now
+emit `E0540 TotalityViolation`.
+
+**Implementation (`crates/check/src/lib.rs`):**
+
+- New `CheckError::TotalityViolation { fn_name, call_at, decl_at }`
+  variant. The diagnostic carries the offending `@fn`'s name,
+  the byte offset of the recursive call site, and the byte offset
+  of the `@fn` declaration so users can find the place to add
+  `@partial`. The `Display` form names both spans and explicitly
+  suggests `@partial @fn` as the opt-out.
+- New `check_totality(program, errors)` pass: walks every
+  `Item::Fn` whose `partial = false`, builds a `SelfRecursionFinder`
+  for that function's body, and emits E0540 if it finds any direct
+  self-call. Runs as a separate pass (not interleaved with the
+  layer-boundary walk) so totality errors surface even on `@fn`s
+  whose bodies the boundary walker has nothing to report on.
+- New `SelfRecursionFinder` walker that recursively visits every
+  expression form in `@fn` bodies: `Call`, `Binary`, `Unary`,
+  `Ref`, `Paren`, `Tuple`, `Array`, `ArrayRepeat`, `FieldAccess`,
+  `Index`, `MethodCall`, `Cast`, `Range`. First-recursive-call
+  wins (one E0540 per function, matching rustc's "report each
+  error once" convention).
+
+**Slice scope (per ADR 0003 implementation milestones):**
+
+- **This slice (v0.2-β):** direct self-recursion → E0540 unless
+  `@partial`. Most conservative possible form of the check.
+- **v0.4+:** layered three-rule cut so common total recursions
+  (constructor-arg destructuring, sigma-bound indexing, tail
+  position) are accepted without `@partial`.
+- **Future slice (no version yet):** mutual recursion via Tarjan
+  SCC analysis over the `@fn` call graph. Today mutual recursion
+  passes silently — documented gap, not a soundness bug. The
+  test `mutual_recursion_not_yet_caught` is the canary; flipping
+  it to `expect_err` is the marker for that future slice.
+
+**Tests (13 new totality tests, check crate now 53 total, was 40):**
+
+- Non-recursive `@fn` passes (positive control).
+- Direct recursive `@fn` without `@partial` → E0540.
+- Direct recursive `@partial @fn` is silent (opt-out works).
+- Recursion buried in arg-position / let-RHS / paren / field-
+  access receiver — walker finds it through compound forms.
+- Calls to *other* fns (not self) silent (negative control).
+- First-recursive-call-wins (multiple call sites → one E0540).
+- Diagnostic carries `decl_at < call_at < src.len()` byte offsets.
+- `@partial` on non-recursive fn is silent.
+- Mutual recursion explicitly NOT yet caught (slice-scope canary).
+- Totality runs alongside S1 boundary check (both errors fire).
+
+Workspace remains green; clippy clean.
+
+This is the first of three planned slices in this batch (totality
+check → snapshot type inference → E0553 inside transitions).
+
 ### Added — Decision #22: imperative trait validation in `clifford-types` (E0541) (2026-05-05)
 
 Second slice of Decision #22 implementation (parser scaffolding
