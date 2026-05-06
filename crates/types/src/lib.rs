@@ -410,11 +410,13 @@ impl Typing {
 pub fn infer(program: &Program, resolution: &Resolution) -> Result<Typing, Vec<TypeError>> {
     let signatures = build_signatures(program);
     let automaton_field_types = build_automaton_field_types(program);
+    let type_registry = build_type_registry(program);
 
     let mut walker = Inferer {
         resolution,
         signatures: &signatures,
         automaton_field_types: &automaton_field_types,
+        type_registry: &type_registry,
         types: HashMap::new(),
         errors: Vec::new(),
         scopes: Vec::new(),
@@ -503,6 +505,114 @@ fn build_automaton_field_types(program: &Program) -> HashMap<String, HashMap<Str
     map
 }
 
+/// One entry in the [`TypeRegistry`] — a top-level `@type` declaration
+/// classified by what kind of body it has.
+///
+/// Slice T4b only distinguishes aliases (whose body is a target [`Type`]
+/// to be unfolded by [`TypeRegistry::unalias`]) from ADTs (which are
+/// nominal *terminal* types — they do not unfold further, and equality
+/// is by name + args). Slice T4c+ will add variant resolution for
+/// multi-segment paths like `Result::Ok`.
+#[derive(Debug, Clone)]
+enum NominalDecl {
+    /// `@type Foo = u32;` — body is the target type the alias resolves to.
+    Alias(Type),
+    /// `@type Result = | Ok(u32) | Err(bool);` — ADT: nominal, terminal,
+    /// does not unfold. Two ADT nominals are equal iff their names + args
+    /// match (per Decision #19's nominal-identity rule).
+    Adt,
+}
+
+/// Registry of every top-level `@type` declaration in the program, indexed
+/// by name. Used by [`TypeRegistry::unalias`] to follow aliases when
+/// comparing types (so `let x: MyAlias = 0u32;` typechecks when
+/// `@type MyAlias = u32;`).
+///
+/// Slice T4b scope: single-segment, non-generic alias following + ADT
+/// terminal-marker registration. Generic alias substitution and
+/// multi-segment variant resolution land in T4c+.
+#[derive(Debug)]
+struct TypeRegistry {
+    /// Map: `@type` name → declaration kind (alias target or ADT marker).
+    decls: HashMap<String, NominalDecl>,
+}
+
+impl TypeRegistry {
+    /// Returns true if `path` (single segment, currently) names a known
+    /// top-level `@type` declaration. Multi-segment paths (e.g.
+    /// `clifford::core::Option`) always return false in T4b — module
+    /// resolution lands in T4d+.
+    #[allow(dead_code)] // used by the validation pass in T4c
+    fn is_known(&self, path: &[String]) -> bool {
+        path.len() == 1 && self.decls.contains_key(&path[0])
+    }
+
+    /// If `t` is a single-segment, non-generic `Type::Nominal` whose path
+    /// names a registered alias, return the alias's target type (one step,
+    /// not transitively). Returns `None` for: primitives, `Ref`/`Array`/
+    /// other compounds, ADT nominals, generic-arg nominals, multi-segment
+    /// nominals, unknown nominals.
+    ///
+    /// Generic alias instantiation (`@type Vec<T> = …` applied to
+    /// `Vec<u32>`) is T4c work; T4b only handles non-generic aliases.
+    fn unfold_one(&self, t: &Type) -> Option<Type> {
+        let Type::Nominal { path, args } = t else {
+            return None;
+        };
+        if path.len() != 1 || !args.is_empty() {
+            return None;
+        }
+        match self.decls.get(&path[0])? {
+            NominalDecl::Alias(target) => Some(target.clone()),
+            NominalDecl::Adt => None,
+        }
+    }
+
+    /// Recursively unfold aliases until `t` is no longer a registered
+    /// alias. Cycle-safe via depth limit (cycle in `@type A = B; @type B
+    /// = A;` returns `Type::Unknown`; not legal but defensive).
+    ///
+    /// Idempotent on non-aliases: `unalias(Primitive(U32))` returns
+    /// `Primitive(U32)` unchanged.
+    fn unalias(&self, t: &Type) -> Type {
+        let mut current = t.clone();
+        // Depth limit: realistic alias chains are 1-3 deep; 32 is generous.
+        // Aliasing more than that almost certainly indicates a cycle in
+        // user source; fail safe to Unknown rather than stack overflow.
+        for _ in 0..32 {
+            match self.unfold_one(&current) {
+                Some(next) => current = next,
+                None => return current,
+            }
+        }
+        Type::Unknown("alias cycle or excessive nesting (T4b safeguard)")
+    }
+}
+
+/// Build the [`TypeRegistry`] from every `Item::Type` in the program.
+///
+/// Aliases get their target translated through [`type_from_type_expr`]
+/// (so a `@type Foo = u32;` registers as `NominalDecl::Alias(Primitive(U32))`).
+/// ADTs register as terminal nominal markers; their variant data is not
+/// captured in T4b (lands in T4c when variant-position references like
+/// `Result::Ok` need typing).
+fn build_type_registry(program: &Program) -> TypeRegistry {
+    use clifford_ast::TypeBody;
+    let mut decls: HashMap<String, NominalDecl> = HashMap::new();
+    for item in &program.items {
+        if let Item::Type(td) = item {
+            let entry = match &td.body {
+                TypeBody::Alias(te) => NominalDecl::Alias(type_from_type_expr(te)),
+                TypeBody::Adt(_) => NominalDecl::Adt,
+            };
+            // First-wins on duplicate names. Resolver E0401 already reports
+            // the duplicate; we just don't overwrite the registration.
+            decls.entry(td.name.clone()).or_insert(entry);
+        }
+    }
+    TypeRegistry { decls }
+}
+
 // ─── Internal walker ────────────────────────────────────────────────────────
 
 struct Inferer<'a> {
@@ -514,6 +624,10 @@ struct Inferer<'a> {
     /// Used by [`Self::field_access_type`] to look up `Counter.value`'s
     /// declared type without re-walking the AST.
     automaton_field_types: &'a HashMap<String, HashMap<String, Type>>,
+    /// Top-level `@type` declarations indexed by name. Used by
+    /// [`types_compatible`] to follow aliases when comparing types.
+    /// See [`TypeRegistry::unalias`].
+    type_registry: &'a TypeRegistry,
     types: HashMap<Span, Type>,
     errors: Vec<TypeError>,
     /// Stack of nested scopes mirroring the resolver's. Each scope holds
@@ -611,7 +725,7 @@ impl<'a> Inferer<'a> {
                     let declared = type_from_type_expr(annotated);
                     if !value_ty.is_unknown()
                         && !declared.is_unknown()
-                        && !types_compatible(&declared, &value_ty)
+                        && !types_compatible(&declared, &value_ty, self.type_registry)
                     {
                         self.errors.push(TypeError::LetTypeMismatch {
                             name: name.clone(),
@@ -929,7 +1043,9 @@ impl<'a> Inferer<'a> {
         let limit = sig.params.len().min(arg_types.len());
         for (i, actual) in arg_types.iter().take(limit).enumerate() {
             let expected = &sig.params[i];
-            if !expected.is_unknown() && !actual.is_unknown() && !types_compatible(expected, actual)
+            if !expected.is_unknown()
+                && !actual.is_unknown()
+                && !types_compatible(expected, actual, self.type_registry)
             {
                 self.errors.push(TypeError::CallArgMismatch {
                     callee: name.to_owned(),
@@ -1180,14 +1296,27 @@ impl<'a> Inferer<'a> {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-/// Two types are compatible for `let`-annotation matching iff they're
-/// structurally equal. (`Unknown` is treated as compatible with anything to
-/// avoid cascading errors when an upstream type is unknown.)
-fn types_compatible(declared: &Type, actual: &Type) -> bool {
+/// Two types are compatible for `let`-annotation matching iff their
+/// *unaliased* forms are structurally equal.
+///
+/// Slice T4b: passes both types through [`TypeRegistry::unalias`] so
+/// `let x: MyAlias = 0u32;` typechecks when `@type MyAlias = u32;`.
+/// Slice T4a only compared the syntactic form, which surfaced the
+/// alias name as a mismatch ("declared `MyAlias`, actual `u32`") even
+/// though the alias resolves to the same thing.
+///
+/// `Unknown` is treated as compatible with anything to avoid cascading
+/// errors when an upstream type is unknown (matches T4a behaviour).
+fn types_compatible(declared: &Type, actual: &Type, registry: &TypeRegistry) -> bool {
     if declared.is_unknown() || actual.is_unknown() {
         return true;
     }
-    declared == actual
+    let d = registry.unalias(declared);
+    let a = registry.unalias(actual);
+    if d.is_unknown() || a.is_unknown() {
+        return true;
+    }
+    d == a
 }
 
 /// Translate a syntactic [`TypeExpr`] into a semantic [`Type`].
@@ -2250,12 +2379,13 @@ mod tests {
     }
 
     #[test]
-    fn nominal_let_annotation_emits_e0512_with_nominal_in_message() {
-        // `let x: MyAlias = 0u32;` reads `MyAlias` as a `Type::Nominal`
-        // in the declared-type position. Slice T4a does no alias
-        // following, so the annotation-vs-initializer check (E0512)
-        // sees `Nominal MyAlias` ≠ `Primitive U32` and reports it. The
-        // diagnostic must mention `MyAlias` so users see *their* name.
+    fn nominal_let_annotation_alias_follows_to_underlying_type() {
+        // T4b behaviour change (was T4a's
+        // `..._emits_e0512_with_nominal_in_message`): with `@type MyAlias
+        // = u32;` registered, the `MyAlias` annotation unfolds to
+        // `Primitive(U32)` for compatibility checking, so the initialiser
+        // `0u32` matches and *no* E0512 fires. T4a documented the
+        // pre-T4b mismatch as the *current* behaviour; T4b lifts it.
         let src = "\
             @type MyAlias = u32;\n\
             @fn f() {\n  \
@@ -2263,14 +2393,10 @@ mod tests {
               return;\n\
             }\n\
         ";
-        let errors = infer_str(src).expect_err("expected E0512 mismatch");
-        let saw_my_alias = errors.iter().any(|e| {
-            matches!(e, TypeError::LetTypeMismatch { declared, actual, .. }
-                if declared == "MyAlias" && actual == "u32")
-        });
+        let res = infer_str(src);
         assert!(
-            saw_my_alias,
-            "expected a LetTypeMismatch with declared `MyAlias` and actual `u32`; got {errors:?}"
+            res.is_ok(),
+            "expected alias-following to make MyAlias = u32 typecheck; got {res:?}"
         );
     }
 
@@ -2325,5 +2451,254 @@ mod tests {
         let translated = type_from_type_expr(param_ty);
         assert!(matches!(translated, Type::Nominal { path, args }
             if path == vec!["Counter".to_owned()] && args.is_empty()));
+    }
+
+    // ─── Slice T4b: type registry + @type alias following ────────────────
+
+    #[test]
+    fn t4b_alias_one_step_typechecks() {
+        // The headline T4b case: a one-step alias unfolds for compatibility.
+        let src = "\
+            @type ByteCount = u32;\n\
+            @fn f() { let _x: ByteCount = 5u32; return; }\n\
+        ";
+        let res = infer_str(src);
+        assert!(res.is_ok(), "expected alias-follow to succeed; got {res:?}");
+    }
+
+    #[test]
+    fn t4b_alias_transitive_typechecks() {
+        // Two-step alias chain: A → B → u32.
+        let src = "\
+            @type B = u32;\n\
+            @type A = B;\n\
+            @fn f() { let _x: A = 7u32; return; }\n\
+        ";
+        let res = infer_str(src);
+        assert!(res.is_ok(), "expected transitive alias-follow; got {res:?}");
+    }
+
+    #[test]
+    fn t4b_alias_chain_three_deep_typechecks() {
+        // Slightly deeper chain to exercise the unalias loop.
+        let src = "\
+            @type C = u32;\n\
+            @type B = C;\n\
+            @type A = B;\n\
+            @fn f() { let _x: A = 1u32; return; }\n\
+        ";
+        let res = infer_str(src);
+        assert!(res.is_ok(), "expected three-deep alias chain; got {res:?}");
+    }
+
+    #[test]
+    fn t4b_alias_mismatch_after_unfolding_still_errors() {
+        // The alias unfolds, but the underlying types still don't match.
+        // Diagnostic should name `MyAlias` and `bool` (T4b deliberately
+        // shows the alias name for the user, not the unfolded form —
+        // their identifier is what they wrote).
+        let src = "\
+            @type MyAlias = u32;\n\
+            @fn f() { let _x: MyAlias = true; return; }\n\
+        ";
+        let errors = infer_str(src).expect_err("expected post-unfold mismatch");
+        let saw = errors.iter().any(|e| {
+            matches!(e, TypeError::LetTypeMismatch { declared, actual, .. }
+                if declared == "MyAlias" && actual == "bool")
+        });
+        assert!(
+            saw,
+            "expected LetTypeMismatch declared=MyAlias actual=bool; got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn t4b_alias_to_compound_type_typechecks() {
+        // Alias of a tuple type. The unalias should peel one layer
+        // (Nominal → Tuple), and structural equality covers the rest.
+        let src = "\
+            @type Pair = (u32, bool);\n\
+            @fn f() { let _x: Pair = (1u32, true); return; }\n\
+        ";
+        let res = infer_str(src);
+        assert!(
+            res.is_ok(),
+            "expected alias-to-tuple to typecheck; got {res:?}"
+        );
+    }
+
+    #[test]
+    fn t4b_alias_to_ref_typechecks() {
+        // Alias of a reference type. The borrow `&x` of a u32 yields
+        // `&u32`, which the alias `BytePtr = &u32` should match.
+        let src = "\
+            @type BytePtr = &u32;\n\
+            @fn f() { let v: u32 = 0u32; let _p: BytePtr = &v; return; }\n\
+        ";
+        let res = infer_str(src);
+        assert!(res.is_ok(), "expected alias-to-ref; got {res:?}");
+    }
+
+    #[test]
+    fn t4b_two_distinct_aliases_to_same_underlying_compare_equal() {
+        // `@type Foo = u32; @type Bar = u32;` — Decision #19 said two
+        // distinct nominal types compare distinct *as nominals*, but
+        // T4b's alias-following means at the `types_compatible` site
+        // both unfold to `u32` and are compatible. This is the
+        // transparent-alias semantics (Foo and Bar are interchangeable
+        // wherever a value of either is required); strong newtype
+        // semantics would need a separate `@newtype` declaration that
+        // T4b doesn't introduce.
+        let src = "\
+            @type Foo = u32;\n\
+            @type Bar = u32;\n\
+            @fn make_foo() -> Foo { return 0u32; }\n\
+            @fn take_bar(x: Bar) -> u32 { return x; }\n\
+            @fn f() { let _y: u32 = take_bar(make_foo()); return; }\n\
+        ";
+        let res = infer_str(src);
+        assert!(
+            res.is_ok(),
+            "expected transparent-alias interchangeability; got {res:?}"
+        );
+    }
+
+    #[test]
+    fn t4b_adt_does_not_unfold() {
+        // `@type Color = | Red | Green | Blue;` — ADT, not alias.
+        // The annotation `let _x: Color = …` does NOT unfold to anything;
+        // Color stays a Nominal terminal type. With nothing to coerce
+        // an integer literal to it, the mismatch fires (declared=Color,
+        // actual=i32 default).
+        let src = "\
+            @type Color = | Red | Green | Blue;\n\
+            @fn f() { let _x: Color = 0; return; }\n\
+        ";
+        let errors = infer_str(src).expect_err("ADT does not unfold");
+        let saw = errors.iter().any(|e| {
+            matches!(e, TypeError::LetTypeMismatch { declared, .. }
+                if declared == "Color")
+        });
+        assert!(saw, "expected Color (ADT) to not unfold; got {errors:?}");
+    }
+
+    #[test]
+    fn t4b_unknown_nominal_path_treated_as_unknown_for_compat() {
+        // A path that doesn't resolve to any `@type` decl is currently
+        // *not* validated by T4b (validation pass is T4c). Compat with
+        // an unknown nominal goes through the unalias path which leaves
+        // it as Nominal — a structural compare against u32 fails. The
+        // diagnostic still names the source identifier correctly.
+        let src = "\
+            @fn f() { let _x: NotADeclaredType = 0u32; return; }\n\
+        ";
+        let errors = infer_str(src).expect_err("unknown nominal vs u32 mismatches");
+        let saw = errors.iter().any(|e| {
+            matches!(e, TypeError::LetTypeMismatch { declared, actual, .. }
+                if declared == "NotADeclaredType" && actual == "u32")
+        });
+        assert!(
+            saw,
+            "expected mismatch with NotADeclaredType named verbatim; got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn t4b_unalias_terminates_on_self_reference() {
+        // `@type A = A;` is illegal source-wise but the unalias loop
+        // must still terminate (depth limit). Build a registry by hand
+        // and call `unalias` directly to verify the safeguard.
+        let mut decls = HashMap::new();
+        decls.insert(
+            "A".to_owned(),
+            NominalDecl::Alias(Type::Nominal {
+                path: vec!["A".to_owned()],
+                args: vec![],
+            }),
+        );
+        let registry = TypeRegistry { decls };
+        let result = registry.unalias(&Type::Nominal {
+            path: vec!["A".to_owned()],
+            args: vec![],
+        });
+        assert!(
+            matches!(result, Type::Unknown(_)),
+            "self-reference should hit the depth-limit safeguard, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn t4b_unalias_terminates_on_two_step_cycle() {
+        // `@type A = B; @type B = A;` — same safeguard.
+        let mut decls = HashMap::new();
+        decls.insert(
+            "A".to_owned(),
+            NominalDecl::Alias(Type::Nominal {
+                path: vec!["B".to_owned()],
+                args: vec![],
+            }),
+        );
+        decls.insert(
+            "B".to_owned(),
+            NominalDecl::Alias(Type::Nominal {
+                path: vec!["A".to_owned()],
+                args: vec![],
+            }),
+        );
+        let registry = TypeRegistry { decls };
+        let result = registry.unalias(&Type::Nominal {
+            path: vec!["A".to_owned()],
+            args: vec![],
+        });
+        assert!(
+            matches!(result, Type::Unknown(_)),
+            "two-step cycle should hit the depth-limit safeguard, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn t4b_generic_args_block_alias_unfolding() {
+        // T4b deliberately punts on generic alias instantiation (T4c
+        // work). A nominal *with* generic args therefore does NOT
+        // unfold even if a same-named alias is registered. This is
+        // the conservative choice: a future `Vec<T> = …` alias is
+        // additive, not breaking, when generic substitution lands.
+        let mut decls = HashMap::new();
+        decls.insert(
+            "Vec".to_owned(),
+            NominalDecl::Alias(Type::Primitive(PrimitiveType::U32)),
+        );
+        let registry = TypeRegistry { decls };
+        let with_args = Type::Nominal {
+            path: vec!["Vec".to_owned()],
+            args: vec![Type::Primitive(PrimitiveType::U8)],
+        };
+        let result = registry.unalias(&with_args);
+        // No unfolding — args block it.
+        assert_eq!(result, with_args);
+    }
+
+    #[test]
+    fn t4b_call_arg_mismatch_through_alias_works() {
+        // The other types_compatible call site is the call-arg check
+        // in `infer_call`. Verify alias following also works there.
+        let src = "\
+            @type Count = u32;\n\
+            @fn double(x: u32) -> u32 { return x; }\n\
+            @fn caller() { let _y: u32 = double(0u32); return; }\n\
+            @fn caller2() {\n  \
+              let n: Count = 5u32;\n  \
+              let _y: u32 = double(n);\n  \
+              return;\n\
+            }\n\
+        ";
+        // `n` has type `Count`; passing it to `double(x: u32)` should
+        // succeed because Count unfolds to u32 at the call-arg compat
+        // check.
+        let res = infer_str(src);
+        assert!(
+            res.is_ok(),
+            "expected alias to work in call-arg compat too; got {res:?}"
+        );
     }
 }
