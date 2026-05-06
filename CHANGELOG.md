@@ -7,6 +7,85 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Type Checker — Slice T4b: `@type` alias following + ADT terminal markers (2026-05-05)
+
+Second slice of type-checker path-resolution work. T4a (the previous
+slice) translated `TypeKind::Path` to `Type::Nominal` verbatim;
+T4b registers the program's top-level `@type` declarations and
+follows non-generic aliases for compatibility checks.
+
+**The headline behaviour change:**
+
+```clifford
+@type ByteCount = u32;
+@fn f() {
+  let _x: ByteCount = 5u32;   // T4a: E0512 mismatch (Nominal ≠ Primitive)
+  return;                     // T4b: typechecks (alias unfolds to u32)
+}
+```
+
+**Implementation (`crates/types/src/lib.rs`):**
+
+- New `TypeRegistry { decls: HashMap<String, NominalDecl> }` built
+  once per `infer()` call from every `Item::Type` in the program.
+- New `NominalDecl` enum: `Alias(Type)` (unfolds via `unalias`) or
+  `Adt` (terminal nominal — does not unfold).
+- New `TypeRegistry::unalias()`: recursively unfolds nominal aliases
+  with a depth-32 cycle safeguard. Idempotent on non-aliases.
+- New `TypeRegistry::unfold_one()`: single-layer unfold returning
+  `None` for non-aliases, generic-arg nominals, multi-segment paths,
+  ADT nominals, and unknown nominals.
+- `types_compatible(declared, actual, registry)` now takes the
+  registry and unaliases both sides before structural comparison.
+- `Inferer` gains a `type_registry: &'a TypeRegistry` field;
+  threaded through both `types_compatible` call sites (let
+  annotation E0512, call-arg E0513).
+
+**What T4b deliberately defers (kept for T4c+):**
+
+- Generic alias substitution (`@type Vec<T> = …` applied to
+  `Vec<u32>`). Generic-arg nominals don't unfold today; the
+  conservative choice is forward-compatible — the alias just stays
+  Nominal until T4c lands the substitution machinery.
+- Validation pass for unknown nominal paths (a separate `E0518
+  UnknownNominalType` walk over all TypeExprs). Today an unknown
+  nominal stays Nominal and trips structural mismatch with whatever
+  it's compared against — the diagnostic still names the user's
+  identifier correctly, just doesn't say "this name doesn't exist."
+- Multi-segment paths (e.g. `clifford::core::Option`) — module
+  resolution is T4d+ work.
+- ADT-variant resolution for `Result::Ok` style paths in *value*
+  position — variants live in expression position, not type
+  position, so type-position resolution doesn't need them.
+
+**Tests (13 new T4b unit tests, types crate now 101 total, was 88):**
+
+- One-step alias typechecks; transitive alias (A→B→u32);
+  three-deep chain.
+- Alias mismatch after unfolding still errors with the alias name
+  preserved in the diagnostic (user sees their identifier).
+- Alias-to-tuple, alias-to-ref typecheck.
+- Two distinct aliases to the same underlying compare equal
+  (transparent-alias semantics; strong newtype semantics would need
+  a separate `@newtype` declaration this PR doesn't introduce).
+- ADT does not unfold (`@type Color = | Red | Green | Blue` stays
+  terminal; `let _x: Color = 0` mismatches as expected).
+- Unknown nominal path treated as Nominal for compat — diagnostic
+  still names it correctly.
+- `unalias` self-reference safeguard returns `Type::Unknown` (no
+  stack overflow on `@type A = A;`).
+- `unalias` two-step cycle (`A → B → A`) hits the safeguard.
+- Generic args block alias unfolding (forward-compat with T4c).
+- Call-arg mismatch through alias works (other `types_compatible`
+  call site).
+
+The pre-T4b test `nominal_let_annotation_emits_e0512_with_nominal_in_message`
+was renamed to `nominal_let_annotation_alias_follows_to_underlying_type`
+and updated to assert the new behaviour: the alias unfolds and the
+typecheck succeeds.
+
+Workspace remains green; clippy clean on the types crate.
+
 ### Locked — Decision #27: GA across scales + ADR 0006 Accepted (2026-05-05)
 
 Architect signed off "lock it in" on ADR 0006 after reviewing the
