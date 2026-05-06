@@ -256,6 +256,14 @@ pub enum TokenKind {
     KwAtNonAtomic,
     /// `Auto@state` state-read operator (Refinement #5d)
     KwAtState,
+    /// `@partial` totality opt-out modifier on `@fn` declarations
+    /// (Decision #23 / ADR 0003). Item-level prefix; the parser
+    /// consumes it before the `@fn` keyword and stamps the AST.
+    KwAtPartial,
+    /// `@snapshot Auto.field` boundary-crossing read operator
+    /// (Decision #24 / ADR 0004). Expression form; carries an
+    /// owned copy of the field's value across the `#`/`@` boundary.
+    KwAtSnapshot,
 
     // ─ Composite sigils ─────────────────────────────────────────────────────
     /// `#>` effect-procedure call operator (Decision #3)
@@ -1113,6 +1121,10 @@ impl<'src> Lexer<'src> {
             "non_atomic" => TokenKind::KwAtNonAtomic,
             // Refinement #5d state-read operator (Auto@state)
             "state" => TokenKind::KwAtState,
+            // Decision #23 / ADR 0003 — totality opt-out modifier
+            "partial" => TokenKind::KwAtPartial,
+            // Decision #24 / ADR 0004 — boundary-crossing read operator
+            "snapshot" => TokenKind::KwAtSnapshot,
             other => {
                 return Err(LexError::UnknownAtForm {
                     name: other.to_owned(),
@@ -1449,7 +1461,8 @@ mod tests {
 
     #[test]
     fn all_functional_sigil_forms() {
-        let src = "@fn @type @trait @module @sequential @initial @terminal @non_atomic @state";
+        let src = "@fn @type @trait @module @sequential @initial @terminal @non_atomic @state \
+                   @partial @snapshot";
         let expected = vec![
             TokenKind::KwAtFn,
             TokenKind::KwAtType,
@@ -1460,6 +1473,10 @@ mod tests {
             TokenKind::KwAtTerminal,
             TokenKind::KwAtNonAtomic,
             TokenKind::KwAtState,
+            // Decision #23 / ADR 0003 — totality opt-out
+            TokenKind::KwAtPartial,
+            // Decision #24 / ADR 0004 — boundary-crossing read
+            TokenKind::KwAtSnapshot,
             TokenKind::Eof,
         ];
         assert_eq!(kinds(src), expected);

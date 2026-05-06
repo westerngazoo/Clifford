@@ -7,6 +7,87 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — v0.2-α: `@partial` and `@snapshot` lexer + AST + parser scaffolding (2026-05-05)
+
+First implementation slice for Decisions #23 (Haskell-clean `@fn`)
+and #24 (`@snapshot` boundary operator). This PR lands the *parser
+surface* — lexer tokens, AST nodes, parser rules, and minimal
+resolver wiring — so subsequent v0.2 slices (totality check, row
+gating, atomicity check) have AST nodes to consume.
+
+**Lexer (`crates/lexer`):**
+- New `KwAtPartial` token (Decision #23 / ADR 0003) for `@partial`
+  totality opt-out modifier.
+- New `KwAtSnapshot` token (Decision #24 / ADR 0004) for
+  `@snapshot Auto.field` boundary-crossing read operator.
+- Both added to `all_functional_sigil_forms` test.
+
+**AST (`crates/ast`):**
+- `FnDecl` gains `pub partial: bool` (default `false`). Stamped by
+  the parser when the source carries a leading `@partial` modifier.
+- New `ExprKind::Snapshot { automaton: String, field: String }`
+  variant for the `@snapshot Auto.field` expression form.
+
+**Parser (`crates/parser`):**
+- `parse_item` recognises `@partial` as an item-level prefix on
+  `@fn`. Splits `parse_fn_decl` into the legacy entry point and a
+  new `parse_fn_decl_with_partial(start, partial)` that the
+  partial-prefix path calls with `partial=true`.
+- `parse_atom` recognises `@snapshot` as an expression form;
+  `parse_snapshot_expr` consumes the `Auto.field` shape (single-
+  segment automaton + dot + field). Composite reads
+  (`@snapshot Auto.field[i]`) and `Self.field` snapshots are
+  out of scope for v0.2-α (deferred per ADR 0004 Q3 and Q2).
+- `@partial` followed by anything other than `@fn` → `ParseError::
+  Expected("@fn after @partial modifier")`.
+- Snapshot rejects missing dot / missing field with descriptive
+  diagnostics.
+
+**Resolver (`crates/resolve`):**
+- Added `ExprKind::Snapshot` arm to the body walker. Calls
+  `require_automaton(automaton)` and `require_field(automaton,
+  field)` against the encountered snapshot site. The hidden-field
+  visibility rule from Decision #25 / `require_field` applies *for
+  free*: snapshotting `Uart.parity_errors` (a `#hidden` field) from
+  `@fn` correctly produces `E0407 HiddenFieldNotAccessible`.
+
+**What v0.2-α deliberately defers:**
+- Totality check (`E0540` for non-structural recursion in non-
+  `@partial` `@fn`s) — `clifford-check` work, lands in v0.2-β.
+- `Readable`-row gating of `@snapshot` from `@fn` (`E0550
+  SnapshotInUnreadableFn`) — depends on Decision #22 trait
+  validation in `clifford-types`, which lands as the next slice.
+- `@snapshot Self.field` rejection inside `#transition` (`E0553
+  SnapshotInImperative`) — `clifford-check` work; today it falls
+  through as a parse error since `Self` isn't an Ident.
+- `#shared`-field snapshot lock-holding proof (`E0552`) — gated to
+  v0.7+ alongside Decision #21 / #26 implementation.
+- Atomicity check (`E0551 SnapshotNotAtomic` for non-`Copy`
+  fields) — needs T4c trait-impl machinery.
+- Type inference for the `Snapshot` expression — `clifford-types`
+  lands the field-type lookup in the next slice.
+
+**Tests:**
+
+- *Lexer*: 1 test updated (`all_functional_sigil_forms` now exercises
+  the two new tokens). 48 tests passing total.
+- *Parser*: 9 new tests (235 total in parser, was 224 — we added 11
+  for Decision #22 in an earlier slice, then 9 more here for
+  v0.2-α; some skips intentional due to deferred features).
+  Coverage: `@partial` stamps the flag, default is false,
+  `@partial @type` rejected, `@partial @fn` with `$ [...]` works;
+  `@snapshot` in `let` RHS / binary expr / call arg, missing dot
+  rejected, missing field rejected.
+- *Resolver*: 4 new tests covering snapshot of known automaton +
+  field (passes), unknown automaton (E0403/E0402), unknown field
+  (E0405), hidden field (E0407 — the Decision #25 interaction).
+
+Workspace remains green; clippy clean.
+
+The next two slices (Decision #22 trait validation, then totality
+check + row gating) land on top of this scaffolding without
+revisiting the parser.
+
 ### Type Checker — Slice T4b: `@type` alias following + ADT terminal markers (2026-05-05)
 
 Second slice of type-checker path-resolution work. T4a (the previous

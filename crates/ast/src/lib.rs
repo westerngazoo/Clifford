@@ -182,9 +182,17 @@ pub struct FnDecl {
     /// `$ [...]` clause appears in source. Per Emergent Rule 2, an empty
     /// trait list at the AST level is interpreted as `[Pure]` by `clifford-types`.
     pub trait_list: Vec<TraitRef>,
+    /// `true` if the source had a leading `@partial` modifier per
+    /// Decision #23 / ADR 0003. A partial `@fn` opts out of the
+    /// totality requirement: it may not terminate (the structural-
+    /// recursion check is suppressed), and it can only be called from
+    /// other `@partial @fn`s, `#`-layer callables, or future
+    /// `@with_budget` blocks (v0.4+). v0.2-α: parser stamps the flag;
+    /// `clifford-check` honours it once the totality check lands.
+    pub partial: bool,
     /// Function body — sequence of statements per §2.6.
     pub body: Block,
-    /// Source span covering `@fn name(params) -> T $ [...] { body }` end-to-end.
+    /// Source span covering `@partial? @fn name(params) -> T $ [...] { body }` end-to-end.
     pub span: Span,
 }
 
@@ -906,6 +914,25 @@ pub enum ExprKind {
     /// resolver verifies it refers to an in-scope multi-state automaton.
     StateRead(String),
 
+    /// `@snapshot Auto.field` — boundary-crossing read operator per
+    /// Decision #24 / ADR 0004. Yields an *owned copy* of the named
+    /// field's current value at the snapshot site, on the pure side.
+    /// The parser captures the automaton name and field name; the
+    /// resolver verifies both exist; `clifford-check` enforces the
+    /// `Readable` capability (#`-layer only in v0.2; ADR 0003's
+    /// `Readable` row gates `@fn` access in v0.4+).
+    ///
+    /// v0.2-α scope (this slice): parser produces the AST node
+    /// only; downstream checks (atomicity, lock-holding, row
+    /// gating) come online in subsequent v0.2 slices.
+    Snapshot {
+        /// The automaton being read from (single segment; `Self.field`
+        /// inside transitions is rejected as `E0553` per ADR 0004 Q2).
+        automaton: String,
+        /// The field being read.
+        field: String,
+    },
+
     /// Parenthesised single expression. Distinguished from a 1-tuple
     /// (which doesn't exist; use `Tuple(vec![one])` only for ≥ 2 elements).
     /// Preserved so round-tripping reproduces source.
@@ -1288,6 +1315,7 @@ mod tests {
             params: Vec::new(),
             return_type: None,
             trait_list: Vec::new(),
+            partial: false,
             body: Block::default(),
             span: Span::new(0, 10),
         });

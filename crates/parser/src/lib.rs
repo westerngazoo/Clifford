@@ -256,6 +256,22 @@ impl<'t> Parser<'t> {
     fn parse_item(&mut self) -> Result<Item, ParseError> {
         let lead = self.peek().clone();
         match lead.kind {
+            // Decision #23 / ADR 0003: `@partial` is an item-level prefix on
+            // `@fn` declarations. Consume it here, then dispatch to the
+            // (already-existing) `@fn` parser with `partial = true`.
+            TokenKind::KwAtPartial => {
+                let start = lead.span.start;
+                self.advance(); // `@partial`
+                let next = self.peek().clone();
+                if !matches!(next.kind, TokenKind::KwAtFn) {
+                    return Err(ParseError::Expected {
+                        expected: "`@fn` after `@partial` modifier",
+                        found: next.kind,
+                        at: next.span.start,
+                    });
+                }
+                self.parse_fn_decl_with_partial(start, true).map(Item::Fn)
+            }
             TokenKind::KwAtFn => self.parse_fn_decl(lead.span.start).map(Item::Fn),
             TokenKind::KwAtType => self.parse_type_decl(lead.span.start).map(Item::Type),
             TokenKind::KwAtTrait => self.parse_trait_decl(lead.span.start).map(Item::Trait),
@@ -289,6 +305,17 @@ impl<'t> Parser<'t> {
     /// Generic parameters, where-clause, and extern modifier still arrive
     /// in subsequent slices.
     fn parse_fn_decl(&mut self, start: usize) -> Result<FnDecl, ParseError> {
+        self.parse_fn_decl_with_partial(start, false)
+    }
+
+    /// Parse `@fn …` with the `partial` flag pre-determined by the caller.
+    /// `parse_item` calls this with `partial=true` after consuming a leading
+    /// `@partial` token; the legacy `parse_fn_decl` calls with `partial=false`.
+    fn parse_fn_decl_with_partial(
+        &mut self,
+        start: usize,
+        partial: bool,
+    ) -> Result<FnDecl, ParseError> {
         self.advance(); // `@fn`
         let (name, _) = self.expect_ident("function name after `@fn`")?;
         let params = self.parse_param_list()?;
@@ -311,6 +338,7 @@ impl<'t> Parser<'t> {
             params,
             return_type,
             trait_list,
+            partial,
             body,
             span: Span::new(start, end),
         })
@@ -2423,6 +2451,8 @@ impl<'t> Parser<'t> {
             }
             TokenKind::KwHashUncheckedCast => self.parse_unchecked_cast_expr(start),
             TokenKind::KwHashUncheckedOffset => self.parse_unchecked_offset_expr(start),
+            // Decision #24 / ADR 0004 — `@snapshot Auto.field` boundary read.
+            TokenKind::KwAtSnapshot => self.parse_snapshot_expr(start),
             TokenKind::Eof => Err(ParseError::UnexpectedEof {
                 context: "expression",
             }),
@@ -2711,6 +2741,25 @@ impl<'t> Parser<'t> {
                 n: Box::new(n),
             },
             span: Span::new(start, close.end),
+        })
+    }
+
+    /// Parse `@snapshot Auto.field` per Decision #24 / ADR 0004.
+    ///
+    /// Single-segment automaton name + dot + field name. Composite
+    /// reads (`@snapshot Auto.field[i]`) and `Self.field` snapshots
+    /// inside transitions (E0553) are out of scope for v0.2-α.
+    /// Multi-segment automaton paths (`mod::Auto.field`) are deferred
+    /// alongside module resolution.
+    fn parse_snapshot_expr(&mut self, start: usize) -> Result<Expr, ParseError> {
+        self.advance(); // `@snapshot`
+        let (automaton, _) =
+            self.expect_ident("automaton name after `@snapshot` (e.g. `@snapshot Counter.value`)")?;
+        self.expect(TokenKind::Dot, "`.` between automaton name and field in `@snapshot`")?;
+        let (field, field_span) = self.expect_ident("field name after `.` in `@snapshot`")?;
+        Ok(Expr {
+            kind: ExprKind::Snapshot { automaton, field },
+            span: Span::new(start, field_span.end),
         })
     }
 }
@@ -6023,6 +6072,174 @@ mod tests {
                 assert_eq!(names, vec!["MadeUpTrait", "AnotherUserTrait"]);
             }
             other => panic!("expected Effect, got {:?}", other),
+        }
+    }
+
+    // ─── Decision #23 / ADR 0003: @partial totality opt-out ──────────────
+
+    #[test]
+    fn partial_fn_parses_and_stamps_flag() {
+        let p = parse_str("@partial @fn parse_input(x: u32) -> u32 { return x; }")
+            .expect("parse @partial @fn");
+        match &p.items[0] {
+            Item::Fn(FnDecl { name, partial, .. }) => {
+                assert_eq!(name, "parse_input");
+                assert!(*partial, "expected partial=true");
+            }
+            other => panic!("expected Fn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ordinary_fn_partial_defaults_false() {
+        let p = parse_str("@fn pure_helper(x: u32) -> u32 { return x; }")
+            .expect("parse plain @fn");
+        match &p.items[0] {
+            Item::Fn(FnDecl { partial, .. }) => assert!(!*partial),
+            other => panic!("expected Fn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn partial_then_non_fn_is_error() {
+        // `@partial` without `@fn` immediately following is rejected.
+        let err = parse_str("@partial @type Foo = u32;").expect_err("partial-then-type illegal");
+        assert!(matches!(
+            err,
+            ParseError::Expected {
+                expected: "`@fn` after `@partial` modifier",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn partial_fn_with_trait_list_works() {
+        // Combination: @partial @fn with $ [...] suffix.
+        let p = parse_str(
+            "@partial @fn maybe_parse(s: &[u8]) -> u32 $ [Readable] { return 0u32; }",
+        )
+        .expect("parse @partial @fn with $ list");
+        match &p.items[0] {
+            Item::Fn(FnDecl {
+                partial,
+                trait_list,
+                ..
+            }) => {
+                assert!(*partial);
+                assert_eq!(trait_list.len(), 1);
+                assert_eq!(trait_list[0].name, "Readable");
+            }
+            other => panic!("expected Fn, got {:?}", other),
+        }
+    }
+
+    // ─── Decision #24 / ADR 0004: @snapshot expression ──────────────────
+
+    #[test]
+    fn snapshot_expression_in_let_rhs() {
+        let p = parse_str(
+            "@fn read_head() -> u32 { let h := @snapshot Uart.rx_head; return h; }",
+        )
+        .expect("parse @snapshot in let RHS");
+        // Verify the body has a let-statement whose value is a Snapshot.
+        match &p.items[0] {
+            Item::Fn(FnDecl { body, .. }) => {
+                let stmt = &body.stmts[0];
+                match &stmt.kind {
+                    StmtKind::LetShort { value, .. } => match &value.kind {
+                        ExprKind::Snapshot { automaton, field } => {
+                            assert_eq!(automaton, "Uart");
+                            assert_eq!(field, "rx_head");
+                        }
+                        other => panic!("expected Snapshot, got {:?}", other),
+                    },
+                    other => panic!("expected LetShort, got {:?}", other),
+                }
+            }
+            other => panic!("expected Fn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn snapshot_in_binary_expression() {
+        // @snapshot composes as an atom, so `a - b` where both are
+        // snapshots should parse as `(@snapshot a) - (@snapshot b)`.
+        let p = parse_str(
+            "@fn used() -> u32 { return @snapshot Uart.rx_head - @snapshot Uart.rx_tail; }",
+        )
+        .expect("parse @snapshot in binary expr");
+        match &p.items[0] {
+            Item::Fn(FnDecl { body, .. }) => {
+                let stmt = &body.stmts[0];
+                if let StmtKind::Return(Some(e)) = &stmt.kind {
+                    match &e.kind {
+                        ExprKind::Binary { op, lhs, rhs } => {
+                            assert_eq!(*op, BinaryOp::Sub);
+                            assert!(matches!(
+                                lhs.kind,
+                                ExprKind::Snapshot { ref automaton, ref field }
+                                    if automaton == "Uart" && field == "rx_head"
+                            ));
+                            assert!(matches!(
+                                rhs.kind,
+                                ExprKind::Snapshot { ref automaton, ref field }
+                                    if automaton == "Uart" && field == "rx_tail"
+                            ));
+                        }
+                        other => panic!("expected Binary, got {:?}", other),
+                    }
+                } else {
+                    panic!("expected Return(Some), got {:?}", stmt.kind);
+                }
+            }
+            other => panic!("expected Fn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn snapshot_missing_dot_is_error() {
+        let err = parse_str("@fn f() { let _x := @snapshot Counter; }").expect_err("missing dot");
+        assert!(matches!(
+            err,
+            ParseError::Expected { expected: "`.` between automaton name and field in `@snapshot`", .. }
+        ));
+    }
+
+    #[test]
+    fn snapshot_missing_field_is_error() {
+        let err = parse_str("@fn f() { let _x := @snapshot Counter.; }").expect_err("missing field");
+        assert!(matches!(
+            err,
+            ParseError::Expected { expected: "field name after `.` in `@snapshot`", .. }
+        ));
+    }
+
+    #[test]
+    fn snapshot_in_arg_position() {
+        // @snapshot composes in argument position too.
+        let p = parse_str(
+            "@fn id(x: u32) -> u32 { return x; } \
+             @fn use_snap() -> u32 { return id(@snapshot Counter.value); }",
+        )
+        .expect("parse @snapshot in call arg");
+        match &p.items[1] {
+            Item::Fn(FnDecl { body, .. }) => {
+                let stmt = &body.stmts[0];
+                if let StmtKind::Return(Some(e)) = &stmt.kind {
+                    if let ExprKind::Call { args, .. } = &e.kind {
+                        assert_eq!(args.len(), 1);
+                        assert!(matches!(
+                            args[0].kind,
+                            ExprKind::Snapshot { ref automaton, ref field }
+                                if automaton == "Counter" && field == "value"
+                        ));
+                    } else {
+                        panic!("expected Call, got {:?}", e.kind);
+                    }
+                }
+            }
+            other => panic!("expected Fn at index 1, got {:?}", other),
         }
     }
 }

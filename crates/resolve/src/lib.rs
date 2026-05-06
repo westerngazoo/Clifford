@@ -1075,6 +1075,17 @@ impl<'a> Walker<'a> {
                 self.require_automaton(name, expr.span);
             }
 
+            // ── Snapshot (Decision #24 / ADR 0004): validate the
+            // automaton + field both exist; hidden-field visibility
+            // (Decision #25) is enforced by `require_field` for free.
+            // Lock-holding proof for `#shared` fields (E0552) and the
+            // `Readable`-row gate from `@fn` callers (E0550) are
+            // `clifford-check` work — land in subsequent v0.2 slices.
+            ExprKind::Snapshot { automaton, field } => {
+                self.require_automaton(automaton, expr.span);
+                self.require_field(automaton, field, expr.span);
+            }
+
             // ── Compound forms: recurse ──
             ExprKind::Paren(inner) => self.walk_expr(inner),
             ExprKind::Tuple(elems) | ExprKind::Array(elems) => {
@@ -2644,6 +2655,69 @@ mod tests {
         assert!(
             res.is_ok(),
             "expected indexed hidden-array write in own transition to succeed, got {res:?}"
+        );
+    }
+
+    // ── Decision #24 / ADR 0004: @snapshot resolution ────────────────────
+
+    #[test]
+    fn snapshot_resolves_against_known_automaton_field() {
+        let src = "\
+            #automaton Counter { value: u32; } \
+            @fn read_value() -> u32 { let v := @snapshot Counter.value; return v; }\
+        ";
+        let res = resolve_str(src);
+        assert!(res.is_ok(), "expected @snapshot Counter.value to resolve, got {res:?}");
+    }
+
+    #[test]
+    fn snapshot_unknown_automaton_is_e0403() {
+        let src = "@fn f() { let _v := @snapshot DoesNotExist.field; return; }";
+        let errors = resolve_str(src).expect_err("expected NotAnAutomaton");
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            ResolveError::NotAnAutomaton { name, .. } if name == "DoesNotExist"
+        ) || matches!(
+            e,
+            ResolveError::UndefinedName { name, .. } if name == "DoesNotExist"
+        ));
+        assert!(saw, "expected NotAnAutomaton/UndefinedName for unknown automaton; got {errors:?}");
+    }
+
+    #[test]
+    fn snapshot_unknown_field_is_e0405() {
+        let src = "\
+            #automaton Counter { value: u32; } \
+            @fn f() { let _v := @snapshot Counter.bogus; return; }\
+        ";
+        let errors = resolve_str(src).expect_err("expected UnknownField");
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            ResolveError::UnknownField { automaton, field, .. }
+                if automaton == "Counter" && field == "bogus"
+        ));
+        assert!(saw, "expected E0405 UnknownField for `Counter.bogus`; got {errors:?}");
+    }
+
+    #[test]
+    fn snapshot_of_hidden_field_is_e0407() {
+        // Decision #25 + #24 interaction: @snapshot of a #hidden field
+        // from outside the owning automaton's transitions must be
+        // rejected via E0407 — the same hidden-visibility rule that
+        // applies to direct field access.
+        let src = "\
+            #automaton Uart { parity_errors: u32 #hidden; } \
+            @fn observe() -> u32 { let _v := @snapshot Uart.parity_errors; return _v; }\
+        ";
+        let errors = resolve_str(src).expect_err("expected HiddenFieldNotAccessible");
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            ResolveError::HiddenFieldNotAccessible { automaton, field, .. }
+                if automaton == "Uart" && field == "parity_errors"
+        ));
+        assert!(
+            saw,
+            "expected E0407 for @snapshot of hidden field from @fn; got {errors:?}"
         );
     }
 }
