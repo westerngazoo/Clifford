@@ -7,6 +7,77 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Decision #22: imperative trait validation in `clifford-types` (E0541) (2026-05-05)
+
+Second slice of Decision #22 implementation (parser scaffolding
+landed earlier; this PR adds the *semantic* validation that closes
+the loop). Today the parser accepts any identifier list in `$
+[...]`; this PR rejects unknown trait names with `E0541 UnknownTrait`
+so typos surface as compile errors instead of silent acceptance.
+
+**Implementation (`crates/types/src/lib.rs`):**
+
+- Two predeclared trait lists (the names locked in Decision #22 +
+  ADR 0003):
+  - `PREDECLARED_PURE_TRAITS = ["Pure", "Readable", "Observable", "Opaque"]`
+  - `PREDECLARED_IMPERATIVE_TRAITS = ["Hardware", "Realtime",
+    "Acquire", "Release", "SeqCst", "LockingDiscipline",
+    "PureState", "Encapsulated"]`
+- New `TraitRegistry { known: HashSet<String> }` built from the
+  two predeclared lists ∪ every `Item::Trait` (user-defined
+  `@trait Name { … }`) in the program.
+- New `validate_trait_lists()` pass walks every `@fn`, `#effect`,
+  `#interrupt`, and `#transition` and emits `E0541 UnknownTrait`
+  for any entry not in the registry. Runs after the body walk so
+  errors are collected in one pass.
+- New `TypeError::UnknownTrait { trait_name, callable, kind, at }`
+  variant. The diagnostic names the offending trait, the
+  containing callable's source identifier, and the source-form
+  kind (`@fn` / `#effect` / `#interrupt` / `#transition`) so users
+  see what *they* wrote, not internal type names. The error
+  message also enumerates the predeclared sets and points at
+  `@trait` declarations as the user-defined route.
+
+**ADR-driven semantics enforced:**
+
+- The dropped `Diverges` trait (per ADR 0003 Q4 — superseded by
+  `@partial`) is *correctly* rejected as unknown. Source code
+  still using `Diverges` will fail to compile, signalling the
+  user to switch.
+- Empty `$ []` and absent trait list both pass without diagnostic
+  (per Emergent Rule 2 — empty ≡ `[Pure]`).
+- Cross-layer trait usage (e.g. `Realtime` on a `@fn`, or `Pure`
+  on a `#effect`) is *not* layer-checked in this slice — both
+  predeclared sets validate together. Layer-aware checking (which
+  is more nuanced per ADR 0003 Q2's row-direction discussion)
+  lands in a follow-up slice.
+
+**Tests (15 new D22 trait-validation tests, types crate now 116
+total, was 101):**
+
+- Each predeclared pure trait accepted on `@fn`.
+- Predeclared imperative traits accepted on `#effect`,
+  `#interrupt`, `#transition`.
+- Unknown trait emits E0541 from each callable kind.
+- Classic typo (`Realtim` for `Realtime`) caught.
+- User-defined `@trait MyOwnTrait` validated.
+- `Diverges` correctly rejected (ADR 0003 Q4 enforcement).
+- Empty `$ []` and absent trait list both silent.
+- Multiple unknown traits all reported in one pass.
+- Smoke test enumerates every name in
+  `PREDECLARED_{PURE,IMPERATIVE}_TRAITS` and verifies acceptance —
+  guards against accidental omissions if someone edits the
+  constants.
+
+Workspace remains green; clippy clean.
+
+This closes the second of the three planned slices for this batch
+(T4b → v0.2-α scaffolding → trait validation). The next natural
+follow-ups: layer-aware trait checking, `@snapshot` row-gating
+(needs `Readable`-trait recognition this slice provides),
+generic-arg validation for `LockingDiscipline<RwLock>`-style
+references.
+
 ### Added — v0.2-α: `@partial` and `@snapshot` lexer + AST + parser scaffolding (2026-05-05)
 
 First implementation slice for Decisions #23 (Haskell-clean `@fn`)

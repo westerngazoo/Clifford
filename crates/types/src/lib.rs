@@ -49,7 +49,7 @@ use std::collections::HashMap;
 
 use clifford_ast::{
     AutomatonDecl, BinaryOp, Block, EffectDecl, Expr, ExprKind, FnDecl, InterruptDecl, Item, Param,
-    PrimitiveType, Program, Stmt, StmtKind, TransitionDecl, TypeExpr, TypeKind, UnaryOp,
+    PrimitiveType, Program, Stmt, StmtKind, TraitRef, TransitionDecl, TypeExpr, TypeKind, UnaryOp,
 };
 use clifford_lexer::Span;
 use clifford_resolve::{BindingRef, Resolution, Symbol, SymbolKind};
@@ -167,6 +167,38 @@ pub enum TypeError {
         /// Display name of the index expression's type.
         index: String,
         /// Byte offset of the index expression.
+        at: usize,
+    },
+
+    /// A `$ [TraitList]` clause references a trait name that is neither
+    /// predeclared (per Decision #2 + Decision #22 / ADR 0003) nor
+    /// declared via a top-level `@trait Name { … }` item.
+    ///
+    /// **Predeclared pure-side traits** (`@fn`): `Pure`, `Readable`,
+    /// `Observable`, `Opaque`.
+    /// **Predeclared imperative-side traits** (`#effect` / `#interrupt`
+    /// / `#transition` per Decision #22): `Hardware`, `Realtime`,
+    /// `Acquire`, `Release`, `SeqCst`, `LockingDiscipline`,
+    /// `PureState`, `Encapsulated`.
+    ///
+    /// User-defined traits must be declared via `@trait Name { … }` at
+    /// top level. Note: `Diverges` from earlier drafts is *deliberately
+    /// removed* — `@partial @fn` covers non-termination per ADR 0003 Q4.
+    /// The diagnostic identifies the offending trait name and the
+    /// callable carrying the trait list, so users see *their*
+    /// identifier and *their* call site.
+    #[error("E0541: unknown trait `{trait_name}` in `{kind} {callable}` trait list (at byte {at}); declare via `@trait {trait_name} {{ … }}` or use a predeclared trait name")]
+    UnknownTrait {
+        /// The unrecognised trait name as written in source.
+        trait_name: String,
+        /// The callable's name (the `@fn`, `#effect`, `#interrupt`, or
+        /// `#transition` whose trait list contains the bad reference).
+        callable: String,
+        /// Source-form of the callable's kind (`@fn`, `#effect`, etc.) so
+        /// the diagnostic shows the user's syntactic form, not internal
+        /// type names.
+        kind: &'static str,
+        /// Byte offset of the trait reference within the trait list.
         at: usize,
     },
 }
@@ -411,6 +443,7 @@ pub fn infer(program: &Program, resolution: &Resolution) -> Result<Typing, Vec<T
     let signatures = build_signatures(program);
     let automaton_field_types = build_automaton_field_types(program);
     let type_registry = build_type_registry(program);
+    let trait_registry = TraitRegistry::build(program);
 
     let mut walker = Inferer {
         resolution,
@@ -432,6 +465,11 @@ pub fn infer(program: &Program, resolution: &Resolution) -> Result<Typing, Vec<T
             _ => {}
         }
     }
+
+    // Decision #22 / Decision #2 / ADR 0003: validate every trait list
+    // (signature-time check; runs after body walk so all errors are
+    // collected in one pass).
+    validate_trait_lists(program, &trait_registry, &mut walker.errors);
 
     if walker.errors.is_empty() {
         Ok(Typing {
@@ -586,6 +624,134 @@ impl TypeRegistry {
             }
         }
         Type::Unknown("alias cycle or excessive nesting (T4b safeguard)")
+    }
+}
+
+/// Predeclared pure-side traits per Decision #2 + ADR 0003.
+///
+/// Used on `@fn` declarations and `@fn`-pointer types. The semantics
+/// switch between *purity classification* (Decision #2 — `Pure`,
+/// `Readable`, `Observable`, `Opaque`) and *first-class effect rows*
+/// (ADR 0003 P2) at row-composition time; for now this slice just
+/// validates that the names are recognised.
+const PREDECLARED_PURE_TRAITS: &[&str] = &["Pure", "Readable", "Observable", "Opaque"];
+
+/// Predeclared imperative-side traits per Decision #22.
+///
+/// Used on `#effect`, `#interrupt`, and `#transition` declarations.
+/// Three subgroups by consumer:
+///
+/// - **Codegen consumers** (memory-ordering fences): `Acquire`,
+///   `Release`, `SeqCst`.
+/// - **`cliffordc audit` / certification**: `Hardware`, `Realtime`,
+///   `LockingDiscipline`, `PureState`, `Encapsulated`.
+///
+/// The orthogonality engine ignores all of them (per Decision #22
+/// design); this slice just validates their names so a typo
+/// (`Realtim` instead of `Realtime`) surfaces as an early diagnostic
+/// rather than silent acceptance.
+const PREDECLARED_IMPERATIVE_TRAITS: &[&str] = &[
+    "Hardware",
+    "Realtime",
+    "Acquire",
+    "Release",
+    "SeqCst",
+    "LockingDiscipline",
+    "PureState",
+    "Encapsulated",
+];
+
+/// Registry of every recognised trait name in the program — predeclared
+/// (per Decision #2 + Decision #22) plus user-defined `@trait` items.
+///
+/// Built once per `infer()` call. Used by [`validate_trait_lists`] to
+/// emit `E0541 UnknownTrait` for typos and undeclared names.
+///
+/// Slice scope: name-only validation. Generic-arg type checking on
+/// generic traits like `LockingDiscipline<RwLock>` is downstream
+/// (T4c work — needs the type registry to resolve the args).
+#[derive(Debug)]
+struct TraitRegistry {
+    /// Set of all known trait names: predeclared + user-`@trait`.
+    known: std::collections::HashSet<String>,
+}
+
+impl TraitRegistry {
+    /// Build the registry: predeclared-pure ∪ predeclared-imperative ∪
+    /// user-`@trait` declarations from the program.
+    fn build(program: &Program) -> Self {
+        let mut known: std::collections::HashSet<String> =
+            std::collections::HashSet::with_capacity(
+                PREDECLARED_PURE_TRAITS.len() + PREDECLARED_IMPERATIVE_TRAITS.len() + 4,
+            );
+        for &name in PREDECLARED_PURE_TRAITS
+            .iter()
+            .chain(PREDECLARED_IMPERATIVE_TRAITS.iter())
+        {
+            known.insert((*name).to_owned());
+        }
+        for item in &program.items {
+            if let Item::Trait(td) = item {
+                known.insert(td.name.clone());
+            }
+        }
+        Self { known }
+    }
+
+    /// True if `name` is a recognised trait (predeclared or user-defined).
+    fn is_known(&self, name: &str) -> bool {
+        self.known.contains(name)
+    }
+}
+
+/// Walk every `@fn` / `#effect` / `#interrupt` / `#transition` in the
+/// program and validate that each entry in its `trait_list` is a known
+/// trait per [`TraitRegistry::is_known`]. Emits `E0541 UnknownTrait`
+/// for unresolved names.
+///
+/// This is a separate pass (rather than inline in the body walk)
+/// because trait validation is a *signature-time* concern, not a
+/// body-walking one — it should fire even on callables whose bodies
+/// the inferer never enters (e.g. `@fn` declarations whose call sites
+/// are all in a different module).
+fn validate_trait_lists(
+    program: &Program,
+    registry: &TraitRegistry,
+    errors: &mut Vec<TypeError>,
+) {
+    for item in &program.items {
+        match item {
+            Item::Fn(d) => check_traits(&d.trait_list, &d.name, "@fn", registry, errors),
+            Item::Effect(d) => check_traits(&d.trait_list, &d.name, "#effect", registry, errors),
+            Item::Interrupt(d) => {
+                check_traits(&d.trait_list, &d.name, "#interrupt", registry, errors);
+            }
+            Item::Automaton(d) => {
+                for t in &d.transitions {
+                    check_traits(&t.trait_list, &t.name, "#transition", registry, errors);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn check_traits(
+    list: &[TraitRef],
+    callable: &str,
+    kind: &'static str,
+    registry: &TraitRegistry,
+    errors: &mut Vec<TypeError>,
+) {
+    for tr in list {
+        if !registry.is_known(&tr.name) {
+            errors.push(TypeError::UnknownTrait {
+                trait_name: tr.name.clone(),
+                callable: callable.to_owned(),
+                kind,
+                at: tr.span.start,
+            });
+        }
     }
 }
 
@@ -2700,5 +2866,216 @@ mod tests {
             res.is_ok(),
             "expected alias to work in call-arg compat too; got {res:?}"
         );
+    }
+
+    // ─── Decision #22 + Decision #2 + ADR 0003: trait validation ─────────
+
+    #[test]
+    fn predeclared_pure_trait_on_fn_accepted() {
+        let src = "@fn p(x: u32) -> u32 $ [Pure] { return x; }";
+        let res = infer_str(src);
+        assert!(res.is_ok(), "Pure should be predeclared, got {res:?}");
+    }
+
+    #[test]
+    fn predeclared_readable_trait_on_fn_accepted() {
+        let src = "@fn r(x: u32) -> u32 $ [Readable] { return x; }";
+        let res = infer_str(src);
+        assert!(res.is_ok(), "Readable should be predeclared, got {res:?}");
+    }
+
+    #[test]
+    fn predeclared_imperative_trait_on_effect_accepted() {
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #effect tick() #mutates: [C] $ [Realtime, Hardware] { }\n\
+        ";
+        let res = infer_str(src);
+        assert!(
+            res.is_ok(),
+            "Realtime + Hardware should be predeclared on #effect, got {res:?}"
+        );
+    }
+
+    #[test]
+    fn predeclared_imperative_traits_on_interrupt_accepted() {
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #interrupt SysTick() #mutates: [C] #priority: HIGH $ [Realtime, Acquire] { }\n\
+        ";
+        let res = infer_str(src);
+        assert!(
+            res.is_ok(),
+            "Realtime + Acquire on #interrupt should be predeclared, got {res:?}"
+        );
+    }
+
+    #[test]
+    fn predeclared_trait_on_transition_accepted() {
+        let src = "\
+            #automaton C {\n  \
+              value: u32;\n  \
+              #transition tick $ [PureState] { C.value = 1u32; }\n\
+            }\n\
+        ";
+        let res = infer_str(src);
+        assert!(
+            res.is_ok(),
+            "PureState on #transition should be predeclared, got {res:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_trait_on_fn_emits_e0541() {
+        let src = "@fn f(x: u32) -> u32 $ [TotallyMadeUp] { return x; }";
+        let errors = infer_str(src).expect_err("expected E0541");
+        let saw = errors.iter().any(|e| {
+            matches!(e, TypeError::UnknownTrait { trait_name, kind, callable, .. }
+                if trait_name == "TotallyMadeUp" && *kind == "@fn" && callable == "f")
+        });
+        assert!(saw, "expected E0541 with kind=@fn callable=f; got {errors:?}");
+    }
+
+    #[test]
+    fn unknown_trait_on_effect_emits_e0541() {
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #effect bad() #mutates: [C] $ [Whatever] { }\n\
+        ";
+        let errors = infer_str(src).expect_err("expected E0541");
+        let saw = errors.iter().any(|e| {
+            matches!(e, TypeError::UnknownTrait { trait_name, kind, callable, .. }
+                if trait_name == "Whatever" && *kind == "#effect" && callable == "bad")
+        });
+        assert!(saw, "expected E0541 on #effect; got {errors:?}");
+    }
+
+    #[test]
+    fn unknown_trait_on_interrupt_emits_e0541() {
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #interrupt SysTick() #mutates: [C] #priority: HIGH $ [Bogus] { }\n\
+        ";
+        let errors = infer_str(src).expect_err("expected E0541");
+        let saw = errors.iter().any(|e| {
+            matches!(e, TypeError::UnknownTrait { trait_name, kind, callable, .. }
+                if trait_name == "Bogus" && *kind == "#interrupt" && callable == "SysTick")
+        });
+        assert!(saw, "expected E0541 on #interrupt; got {errors:?}");
+    }
+
+    #[test]
+    fn unknown_trait_on_transition_emits_e0541() {
+        let src = "\
+            #automaton C {\n  \
+              v: u32;\n  \
+              #transition tick $ [DefinitelyNotATrait] { C.v = 1u32; }\n\
+            }\n\
+        ";
+        let errors = infer_str(src).expect_err("expected E0541");
+        let saw = errors.iter().any(|e| {
+            matches!(e, TypeError::UnknownTrait { trait_name, kind, callable, .. }
+                if trait_name == "DefinitelyNotATrait" && *kind == "#transition" && callable == "tick")
+        });
+        assert!(saw, "expected E0541 on #transition; got {errors:?}");
+    }
+
+    #[test]
+    fn typo_in_predeclared_trait_emits_e0541() {
+        // `Realtim` (missing trailing `e`) is the classic typo. The
+        // diagnostic must catch it — that's the whole point of the
+        // validation pass per Decision #22.
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #effect e() #mutates: [C] $ [Realtim] { }\n\
+        ";
+        let errors = infer_str(src).expect_err("expected E0541 on typo");
+        let saw = errors.iter().any(|e| {
+            matches!(e, TypeError::UnknownTrait { trait_name, .. } if trait_name == "Realtim")
+        });
+        assert!(saw, "expected E0541 for `Realtim` typo; got {errors:?}");
+    }
+
+    #[test]
+    fn user_defined_trait_via_at_trait_is_accepted() {
+        let src = "\
+            @trait MyOwnTrait { }\n\
+            @fn f(x: u32) -> u32 $ [MyOwnTrait] { return x; }\n\
+        ";
+        let res = infer_str(src);
+        assert!(
+            res.is_ok(),
+            "user-defined `@trait MyOwnTrait` should validate; got {res:?}"
+        );
+    }
+
+    #[test]
+    fn diverges_trait_is_unknown_per_adr_0003_q4() {
+        // ADR 0003 Q4 explicitly DROPPED the `Diverges` trait —
+        // `@partial @fn` covers non-termination. Source code that still
+        // references `Diverges` should fail validation, signalling the
+        // user to switch to `@partial`.
+        let src = "@fn f(x: u32) -> u32 $ [Diverges] { return x; }";
+        let errors = infer_str(src).expect_err("Diverges should be unknown post-ADR-0003");
+        let saw = errors.iter().any(|e| {
+            matches!(e, TypeError::UnknownTrait { trait_name, .. } if trait_name == "Diverges")
+        });
+        assert!(saw, "expected E0541 for dropped `Diverges` trait; got {errors:?}");
+    }
+
+    #[test]
+    fn empty_trait_list_does_not_trigger_validation() {
+        // Per Emergent Rule 2 + the AST docs, an empty `$ [...]` is the
+        // same shape as no trait list. No diagnostic should fire.
+        let src1 = "@fn p(x: u32) -> u32 { return x; }";
+        let src2 = "@fn p(x: u32) -> u32 $ [] { return x; }";
+        assert!(infer_str(src1).is_ok(), "no trait list should be silent");
+        assert!(infer_str(src2).is_ok(), "empty trait list should be silent");
+    }
+
+    #[test]
+    fn multiple_unknown_traits_all_reported() {
+        // Multiple bad trait names in one list — each gets its own E0541.
+        let src = "@fn f(x: u32) -> u32 $ [Foo, Bar, Pure, Baz] { return x; }";
+        let errors = infer_str(src).expect_err("expected multiple E0541s");
+        let unknown_names: Vec<String> = errors
+            .iter()
+            .filter_map(|e| match e {
+                TypeError::UnknownTrait { trait_name, .. } => Some(trait_name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(unknown_names.contains(&"Foo".to_owned()));
+        assert!(unknown_names.contains(&"Bar".to_owned()));
+        assert!(unknown_names.contains(&"Baz".to_owned()));
+        assert!(
+            !unknown_names.contains(&"Pure".to_owned()),
+            "Pure is predeclared and should not appear"
+        );
+    }
+
+    #[test]
+    fn predeclared_traits_full_set_recognised() {
+        // Smoke test: every name in PREDECLARED_PURE_TRAITS and
+        // PREDECLARED_IMPERATIVE_TRAITS resolves cleanly. If someone
+        // edits the constants, this test catches an accidental
+        // omission.
+        for name in PREDECLARED_PURE_TRAITS.iter() {
+            let src = format!("@fn f(x: u32) -> u32 $ [{name}] {{ return x; }}");
+            assert!(
+                infer_str(&src).is_ok(),
+                "predeclared pure trait `{name}` should be recognised"
+            );
+        }
+        for name in PREDECLARED_IMPERATIVE_TRAITS.iter() {
+            let src = format!(
+                "#automaton C {{ v: u32; }}\n\
+                 #effect e() #mutates: [C] $ [{name}] {{ }}"
+            );
+            assert!(
+                infer_str(&src).is_ok(),
+                "predeclared imperative trait `{name}` should be recognised"
+            );
+        }
     }
 }
