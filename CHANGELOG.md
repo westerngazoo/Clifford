@@ -7,6 +7,134 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Codegen slice 8: Decision #17 / #19 unsafe primitives (2026-05-11)
+
+Closes the codegen story for the spec's six narrow-unsafe escape
+hatches: `#unchecked_load` / `#volatile_load` (expressions),
+`#unchecked_store` / `#volatile_store` (statements),
+`#unchecked_cast` (expression with mandatory non-empty reason
+string per Refinement #19a), and `#unchecked_offset` (Decision #19
+pointer arithmetic).
+
+These are the spec's blessed escape hatches for talking to memory
+the type system can't see (raw MMIO outside register-block
+automatons, ABI bridges to C, hand-rolled DMA descriptor builders,
+…). Every use is recorded in the AST with its reason and surfaces
+through `cliffordc audit --list-unsafe`.
+
+**The headline shape:**
+
+```clifford
+@fn read_byte(p: &u8) -> u8 {
+  return #unchecked_load<u8>(p);
+}
+
+@fn write_byte(p: &u8) {
+  #unchecked_store<u8>(p, 65u8);
+}
+
+@fn write_mmio(p: &u32) {
+  #volatile_store<u32>(p, 0xDEAD_BEEFu32);
+}
+
+@fn step(p: &u32) -> &u32 {
+  return #unchecked_offset<u32>(p, 1i32);   // p + sizeof(u32)
+}
+
+@fn capture_address(p: &u32) -> u64 {
+  return #unchecked_cast<&u32, u64>("addr capture for log", p);
+}
+```
+
+→
+
+```llvm
+%v1 = load i8, i8* %p                              ; #unchecked_load
+store i8 65, i8* %p                                ; #unchecked_store
+store volatile i32 -559038737, i32* %p             ; #volatile_store (0xDEADBEEF)
+%v2 = getelementptr i32, i32* %p, i32 1            ; #unchecked_offset
+%v3 = ptrtoint i32* %p to i64                      ; #unchecked_cast (ptr→int)
+```
+
+**Implementation (`crates/codegen/src/lib.rs`):**
+
+- `emit_expr` dispatch grew four arms — `UncheckedLoad`,
+  `VolatileLoad`, `UncheckedCast`, `UncheckedOffset` — and
+  `emit_stmt` grew two arms — `UncheckedStore`, `VolatileStore`.
+- New `Emitter::emit_unchecked_load(ty, ptr, is_volatile)` —
+  `load`/`load volatile` against a raw pointer; element type comes
+  from the user-written `TypeExpr` so the storage width is
+  explicit.
+- New `Emitter::emit_unchecked_store(ty, ptr, value, is_volatile)`
+  — symmetric write side; statement form (no result).
+- New `Emitter::emit_unchecked_cast(from_ty, to_ty, value)` —
+  picks the LLVM opcode by source / dest IR-type shapes:
+  - same IR type → no-op (return value as-is)
+  - both integers → `trunc` / `sext` / `zext` (signedness from
+    the user-written source type, not the value's inferred type;
+    `#unchecked_cast` is explicit at this level)
+  - source pointer + dest int → `ptrtoint`
+  - source int + dest pointer → `inttoptr`
+  - any other shape → `bitcast` (LLVM accepts bitcast between
+    same-bit-width values; for size mismatches LLVM will reject
+    at IR-load time, surfacing the user's error)
+- New `Emitter::emit_unchecked_offset(ty, ptr, n)` — single
+  `getelementptr` against the raw pointer; the signed `n` is the
+  element-count offset, typed by `expr_ir_type`.
+- New `type_expr_is_signed_int(t)` free helper — same shape as the
+  expr-side `expr_is_signed_int` but operates on a syntactic
+  `TypeExpr` (used by `#unchecked_cast` since the source type is
+  user-written, not inferred).
+
+**Reason-string handling:** the mandatory non-empty reason on
+`#unchecked_cast` (Refinement #19a) is preserved on the AST and
+surfaced by the audit-log tool. We deliberately do NOT embed it in
+the emitted IR — LLVM strips comments during parse, so a comment
+would be lost. The reason lives where it's queryable by tooling
+(the AST), not where it would silently disappear (the IR text).
+
+**Volatile semantics:** `#volatile_load` / `#volatile_store`
+produce `load volatile` / `store volatile` ops, matching the
+register-block field-access path's volatile handling (slice 4).
+The contract is the same: word-sized integer volatile loads/stores
+are a single hardware instruction on every supported target. This
+is the hatch firmware uses for MMIO that lives *outside* a
+register-block automaton (e.g. dynamically-resolved peripheral
+addresses, IPC mailboxes).
+
+**Deferred to later slices:**
+
+- The `#unchecked_cast` `bitcast` fallback is best-effort. If a
+  user attempts a same-shape cast LLVM rejects (e.g. mismatched
+  bit widths between aggregate types), the error surfaces from
+  `llc` / `clang`, not from `cliffordc`. A future slice could add
+  pre-validation by walking the type pair and producing a clean
+  `E0810`-shaped error.
+- Float ↔ int via `#unchecked_cast` (`fptoui`, `sitofp`, etc.) —
+  not exercised by firmware yet; falls through to `bitcast` today
+  which LLVM will reject.
+- Audit-log emission is the AST's job (already wired); the IR
+  pass deliberately does not touch it.
+
+**Tests added (`crates/codegen/src/lib.rs::tests`):** 12 new tests.
+
+- `s8_unchecked_load_emits_plain_load` — `#unchecked_load<u32>(p)`.
+- `s8_volatile_load_emits_volatile_load` — `#volatile_load<u32>`.
+- `s8_unchecked_store_emits_plain_store` — `#unchecked_store<u32>`.
+- `s8_volatile_store_emits_volatile_store` — `#volatile_store<u32>`.
+- `s8_unchecked_cast_int_widen_unsigned_emits_zext` — `<u8, u32>`.
+- `s8_unchecked_cast_int_widen_signed_emits_sext` — `<i8, i32>`.
+- `s8_unchecked_cast_int_narrowing_emits_trunc` — `<u32, u8>`.
+- `s8_unchecked_cast_same_type_is_noop` — `<u32, u32>` no-op.
+- `s8_unchecked_cast_pointer_to_int_emits_ptrtoint` — `<&u32, u64>`.
+- `s8_unchecked_offset_emits_getelementptr` — `<u32>(p, 4i32)`.
+- `s8_unchecked_load_inside_binary_op` — load result feeds an add.
+- `s8_type_expr_is_signed_int_table` — direct unit test on the
+  helper for every primitive type.
+
+Total codegen tests: **117** (105 pre-slice-8 + 12 new). All green;
+clippy clean across the workspace.
+
 ### Added — Codegen slice 7: integer cast expressions (2026-05-10)
 
 Lowers `expr as Type` for the integer-to-integer cases that v0.1
