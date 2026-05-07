@@ -12,9 +12,19 @@ description = "LLVM IR code generation for the Clifford compiler. Implements §8
 # only allowed sites). Every `unsafe` block requires a `// SAFETY:` comment.
 
 [dependencies]
+clifford-ast.workspace = true
 clifford-effect.workspace = true
 clifford-ortho.workspace = true
 thiserror.workspace = true
 
-# LLVM binding choice (inkwell vs llvm-sys) deferred to actual implementation.
-# Add the dep here when chosen.
+# Text-form LLVM IR emission in v0.1 (no native LLVM linkage). The
+# inkwell-vs-llvm-sys decision is deferred until a slice needs the
+# native binding (target-machine introspection, JIT, or in-process
+# verification). Until then the IR is emitted as a `.ll` text the
+# user can pipe to `llc` / `clang` externally.
+
+[dev-dependencies]
+# Tests parse + resolve real Clifford source to exercise lowering
+# end-to-end without re-implementing the upstream phases.
+clifford-lexer.workspace = true
+clifford-parser.workspace = true

@@ -7,6 +7,124 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Codegen slice 1: text-form LLVM IR for @fn + primitives + arithmetic + calls (2026-05-07)
+
+First real lowering in `clifford-codegen`. The crate was a stub with
+a single `NotYetImplemented` error code (E0810) since Phase-4
+scaffolding; this slice fills it in for the v0.1 minimum surface.
+
+**The decision recorded in `crates/codegen/Cargo.toml`:**
+
+> Text-form LLVM IR emission in v0.1 (no native LLVM linkage). The
+> inkwell-vs-llvm-sys decision is deferred until a slice needs the
+> native binding (target-machine introspection, JIT, or in-process
+> verification). Until then the IR is emitted as a `.ll` text the
+> user can pipe to `llc` / `clang` externally.
+
+**What lowers in this slice:**
+
+- **Module header.** `; ModuleID = '<name>'` + `source_filename =
+  "<name>"` per LLVM convention.
+- **Primitive types** (§4.1):
+  - `bool` → `i1`
+  - `u8`/`i8` → `i8`, `u16`/`i16` → `i16`, `u32`/`i32`/`char` →
+    `i32`, `u64`/`i64` → `i64`
+  - `usize`/`isize` → `i64` (v0.1 default 64-bit target;
+    target-aware lowering is a future slice)
+  - `f32` → `float`, `f64` → `double`
+  - `()` (unit) → `void`
+- **`@fn` declarations** with primitive params + return types +
+  bodies. One `define <ret_ty> @<name>(...)` per `@fn`; per-fn SSA
+  counter reset; `entry:` label per function.
+- **Statements:** `Let`, `LetShort`, `Expr`, `Return(Some)` /
+  `Return(None)`. `let` and `let :=` bindings emit an SSA-add-zero
+  identity to give the binding a named SSA temp (LLVM optimises it
+  away). Future slice with allocator/store machinery will replace
+  this idiom for mutable bindings.
+- **Expressions:** integer / hex / binary / boolean literals, path
+  expressions (single-segment, resolves to local / param), parens,
+  binary arithmetic (`+`, `-`, `*`, `/`, `%`), direct function
+  calls (single-segment Path callee).
+- **Hex / binary literals** lowered to their decimal IR forms (LLVM
+  text accepts decimal integer constants).
+- Per-`@fn` SSA reset (`%tmp.0` starts each function), so callers
+  and callees don't share the temp namespace.
+
+**Public API:**
+
+- `pub fn lower(program: &Program, module_name: &str) -> Result<String,
+  Vec<CodegenError>>` — entry point. Returns the `.ll` text on
+  success; errors accumulate across the program in source order.
+- `CodegenError` enum:
+  - `E0810 NotYetImplemented { what: &'static str }` — AST shape
+    not in this slice (e.g. `"reference type"`, `"tuple
+    expression"`, `"sigma loop"`).
+  - `E0811 UnresolvedName { name }` — internal safety net for
+    upstream resolver bugs.
+  - `E0812 BadLiteral { literal, reason }` — internal safety net
+    for malformed literals after upstream typing.
+
+**What slice 1 deliberately defers (subsequent codegen slices):**
+
+- **§8.4 Automaton/transition/effect lowering** — state struct per
+  non-register-block automaton; state-tag field for multi-state
+  automata; one LLVM function per effect / transition / hardware
+  mutator / interface-method specialisation; transition-atomicity
+  wrapping per Refinement #5e (cli/sti or LDREX/STREX based on R(A)
+  and target); register-block field reads/writes as volatile
+  loads/stores at `address + offset` (Decision #6); bit-field RMW
+  with target-atomic when concurrent writer exists (Decision #20).
+- **§8.5 Interrupt handler emission** — `#interrupt NAME` produces
+  an LLVM function with linker symbol `NAME`, target-specific
+  calling convention, `.interrupts` section (Decision #10).
+- **§8.3 Composite types** — references (`T*` with `noalias` for
+  `&mut`), arrays (LLVM `[N x T]`), slices (`{T*, i64}`), tuples
+  (LLVM struct), ADTs (tagged-union representation).
+- **Sigma loops** — counted loop with bounds-check elision (§5.8).
+- **Decision #22 codegen consumers** — `Acquire` / `Release` /
+  `SeqCst` memory-ordering fences (consumed by the v0.4-α slice
+  when imperative-callable lowering lands).
+- **Native LLVM binding** (inkwell or llvm-sys) — deferred until a
+  slice needs it for target-machine introspection, JIT, or
+  in-process IR verification. v0.1 ships text-form `.ll` only.
+- **`Typing` integration** — slice 1 uses a syntactic guess for IR
+  types (literal suffixes + path-default-i32 + binary-operand-of-
+  lhs); a typing-aware future slice will replace this with
+  authoritative type info from `clifford-types`.
+- **Optimisation passes** — none in v0.1; LLVM's own passes do the
+  heavy lifting downstream.
+
+**Tests (20 total, codegen crate previously had 1 smoke test):**
+
+- Module header (ModuleID, source_filename).
+- Non-`@fn` items silently skipped (partial program lowers cleanly).
+- `@fn` no-args / void return; with-params + return; bool param →
+  `i1`; integer literal return; arithmetic; multiple ops; call
+  expression with typed args; `let` binding with `_x: u32`; `let
+  :=` binding; multiple fns each emit independently.
+- E0810 surfaces correctly for unsupported expressions (tuple) and
+  unsupported types (reference).
+- Primitive-type-mapping smoke test enumerating all 13 primitives
+  → IR-type table.
+- Hex literal `0xFFu32` lowers to `255`; binary `0b1010u32` →
+  `10`.
+- Determinism (same input → same output) and snapshot-style locks
+  for the canonical add-fn shape and a call-chain shape.
+
+**Cargo.toml changes:**
+
+- `clifford-codegen` now depends on `clifford-ast` (was missing,
+  needed to walk the AST).
+- New dev-dependencies: `clifford-lexer`, `clifford-parser` (tests
+  parse real source for end-to-end coverage).
+
+Workspace remains green; clippy clean.
+
+This slice unblocks the v0.1 GA milestone path: combined with the
+existing lexer/parser/resolver/types/check/effect/ortho pipeline, a
+program of pure `@fn`s with primitives + arithmetic + calls now
+goes from `.cl` source to runnable `.ll` IR.
+
 ### Type Checker — Slice T4e: compound-position generic unification for variant calls (2026-05-07)
 
 Fifth slice of type-checker path-resolution work. T4d added variant-
