@@ -261,6 +261,13 @@ struct Emitter<'a> {
     /// [`Self::emit_effect`] / [`Self::emit_interrupt`] /
     /// [`Self::emit_transition`].
     pending_exit_fence: Option<&'static str>,
+    /// Slice 9: when emitting a `#transition name -> Dest { … }`
+    /// inside a multi-state automaton, this carries
+    /// `(automaton_name, dest_tag)` so a `store i32 <tag>, i32* …`
+    /// is emitted before every `ret` exit (alongside any
+    /// Decision #22 release / SeqCst fence). `None` for monoid
+    /// transitions or transitions without a `-> Dest` target.
+    pending_transition_tag_write: Option<(String, u32)>,
     /// Errors collected across the whole program.
     errors: Vec<CodegenError>,
 }
@@ -290,6 +297,45 @@ struct AutomatonInfo {
     /// `0` for non-register-block. Sum of `address` + each field's
     /// `offset` is the absolute MMIO address of that field.
     base_address: u64,
+    /// Slice 9: state-tag table for multi-state automatons. Each
+    /// `(name, tag)` pair maps a `#states: [...]` entry to the
+    /// integer encoding used in the state struct's tag field. Empty
+    /// for monoid automatons (no `#states` clause). The first
+    /// declared state always has tag 0 — that matches the global's
+    /// `zeroinitializer` so the initial state needs no special
+    /// emission.
+    state_tags: Vec<(String, u32)>,
+}
+
+impl AutomatonInfo {
+    /// Slice 9: `true` iff this automaton has a `#states: [...]`
+    /// clause (i.e. is multi-state). Monoid automatons return
+    /// `false` and skip the state-tag field in the state struct.
+    fn is_multi_state(&self) -> bool {
+        !self.state_tags.is_empty()
+    }
+
+    /// Slice 9: return the LLVM struct-field index for the user-
+    /// declared field at user-visible index `user_idx`. For
+    /// multi-state automatons the state-tag occupies index 0, so
+    /// user fields shift up by one. For monoid automatons the
+    /// user index IS the LLVM index.
+    fn llvm_field_index(&self, user_idx: usize) -> usize {
+        if self.is_multi_state() {
+            user_idx + 1
+        } else {
+            user_idx
+        }
+    }
+
+    /// Slice 9: look up the integer tag for a state name.
+    /// Returns `None` if `state_name` isn't in the `#states`
+    /// list (or the automaton is monoid).
+    fn state_tag(&self, state_name: &str) -> Option<u32> {
+        self.state_tags
+            .iter()
+            .find_map(|(n, tag)| if n == state_name { Some(*tag) } else { None })
+    }
 }
 
 /// One per-function local binding: source name + SSA-value ref + IR
@@ -314,6 +360,7 @@ impl<'a> Emitter<'a> {
             transition_owners: HashMap::new(),
             enclosing_owner: None,
             pending_exit_fence: None,
+            pending_transition_tag_write: None,
             errors: Vec::new(),
         }
     }
@@ -360,6 +407,23 @@ impl<'a> Emitter<'a> {
                     };
                     fields.push((f.name.clone(), ir_ty, offset));
                 }
+                // Slice 9: build state-tag table from the
+                // `#states: [...]` clause (Decision #5). The first
+                // listed state is the initial state and gets tag 0;
+                // subsequent states get sequential tags. Empty for
+                // monoid automatons (no `#states` clause).
+                let state_tags: Vec<(String, u32)> = decl
+                    .states
+                    .as_ref()
+                    .map(|names| {
+                        names
+                            .iter()
+                            .enumerate()
+                            .map(|(i, sn)| (sn.name.clone(), i as u32))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
                 self.automatons.insert(
                     decl.name.clone(),
                     AutomatonInfo {
@@ -367,6 +431,7 @@ impl<'a> Emitter<'a> {
                         fields,
                         is_register_block,
                         base_address,
+                        state_tags,
                     },
                 );
                 // Slice 4: record transition→owner mapping so
@@ -399,7 +464,19 @@ impl<'a> Emitter<'a> {
                 continue;
             };
             // Emit struct type.
-            let parts: Vec<String> = info.fields.iter().map(|(_, ty, _)| ty.clone()).collect();
+            //
+            // Slice 9: multi-state automatons prepend an `i32` state-
+            // tag at LLVM struct-field index 0. The user-declared
+            // fields shift up by one — see [`AutomatonInfo::llvm_field_index`].
+            // The global stays `zeroinitializer` since the first
+            // declared state always has tag 0.
+            let mut parts: Vec<String> = Vec::with_capacity(info.fields.len() + 1);
+            if info.is_multi_state() {
+                parts.push("i32".to_owned()); // state tag
+            }
+            for (_, ty, _) in &info.fields {
+                parts.push(ty.clone());
+            }
             writeln!(
                 &mut self.out,
                 "%struct.{name} = type {{ {fields} }}",
@@ -563,6 +640,36 @@ impl<'a> Emitter<'a> {
         let ordering = memory_ordering_from_traits(&decl.trait_list);
         self.pending_exit_fence = ordering.exit;
 
+        // Slice 9: if this transition has a `-> Dest` target on a
+        // multi-state automaton, set up a pending tag write so a
+        // `store i32 <dest_tag>, i32* …` is emitted before each
+        // `ret`. The resolver has already validated that the
+        // destination is one of the automaton's `#states`; we
+        // surface a defensive `NotYetImplemented` if it isn't, in
+        // case codegen runs ahead of upstream validation.
+        self.pending_transition_tag_write = match &decl.destination {
+            Some(dest) => {
+                let info = self.automatons.get(owner);
+                match info.and_then(|i| i.state_tag(dest)) {
+                    Some(tag) => Some((owner.to_owned(), tag)),
+                    None => {
+                        // Either not multi-state, or `dest` isn't a
+                        // declared state. Either way, the upstream
+                        // validation should have rejected this; we
+                        // skip emission but record an error so the
+                        // user sees something concrete.
+                        if info.map(|i| i.is_multi_state()).unwrap_or(false) {
+                            self.errors.push(CodegenError::UnresolvedName {
+                                name: format!("{owner}#states[{dest}]"),
+                            });
+                        }
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+
         // Slice 3: transitions take no value parameters at the AST
         // level (Decision #5 / Refinement #5b restricts transition
         // signatures). The generated IR fn signature is `void`.
@@ -577,6 +684,7 @@ impl<'a> Emitter<'a> {
 
         self.enclosing_owner = None;
         self.pending_exit_fence = None;
+        self.pending_transition_tag_write = None;
     }
 
     fn emit_module_header(&mut self) {
@@ -677,11 +785,34 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// Decision #22: emit the configured exit fence (if any) just
-    /// before a `ret` is written. Called from every site that emits
-    /// a `ret` so `Release` / `SeqCst` semantics are honoured at
-    /// every exit path.
+    /// Decision #22 + Slice 9: emit any pending exit-time writes
+    /// just before a `ret` is written. Called from every site that
+    /// emits a `ret` so the contracts are honoured at every exit
+    /// path.
+    ///
+    /// Order matters: the state-tag write happens BEFORE the
+    /// release / SeqCst fence so the new state is visible to other
+    /// agents only once the fence makes it so.
     fn emit_exit_fence_if_pending(&mut self) {
+        // Slice 9: emit the destination state-tag write before any
+        // fence. Cloning the pair is fine — it's a one-shot per
+        // `ret` and the table is small.
+        if let Some((auto, tag)) = self.pending_transition_tag_write.clone() {
+            // Stage 1: pointer to the state-tag field (LLVM index 0
+            // for multi-state automatons by construction).
+            let tag_ptr = self.fresh_value();
+            writeln!(
+                &mut self.out,
+                "  {tag_ptr} = getelementptr %struct.{auto}, %struct.{auto}* @{auto}.state, i32 0, i32 0",
+            )
+            .ok();
+            // Stage 2: store the destination tag.
+            writeln!(
+                &mut self.out,
+                "  store i32 {tag}, i32* {tag_ptr}",
+            )
+            .ok();
+        }
         if let Some(ordering) = self.pending_exit_fence {
             writeln!(&mut self.out, "  fence {ordering}").ok();
         }
@@ -841,7 +972,11 @@ impl<'a> Emitter<'a> {
                         absolute_address: info.base_address + offset.unwrap_or(0),
                     }
                 } else {
-                    FieldLocation::Struct { idx }
+                    // Slice 9: shift user-field index by the state-
+                    // tag slot for multi-state automatons.
+                    FieldLocation::Struct {
+                        idx: info.llvm_field_index(idx),
+                    }
                 };
                 entries.push((loc, ir_ty));
             }
@@ -1033,7 +1168,12 @@ impl<'a> Emitter<'a> {
                     absolute_address: info.base_address + offset.unwrap_or(0),
                 }
             } else {
-                FieldLocation::Struct { idx }
+                // Slice 9: shift user-field index by the state-tag
+                // slot for multi-state automatons (LLVM idx 0 holds
+                // the i32 tag; user fields start at idx 1).
+                FieldLocation::Struct {
+                    idx: info.llvm_field_index(idx),
+                }
             };
             (
                 format!("%struct.{automaton}"),
@@ -1217,6 +1357,12 @@ impl<'a> Emitter<'a> {
             // Float casts and pointer-int casts are deferred —
             // the firmware tier doesn't need either yet.
             ExprKind::Cast { value, ty } => self.emit_cast_expr(value, ty),
+            // Slice 9: `Auto@state` — read the current state tag.
+            // Lowers to GEP+load of LLVM index 0 of the state
+            // struct (multi-state automatons reserve index 0 for
+            // the i32 tag). Monoid automatons reject this as
+            // `NotYetImplemented` since they have no state tag.
+            ExprKind::StateRead(name) => self.emit_state_read(name),
             // Slice 8: Decision #17 / #19 unsafe primitives
             // (expression forms). Each lowers to a single LLVM
             // op against a raw pointer value, with no implicit
@@ -1311,7 +1457,12 @@ impl<'a> Emitter<'a> {
                     absolute_address: info.base_address + offset.unwrap_or(0),
                 }
             } else {
-                FieldLocation::Struct { idx }
+                // Slice 9: shift user-field index by the state-tag
+                // slot for multi-state automatons (LLVM idx 0 holds
+                // the i32 tag; user fields start at idx 1).
+                FieldLocation::Struct {
+                    idx: info.llvm_field_index(idx),
+                }
             };
             (ir_ty, loc, info.is_register_block)
         };
@@ -1687,6 +1838,55 @@ impl<'a> Emitter<'a> {
         )
         .ok();
         Ok(result)
+    }
+
+    /// Slice 9: lower `Auto@state` to a load of the state-tag
+    /// field. Multi-state automatons reserve LLVM struct index 0
+    /// for an `i32` tag; this emits the canonical
+    /// `getelementptr` + `load i32` pair. Monoid automatons (no
+    /// `#states` clause) and register-block automatons surface
+    /// `NotYetImplemented` since neither has a tag field.
+    ///
+    /// ```text
+    /// %tag_ptr = getelementptr %struct.<Auto>, %struct.<Auto>* @<Auto>.state, i32 0, i32 0
+    /// %tag     = load i32, i32* %tag_ptr
+    /// ```
+    fn emit_state_read(&mut self, automaton: &str) -> Result<String, CodegenError> {
+        let info = self.automatons.get(automaton).ok_or_else(|| {
+            CodegenError::UnresolvedName {
+                name: automaton.to_owned(),
+            }
+        })?;
+        if info.is_register_block {
+            // A register-block multi-state combo would need a
+            // user-specified MMIO offset for the tag; the spec
+            // doesn't define this yet. Defer the question to a
+            // future slice if a real use-case appears.
+            return Err(CodegenError::NotYetImplemented {
+                what: "Auto@state on a register-block automaton",
+            });
+        }
+        if !info.is_multi_state() {
+            // Monoid automaton — no state tag exists. The resolver
+            // accepts `Auto@state` for any automaton; codegen is
+            // the layer that knows there's nothing to read.
+            return Err(CodegenError::NotYetImplemented {
+                what: "Auto@state on a monoid automaton (no `#states` clause)",
+            });
+        }
+        let tag_ptr = self.fresh_value();
+        writeln!(
+            &mut self.out,
+            "  {tag_ptr} = getelementptr %struct.{automaton}, %struct.{automaton}* @{automaton}.state, i32 0, i32 0",
+        )
+        .ok();
+        let tag_val = self.fresh_value();
+        writeln!(
+            &mut self.out,
+            "  {tag_val} = load i32, i32* {tag_ptr}",
+        )
+        .ok();
+        Ok(tag_val)
     }
 
     /// Slice 3: lower an automaton field read. The emitted IR is:
@@ -4294,6 +4494,318 @@ mod tests {
                 "wrong signedness for {p:?}"
             );
         }
+    }
+
+    // ─── Slice 9: multi-state automatons (Decision #5 categorical) ───────
+
+    #[test]
+    fn s9_monoid_struct_unchanged() {
+        // Sanity: monoid automatons (no `#states` clause) keep their
+        // slice-3 struct shape — `{ <user fields> }` with no tag
+        // prepended.
+        let src = "#automaton C { v: u32; }\n";
+        let ir = lower_str(src).expect("lower monoid");
+        assert!(
+            ir.contains("%struct.C = type { i32 }"),
+            "expected single-field struct; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s9_multi_state_struct_prepends_i32_tag() {
+        // Multi-state automaton's struct has `i32` (the tag) at
+        // index 0, then the user fields.
+        let src = "\
+            #automaton Counter {\n  \
+              #states: [Idle, Counting, Done];\n  \
+              count: u32;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower multi-state");
+        assert!(
+            ir.contains("%struct.Counter = type { i32, i32 }"),
+            "expected {{ i32, i32 }} (tag + count); got:\n{ir}"
+        );
+        // Initial state is the first listed; tag 0 = `Idle`. The
+        // global stays `zeroinitializer` because `Idle` is tag 0.
+        assert!(
+            ir.contains("@Counter.state = global %struct.Counter zeroinitializer"),
+            "expected zeroinitializer global; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s9_state_read_emits_gep_load_at_index_0() {
+        // `Counter@state` lowers to a GEP+load at LLVM struct
+        // index 0 with i32 element type.
+        let src = "\
+            #automaton Counter {\n  \
+              #states: [Idle, Active];\n  \
+              count: u32;\n\
+            }\n\
+            #effect read() -> u32 #mutates: [Counter] {\n  \
+              let s: u32 = Counter@state;\n  \
+              return s;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower @state read");
+        assert!(
+            ir.contains("getelementptr %struct.Counter, %struct.Counter* @Counter.state, i32 0, i32 0"),
+            "expected GEP at idx 0 (state tag); got:\n{ir}"
+        );
+        assert!(
+            ir.contains("load i32, i32*"),
+            "expected load i32 of tag; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s9_user_field_index_shifts_for_multi_state() {
+        // The user's `count: u32` is the FIRST user field but lives
+        // at LLVM struct index 1 because the tag occupies index 0.
+        let src = "\
+            #automaton Counter {\n  \
+              #states: [Idle, Active];\n  \
+              count: u32;\n\
+            }\n\
+            #effect bump() #mutates: [Counter] {\n  \
+              Counter.count += 1u32;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower bump");
+        // Read of count goes through idx 1, NOT idx 0.
+        assert!(
+            ir.contains("getelementptr %struct.Counter, %struct.Counter* @Counter.state, i32 0, i32 1"),
+            "expected GEP at idx 1 (user field after tag); got:\n{ir}"
+        );
+        // Crucially, NO GEP at idx 0 should appear for a field op
+        // (that would be the tag, not `count`).
+        let count_at_0 = ir.matches("@Counter.state, i32 0, i32 0").count();
+        // The tag GEP would only appear if there's a state-read or
+        // a transition tag write; this effect has neither.
+        assert_eq!(
+            count_at_0, 0,
+            "did not expect tag GEP for field-only effect; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s9_transition_with_destination_writes_tag_before_ret() {
+        // `#transition start -> Counting { ... }` — the destination
+        // tag (`Counting` = tag 1) is written via a store before
+        // the `ret void`.
+        let src = "\
+            #automaton Counter {\n  \
+              #states: [Idle, Counting];\n  \
+              count: u32;\n  \
+              #transition start -> Counting { Counter.count = 0u32; }\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower transition with dest");
+        // Tag pointer GEP at idx 0:
+        assert!(
+            ir.contains("getelementptr %struct.Counter, %struct.Counter* @Counter.state, i32 0, i32 0"),
+            "expected tag GEP at idx 0; got:\n{ir}"
+        );
+        // Tag store i32 1 (Counting):
+        assert!(
+            ir.contains("store i32 1, i32*"),
+            "expected store of tag 1 (Counting); got:\n{ir}"
+        );
+        // Tag write must precede ret void:
+        let tag_pos = ir.find("store i32 1, i32*").expect("tag store missing");
+        let ret_pos = ir.find("ret void").expect("ret void missing");
+        assert!(
+            tag_pos < ret_pos,
+            "tag write must come before ret; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s9_transition_without_destination_emits_no_tag_write() {
+        // `#transition tick { ... }` — no `-> Dest`, so no tag
+        // write should be emitted (state stays the same).
+        let src = "\
+            #automaton Counter {\n  \
+              #states: [Idle, Counting];\n  \
+              count: u32;\n  \
+              #transition tick { Counter.count += 1u32; }\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower tickless transition");
+        // We expect a GEP at idx 1 (count) — but NOT a store at idx 0
+        // (tag). Verify by checking that no tag store happens inside
+        // the @Counter_tick body.
+        // Easy heuristic: no `store i32 N, i32*` where N matches a
+        // tag value (0 or 1) AND the surrounding op is the tag GEP.
+        // A simpler check: the only `store` should be for `count`.
+        // Tag values are 0 (Idle) and 1 (Counting). The transition
+        // body's `+= 1u32` produces `store i32 ..., i32* %tag.0`
+        // for the count, so we check for an absence of GEP at idx 0
+        // inside the transition.
+        // Pull out the @Counter_tick body for inspection:
+        let body_start = ir
+            .find("define void @Counter_tick()")
+            .expect("Counter_tick fn missing");
+        let body_end = ir[body_start..]
+            .find("\n}\n")
+            .map(|p| body_start + p)
+            .unwrap_or(ir.len());
+        let body = &ir[body_start..body_end];
+        assert!(
+            !body.contains("@Counter.state, i32 0, i32 0"),
+            "tickless transition must not emit tag GEP; got body:\n{body}"
+        );
+    }
+
+    #[test]
+    fn s9_transition_destination_uses_correct_tag_for_third_state() {
+        // `#transition finish -> Done` on `[Idle, Counting, Done]`
+        // — `Done` is the third state, tag 2.
+        let src = "\
+            #automaton Counter {\n  \
+              #states: [Idle, Counting, Done];\n  \
+              count: u32;\n  \
+              #transition finish -> Done { return; }\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower 3-state transition");
+        assert!(
+            ir.contains("store i32 2, i32*"),
+            "expected store of tag 2 (Done = 3rd state); got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s9_state_read_on_monoid_returns_e0810() {
+        // `Auto@state` on a monoid (no `#states`) is meaningless —
+        // we surface it as NotYetImplemented.
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #effect r() -> u32 #mutates: [C] { return C@state; }\n\
+        ";
+        let errors = lower_str(src).expect_err("expected E0810");
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            CodegenError::NotYetImplemented { what }
+                if *what == "Auto@state on a monoid automaton (no `#states` clause)"
+        ));
+        assert!(
+            saw,
+            "expected NotYetImplemented(monoid @state); got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn s9_state_read_on_register_block_returns_e0810() {
+        // `Auto@state` on a register-block automaton has no defined
+        // semantics yet (the tag has no MMIO offset); deferred.
+        let src = "\
+            #automaton Mmio {\n  \
+              #address: 0x4000_0000;\n  \
+              #states: [Off, On];\n  \
+              ctl: u32 #offset: 0x00;\n\
+            }\n\
+            #effect r() -> u32 #mutates: [Mmio] { return Mmio@state; }\n\
+        ";
+        let errors = lower_str(src).expect_err("expected E0810");
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            CodegenError::NotYetImplemented { what }
+                if *what == "Auto@state on a register-block automaton"
+        ));
+        assert!(
+            saw,
+            "expected NotYetImplemented(register-block @state); got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn s9_full_three_state_program_lowers_cleanly() {
+        // End-to-end smoke: 3 states, 2 transitions (one with
+        // destination, one without), one state-read.
+        let src = "\
+            #automaton Counter {\n  \
+              #states: [Idle, Counting, Done];\n  \
+              count: u32;\n  \
+              #transition start -> Counting { Counter.count = 0u32; }\n  \
+              #transition finish -> Done { return; }\n\
+            }\n\
+            #effect bump() #mutates: [Counter] { Counter.count += 1u32; }\n\
+            #effect peek() -> u32 #mutates: [Counter] { return Counter@state; }\n\
+        ";
+        let ir = lower_str(src).expect("lower full 3-state program");
+        for needle in [
+            "%struct.Counter = type { i32, i32 }",
+            "@Counter.state = global %struct.Counter zeroinitializer",
+            "define void @Counter_start()",
+            "define void @Counter_finish()",
+            "store i32 1, i32*", // start -> Counting
+            "store i32 2, i32*", // finish -> Done
+            "define void @bump()",
+            "define i32 @peek()",
+        ] {
+            assert!(
+                ir.contains(needle),
+                "missing `{needle}` in IR; got:\n{ir}"
+            );
+        }
+    }
+
+    #[test]
+    fn s9_destination_tag_write_combines_with_release_fence() {
+        // Decision #22 + slice 9 interaction: a transition with
+        // both `-> Dest` and `$ [Release]` should emit the tag
+        // write FIRST, then the release fence, then the ret.
+        let src = "\
+            #automaton C {\n  \
+              #states: [A, B];\n  \
+              v: u32;\n  \
+              #transition flip -> B $ [Release] { return; }\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower transition with release");
+        let tag_pos = ir.find("store i32 1, i32*").expect("tag store missing");
+        let fence_pos = ir.find("fence release").expect("release fence missing");
+        let ret_pos = ir.find("ret void").expect("ret missing");
+        assert!(
+            tag_pos < fence_pos && fence_pos < ret_pos,
+            "expected order: tag write < fence < ret; got positions {tag_pos} / {fence_pos} / {ret_pos} in:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s9_helper_llvm_field_index_monoid() {
+        // Direct unit test on the helper. Monoid: idx 0 -> 0.
+        let info = AutomatonInfo {
+            name: "M".to_owned(),
+            fields: vec![],
+            is_register_block: false,
+            base_address: 0,
+            state_tags: vec![],
+        };
+        assert_eq!(info.llvm_field_index(0), 0);
+        assert_eq!(info.llvm_field_index(3), 3);
+        assert!(!info.is_multi_state());
+    }
+
+    #[test]
+    fn s9_helper_llvm_field_index_multi_state() {
+        // Multi-state: idx 0 -> 1, idx 3 -> 4 (the i32 tag occupies
+        // LLVM idx 0).
+        let info = AutomatonInfo {
+            name: "C".to_owned(),
+            fields: vec![],
+            is_register_block: false,
+            base_address: 0,
+            state_tags: vec![("A".to_owned(), 0), ("B".to_owned(), 1)],
+        };
+        assert!(info.is_multi_state());
+        assert_eq!(info.llvm_field_index(0), 1);
+        assert_eq!(info.llvm_field_index(3), 4);
+        assert_eq!(info.state_tag("A"), Some(0));
+        assert_eq!(info.state_tag("B"), Some(1));
+        assert_eq!(info.state_tag("C"), None);
     }
 
     // ─── Decision #22 codegen: memory-ordering fences ────────────────────
