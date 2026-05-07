@@ -781,6 +781,20 @@ impl<'a> Emitter<'a> {
                     self.errors.push(e);
                 }
             }
+            // Slice 8: Decision #17 unsafe-store primitives. The
+            // statement form discards the result (stores don't
+            // produce values); both lower to a single LLVM `store`
+            // (volatile when the source variant says so).
+            StmtKind::UncheckedStore { ty, ptr, value } => {
+                if let Err(e) = self.emit_unchecked_store(ty, ptr, value, false) {
+                    self.errors.push(e);
+                }
+            }
+            StmtKind::VolatileStore { ty, ptr, value } => {
+                if let Err(e) = self.emit_unchecked_store(ty, ptr, value, true) {
+                    self.errors.push(e);
+                }
+            }
             other => {
                 self.errors.push(CodegenError::NotYetImplemented {
                     what: stmt_kind_name(other),
@@ -1203,6 +1217,20 @@ impl<'a> Emitter<'a> {
             // Float casts and pointer-int casts are deferred —
             // the firmware tier doesn't need either yet.
             ExprKind::Cast { value, ty } => self.emit_cast_expr(value, ty),
+            // Slice 8: Decision #17 / #19 unsafe primitives
+            // (expression forms). Each lowers to a single LLVM
+            // op against a raw pointer value, with no implicit
+            // checks — the caller is responsible for safety per
+            // the spec's audit-log obligation.
+            ExprKind::UncheckedLoad { ty, ptr } => self.emit_unchecked_load(ty, ptr, false),
+            ExprKind::VolatileLoad { ty, ptr } => self.emit_unchecked_load(ty, ptr, true),
+            ExprKind::UncheckedCast {
+                from_ty,
+                to_ty,
+                value,
+                ..
+            } => self.emit_unchecked_cast(from_ty, to_ty, value),
+            ExprKind::UncheckedOffset { ty, ptr, n } => self.emit_unchecked_offset(ty, ptr, n),
             other => Err(CodegenError::NotYetImplemented {
                 what: expr_kind_name(other),
             }),
@@ -1509,6 +1537,156 @@ impl<'a> Emitter<'a> {
         Err(CodegenError::NotYetImplemented {
             what: "non-integer cast (float / pointer / aggregate)",
         })
+    }
+
+    /// Slice 8: lower `#unchecked_load<T>(ptr)` (and the volatile
+    /// sibling). Both lower to a single LLVM `load` against the raw
+    /// pointer SSA value. The pointer expression's IR type is
+    /// expected to be `T*`; we emit the load with element type `T`.
+    ///
+    /// ```text
+    /// %v = load <T>, <T>* <ptr>          ; #unchecked_load
+    /// %v = load volatile <T>, <T>* <ptr> ; #volatile_load
+    /// ```
+    fn emit_unchecked_load(
+        &mut self,
+        ty: &TypeExpr,
+        ptr: &Expr,
+        is_volatile: bool,
+    ) -> Result<String, CodegenError> {
+        let elem_ir_ty = self.lower_type(ty)?;
+        let ptr_value = self.emit_expr(ptr)?;
+        let result = self.fresh_value();
+        let keyword = if is_volatile { "load volatile" } else { "load" };
+        writeln!(
+            &mut self.out,
+            "  {result} = {keyword} {elem_ir_ty}, {elem_ir_ty}* {ptr_value}",
+        )
+        .ok();
+        Ok(result)
+    }
+
+    /// Slice 8: lower `#unchecked_store<T>(ptr, value)` (and the
+    /// volatile sibling). Statement form — emits a single LLVM
+    /// `store`, no result. The element type comes from the
+    /// `TypeExpr` carried on the AST node, not from the value's
+    /// inferred type, so the user can be explicit about the storage
+    /// width independent of any implicit promotions.
+    fn emit_unchecked_store(
+        &mut self,
+        ty: &TypeExpr,
+        ptr: &Expr,
+        value: &Expr,
+        is_volatile: bool,
+    ) -> Result<(), CodegenError> {
+        let elem_ir_ty = self.lower_type(ty)?;
+        let ptr_value = self.emit_expr(ptr)?;
+        let val_ssa = self.emit_expr(value)?;
+        let keyword = if is_volatile { "store volatile" } else { "store" };
+        writeln!(
+            &mut self.out,
+            "  {keyword} {elem_ir_ty} {val_ssa}, {elem_ir_ty}* {ptr_value}",
+        )
+        .ok();
+        Ok(())
+    }
+
+    /// Slice 8: lower `#unchecked_cast<S, T>("reason", value)`.
+    ///
+    /// Picks the LLVM opcode by the source / dest IR-type shapes:
+    ///   - same IR type           → no-op (return the value as-is)
+    ///   - both integer types     → reuse the slice-7 trunc/sext/zext
+    ///                              dispatch
+    ///   - source pointer + dest int  → `ptrtoint`
+    ///   - source int + dest pointer  → `inttoptr`
+    ///   - same bit-width otherwise   → `bitcast`
+    ///
+    /// The mandatory reason string is preserved in the AST and is
+    /// already accessible via `cliffordc audit --list-unsafe`; we
+    /// don't embed it in the IR (it would be a comment, which LLVM
+    /// would discard during parsing).
+    fn emit_unchecked_cast(
+        &mut self,
+        from_ty: &TypeExpr,
+        to_ty: &TypeExpr,
+        value: &Expr,
+    ) -> Result<String, CodegenError> {
+        let src_ir_ty = self.lower_type(from_ty)?;
+        let dst_ir_ty = self.lower_type(to_ty)?;
+        let src_value = self.emit_expr(value)?;
+
+        if src_ir_ty == dst_ir_ty {
+            return Ok(src_value);
+        }
+
+        // Pure integer ↔ integer: reuse the slice-7 logic. Source
+        // signedness comes from the user-written `from_ty` since the
+        // cast is explicit at this level.
+        let src_bits = int_bits(&src_ir_ty);
+        let dst_bits = int_bits(&dst_ir_ty);
+        if let (Some(s), Some(d)) = (src_bits, dst_bits) {
+            let opcode = if d < s {
+                "trunc"
+            } else if type_expr_is_signed_int(from_ty) {
+                "sext"
+            } else {
+                "zext"
+            };
+            let result = self.fresh_value();
+            writeln!(
+                &mut self.out,
+                "  {result} = {opcode} {src_ir_ty} {src_value} to {dst_ir_ty}",
+            )
+            .ok();
+            return Ok(result);
+        }
+
+        // Pointer ↔ integer dispatches.
+        let src_is_ptr = src_ir_ty.ends_with('*');
+        let dst_is_ptr = dst_ir_ty.ends_with('*');
+        let opcode = match (src_is_ptr, dst_is_ptr) {
+            (true, false) if dst_bits.is_some() => "ptrtoint",
+            (false, true) if src_bits.is_some() => "inttoptr",
+            // Same-shape (both pointers, both aggregates, etc.) —
+            // fall back to bitcast. LLVM accepts bitcast between
+            // any two same-bit-width values.
+            _ => "bitcast",
+        };
+        let result = self.fresh_value();
+        writeln!(
+            &mut self.out,
+            "  {result} = {opcode} {src_ir_ty} {src_value} to {dst_ir_ty}",
+        )
+        .ok();
+        Ok(result)
+    }
+
+    /// Slice 8: lower `#unchecked_offset<T>(ptr, n)` per Decision
+    /// #19. Emits a single `getelementptr` against the raw pointer
+    /// with element type `T`. The signed `n` is the element-count
+    /// offset; LLVM's GEP semantics treat it as a signed integer
+    /// extending to pointer width.
+    ///
+    /// ```text
+    /// %p2 = getelementptr <T>, <T>* <ptr>, <n_ir_ty> <n>
+    /// ```
+    fn emit_unchecked_offset(
+        &mut self,
+        ty: &TypeExpr,
+        ptr: &Expr,
+        n: &Expr,
+    ) -> Result<String, CodegenError> {
+        let elem_ir_ty = self.lower_type(ty)?;
+        let ptr_value = self.emit_expr(ptr)?;
+        let n_ir_ty = self.expr_ir_type(n);
+        let n_value = self.emit_expr(n)?;
+        let result = self.fresh_value();
+        writeln!(
+            &mut self.out,
+            "  {result} = getelementptr {elem_ir_ty}, {elem_ir_ty}* {ptr_value}, {n_ir_ty} {n_value}",
+        )
+        .ok();
+        Ok(result)
     }
 
     /// Slice 3: lower an automaton field read. The emitted IR is:
@@ -2116,6 +2294,22 @@ fn array_element_ir_type(ir_ty: &str) -> Option<String> {
     // types containing spaces (e.g. `[4 x [4 x i8]]`) survive intact.
     let (_n, t) = body.split_once(" x ")?;
     Some(t.trim().to_owned())
+}
+
+/// Slice 8: True if a syntactic `TypeExpr` names a signed integer
+/// primitive. Used by `#unchecked_cast` to pick `sext` vs `zext`
+/// when widening from a user-written source type.
+fn type_expr_is_signed_int(t: &TypeExpr) -> bool {
+    matches!(
+        &t.kind,
+        TypeKind::Primitive(
+            PrimitiveType::I8
+                | PrimitiveType::I16
+                | PrimitiveType::I32
+                | PrimitiveType::I64
+                | PrimitiveType::Isize
+        )
+    )
 }
 
 /// Slice 7: bit width for an integer LLVM IR type-text.
@@ -3928,6 +4122,178 @@ mod tests {
             ir.contains(" to i8"),
             "expected narrowing to i8; got:\n{ir}"
         );
+    }
+
+    // ─── Slice 8: Decision #17 / #19 unsafe primitives ───────────────────
+
+    #[test]
+    fn s8_unchecked_load_emits_plain_load() {
+        // `#unchecked_load<u32>(p)` where `p: &u32` — load i32 from
+        // the i32* parameter. Plain (non-volatile).
+        let src = "@fn r(p: &u32) -> u32 { return #unchecked_load<u32>(p); }";
+        let ir = lower_str(src).expect("lower unchecked load");
+        assert!(
+            ir.contains("load i32, i32* %p"),
+            "expected plain load i32 from %p; got:\n{ir}"
+        );
+        assert!(
+            !ir.contains("load volatile"),
+            "non-volatile load should not be volatile; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s8_volatile_load_emits_volatile_load() {
+        let src = "@fn r(p: &u32) -> u32 { return #volatile_load<u32>(p); }";
+        let ir = lower_str(src).expect("lower volatile load");
+        assert!(
+            ir.contains("load volatile i32, i32* %p"),
+            "expected volatile load i32; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s8_unchecked_store_emits_plain_store() {
+        // `#unchecked_store<u32>(p, 7u32);` — write a constant to
+        // the pointer.
+        let src = "@fn w(p: &u32) { #unchecked_store<u32>(p, 7u32); return; }";
+        let ir = lower_str(src).expect("lower unchecked store");
+        assert!(
+            ir.contains("store i32 7, i32* %p"),
+            "expected plain store i32 7 to %p; got:\n{ir}"
+        );
+        assert!(
+            !ir.contains("store volatile"),
+            "non-volatile store should not be volatile; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s8_volatile_store_emits_volatile_store() {
+        let src = "@fn w(p: &u32) { #volatile_store<u32>(p, 7u32); return; }";
+        let ir = lower_str(src).expect("lower volatile store");
+        assert!(
+            ir.contains("store volatile i32 7, i32* %p"),
+            "expected volatile store i32 7; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s8_unchecked_cast_int_widen_unsigned_emits_zext() {
+        let src = "@fn c() -> u32 { return #unchecked_cast<u8, u32>(\"widen for index\", 5u8); }";
+        let ir = lower_str(src).expect("lower unchecked cast widen");
+        assert!(
+            ir.contains("zext i8 5 to i32"),
+            "expected zext for unsigned widen; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s8_unchecked_cast_int_widen_signed_emits_sext() {
+        let src = "@fn c() -> i32 {\n  \
+            let v: i8 = -1i8;\n  \
+            return #unchecked_cast<i8, i32>(\"sign extend\", v);\n\
+        }";
+        let ir = lower_str(src).expect("lower unchecked cast widen signed");
+        assert!(
+            ir.contains("sext i8"),
+            "expected sext for signed widen; got:\n{ir}"
+        );
+        assert!(ir.contains(" to i32"), "expected widen to i32; got:\n{ir}");
+    }
+
+    #[test]
+    fn s8_unchecked_cast_int_narrowing_emits_trunc() {
+        let src = "@fn c() -> u8 { return #unchecked_cast<u32, u8>(\"narrow\", 5u32); }";
+        let ir = lower_str(src).expect("lower unchecked cast narrow");
+        assert!(
+            ir.contains("trunc i32 5 to i8"),
+            "expected trunc; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s8_unchecked_cast_same_type_is_noop() {
+        let src = "@fn c() -> u32 { return #unchecked_cast<u32, u32>(\"identity\", 5u32); }";
+        let ir = lower_str(src).expect("lower unchecked cast same");
+        assert!(
+            !ir.contains("zext") && !ir.contains("sext") && !ir.contains("trunc"),
+            "same-type unchecked cast should be no-op; got:\n{ir}"
+        );
+        assert!(ir.contains("ret i32 5"), "expected ret 5; got:\n{ir}");
+    }
+
+    #[test]
+    fn s8_unchecked_cast_pointer_to_int_emits_ptrtoint() {
+        // `&u32 -> u64` via #unchecked_cast: ptrtoint i32* to i64.
+        let src = "@fn c(p: &u32) -> u64 { return #unchecked_cast<&u32, u64>(\"addr capture\", p); }";
+        let ir = lower_str(src).expect("lower ptrtoint");
+        assert!(
+            ir.contains("ptrtoint i32* %p to i64"),
+            "expected ptrtoint i32* -> i64; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s8_unchecked_offset_emits_getelementptr() {
+        // `#unchecked_offset<u32>(p, 4i32)` — gep with element type
+        // u32 at signed offset 4.
+        let src = "@fn o(p: &u32) -> &u32 {\n  \
+            let q: &u32 = #unchecked_offset<u32>(p, 4i32);\n  \
+            return q;\n\
+        }";
+        let ir = lower_str(src).expect("lower unchecked offset");
+        assert!(
+            ir.contains("getelementptr i32, i32* %p, i32 4"),
+            "expected getelementptr i32 i32* %p i32 4; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s8_unchecked_load_inside_binary_op() {
+        // Read the pointer, add a constant, return.
+        let src = "@fn x(p: &u32) -> u32 {\n  \
+            return #unchecked_load<u32>(p) + 1u32;\n\
+        }";
+        let ir = lower_str(src).expect("lower load+add");
+        assert!(
+            ir.contains("load i32, i32* %p"),
+            "expected load; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("add i32"),
+            "expected add using load result; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s8_type_expr_is_signed_int_table() {
+        use clifford_ast::{TypeExpr, TypeKind};
+        use clifford_lexer::Span;
+        let span = Span::new(0, 0);
+        let make = |p: PrimitiveType| TypeExpr {
+            kind: TypeKind::Primitive(p),
+            span,
+        };
+        for (p, expected) in [
+            (PrimitiveType::I8, true),
+            (PrimitiveType::I16, true),
+            (PrimitiveType::I32, true),
+            (PrimitiveType::I64, true),
+            (PrimitiveType::Isize, true),
+            (PrimitiveType::U8, false),
+            (PrimitiveType::U16, false),
+            (PrimitiveType::U32, false),
+            (PrimitiveType::U64, false),
+            (PrimitiveType::Usize, false),
+            (PrimitiveType::Bool, false),
+        ] {
+            assert_eq!(
+                type_expr_is_signed_int(&make(p)),
+                expected,
+                "wrong signedness for {p:?}"
+            );
+        }
     }
 
     // ─── Decision #22 codegen: memory-ordering fences ────────────────────
