@@ -7,6 +7,113 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Codegen slice 2: `Typing` integration + sign-aware ops + composite types + deref/negation (2026-05-07)
+
+Second codegen slice. Slice 1 lowered `@fn` bodies using syntactic
+type guesses (`infer_expr_ir_type`); slice 2 wires in the
+authoritative `Typing` from `clifford-types` and adds the unary,
+deref, signed-int, and composite-type pieces.
+
+**Public API change (breaking):**
+
+```rust
+// Before (slice 1):
+pub fn lower(program: &Program, module_name: &str) -> Result<String, Vec<CodegenError>>;
+
+// After (slice 2):
+pub fn lower(
+    program: &Program,
+    resolution: &Resolution,
+    typing: &Typing,
+    module_name: &str,
+) -> Result<String, Vec<CodegenError>>;
+```
+
+The CLI driver passes the upstream phase outputs through; tests in
+this crate use the standard
+`tokenize → parse → resolve → infer → lower` pipeline.
+
+**Implementation (`crates/codegen/src/lib.rs`):**
+
+- `Emitter` now holds `&Resolution` and `&Typing`; `LocalBinding`
+  struct (replacing the previous tuple) tracks `name` + SSA
+  `value` + recorded `ir_type` so path lookups know the right LLVM
+  type without re-walking typing per use.
+- New `expr_ir_type(&Expr) -> String` consults `Typing::lookup`
+  first; falls back to syntactic clues only when typing is silent.
+  Removes the syntactic-only `infer_expr_ir_type`.
+- New `expr_is_signed_int` for sign-aware op selection.
+- New `bind_via_identity` consolidates the `add 0,v` / `fadd 0.0,v`
+  binding pattern; falls back to value-passthrough for non-scalar
+  types.
+
+**Sign-aware integer ops:**
+
+- `i8` / `i16` / `i32` / `i64` / `isize` → `sdiv` / `srem`
+- `u8` / `u16` / `u32` / `u64` / `usize` → `udiv` / `urem`
+- Driven by the operand's recorded `Type` (signed vs unsigned).
+
+**Unary expressions (new in slice 2):**
+
+- `-x` (integer) → `sub T 0, %x`
+- `-x` (float) → `fneg T %x`
+- `!x` (bool) → `xor i1 %x, true`
+- `~x` (integer) → `xor T %x, -1`
+- `*p` (deref) → `load T, T* %p` — pointee type read from the
+  operand's recorded `Type::Ref { inner, … }`
+
+**Composite types (new in slice 2):**
+
+- `&T` / `&mut T` → `T*` (mutability-as-attribute is a future slice
+  — IR-type form is `T*` for both)
+- `[T; N]` → `[N x T]`
+- `[T]` (slice) → `{T*, i64}` standard fat-pointer layout per §8.3
+- `(T1, T2, …)` (tuple) → LLVM struct `{T1, T2, …}`
+- `Range<T>` → `{T, T}` (lo, hi pair) — sigma-loop slice will
+  refine this
+- `Type::StringSlice` → `{i8*, i64}`
+- Nominals (aliases / ADTs) and `Unknown` lower as `i32`
+  best-effort; ADT lowering with tagged-union representation lands
+  in codegen slice 3.
+
+**`type_to_ir(&Type) -> String`** is a free function mirroring
+`Emitter::lower_type` but operating on the semantic `Type`. Used
+by `expr_ir_type` and the call-return type path.
+
+**Lookup helpers:**
+
+- `lookup_local(name)` — returns the SSA value-ref string
+- `lookup_local_ir_type(name)` — returns the recorded IR type
+
+**Tests (16 new slice-2 tests, codegen crate now 36 total, was 20):**
+
+- `i32` / `i64` div → `sdiv`; rem → `srem`
+- `u32` / `usize` div still uses `udiv` (regression guard)
+- `isize` → signed; `usize` → unsigned (the i64-as-pointer-sized
+  ambiguity resolved correctly)
+- Unary `-x` int / `!x` bool / `~x` int — each new IR shape
+- `&T` and `&mut T` signatures lower to `T*`
+- `[T; N]` signature → `[N x T]`
+- `(T1, T2)` signature → struct
+- `*p` deref → typed `load`
+- `let x: u8 = …` recorded IR type honored at path-position read
+  (slice 1 would have defaulted to i32; slice 2 picks i8)
+- Bool-returning call `call i1 @returns_bool()` (slice 1 always
+  picked i32 for call return types; slice 2 reads typing)
+
+The pre-slice-2 `unsupported_type_emits_e0810` test was retargeted
+from `&u32` (now supported) to `access<u32>` (still deferred to
+codegen slice 3+ for nominal-pointer provenance).
+
+Workspace remains green; clippy clean.
+
+The codegen surface now covers the full v0.1 *pure-`@fn`* program
+shape with primitives, refs, arrays, slices, tuples, all unary +
+binary ops over integers and bool, deref, and direct calls. The
+remaining v0.1 firmware piece is **§8.4 automaton/transition/effect
+lowering** (codegen slice 3 — the substantive piece for the QEMU
+integration milestone).
+
 ### Added — Codegen slice 1: text-form LLVM IR for @fn + primitives + arithmetic + calls (2026-05-07)
 
 First real lowering in `clifford-codegen`. The crate was a stub with
