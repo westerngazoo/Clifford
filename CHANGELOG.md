@@ -7,6 +7,153 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Codegen slice 5: indexed field operations (2026-05-08)
+
+Closes the slice-3 deferral on indexed-field assignment and adds
+the symmetric read side. Unblocks array-typed automaton fields —
+UART FIFOs, lookup tables, ring buffers — for both struct-backed
+and register-block automatons.
+
+**The headline shape — array-typed automaton fields now lower:**
+
+```clifford
+#automaton Counter { buf: [u8; 64]; }
+
+#effect peek() #mutates: [Counter] {
+  let _x: u8 = Counter.buf[3u32];
+}
+
+#effect poke() #mutates: [Counter] {
+  #mutate Counter { buf[3u32] = 5u8 };
+}
+```
+
+→
+
+```llvm
+; read
+%v1 = getelementptr %struct.Counter, %struct.Counter* @Counter.state, i32 0, i32 0
+%v2 = getelementptr [64 x i8], [64 x i8]* %v1, i32 0, i32 3
+%v3 = load i8, i8* %v2
+
+; write
+%v4 = getelementptr %struct.Counter, %struct.Counter* @Counter.state, i32 0, i32 0
+%v5 = getelementptr [64 x i8], [64 x i8]* %v4, i32 0, i32 3
+store i8 5, i8* %v5
+```
+
+For register-block automatons (Decision #6) the struct-field GEP is
+replaced by an `inttoptr` literal at the absolute MMIO address, and
+the load / store becomes volatile:
+
+```clifford
+#automaton Uart {
+  #address: 0x4000_4000;
+  fifo: [u8; 16] #offset: 0x20;
+}
+
+#effect tx() #mutates: [Uart] {
+  #mutate Uart { fifo[2u32] = 65u8 };  // 'A'
+}
+```
+
+→
+
+```llvm
+%v1 = getelementptr [16 x i8], [16 x i8]* inttoptr (i64 1073758240 to [16 x i8]*), i32 0, i32 2
+store volatile i8 65, i8* %v1
+```
+
+(`0x4000_4000 + 0x20 = 0x4000_4020 = 1073758240`.)
+
+**Implementation (`crates/codegen/src/lib.rs`):**
+
+- New `Emitter::emit_index_expr(obj, index)` lowers `Auto.field[i]`
+  / `Self.field[i]` reads. Today it only accepts the canonical
+  firmware shape — `Index { obj: FieldAccess(Path([Auto|Self]),
+  field), index }`. Indexing on local arrays / slices / tuples
+  surfaces a `NotYetImplemented` and waits for the alloca-based
+  borrow machinery (separate slice).
+- New `Emitter::emit_indexed_field_store(automaton, loc,
+  field_ir_ty, index_expr, value, is_register_block)` is the write
+  counterpart. Mirrors `emit_index_expr` but stores instead of
+  loads, and walks the index expression up front to satisfy the
+  borrow checker.
+- `emit_mutate` now dispatches on `fa.index.is_some()`: indexed
+  assigns route through `emit_indexed_field_store`, plain assigns
+  keep the slice-3 / slice-4 `emit_field_store` path. The
+  slice-3 deferred `NotYetImplemented` for indexed assigns is
+  removed.
+- New `array_element_ir_type(ir_ty)` free helper parses
+  `[N x T]` → `T`. Splits on the first ` x ` only so nested arrays
+  (`[4 x [4 x i8]]` → `[4 x i8]`) survive. Returns `None` for
+  non-array IR types so the caller can surface a structured
+  `NotYetImplemented`.
+
+**Both stages use a 2-level GEP** (struct-field pointer → array-element
+pointer) for struct-backed automatons. For register-block
+automatons the first GEP is replaced by `inttoptr (i64 <abs> to
+[N x T]*)`; the array GEP and the volatile load / store still
+apply, so the dispatch shape stays uniform across the two backends.
+
+**Index-expression typing:** the index expression goes through
+`expr_ir_type` so the GEP's second index carries the LLVM type the
+program supplied (e.g. `i32` for `3u32`). LLVM's GEP semantics
+treat the array offset as signed extending to pointer width, so
+both `i32` and `i64` indices work; we don't truncate or extend in
+codegen.
+
+**Self-resolution in transitions:** indexed field operations on
+`Self` (e.g. `#mutate Self { buf[0u32] = 1u8 };` inside a
+`#transition`) resolve the owner from `enclosing_owner`, the same
+way slice-3 / slice-4 plain field accesses do. A test
+(`s5_indexed_field_in_transition_uses_self_owner`) pins this.
+
+**Deferred to later slices:**
+
+- Indexing on local arrays / slices / tuples (requires the
+  alloca-pre-pass for `&x` borrow expressions).
+- Multi-dimensional indexing (`Auto.matrix[i][j]`) — today the
+  outer index returns an element-type value; nested indexing on
+  that value falls back to the `NotYetImplemented` for
+  non-field-access receivers.
+- Range / slice indexing (`buf[1..4]`) — not in v0.1 scope.
+- Bounds-check insertion — Decision #18 says register-block
+  fields are unchecked and the size is part of the spec; ordinary
+  fields will gain checks in a later slice.
+
+**Tests added (`crates/codegen/src/lib.rs::tests`):**
+
+- `s5_array_element_ir_type_extracts_element` — `[64 x i8]` → `i8`,
+  `[16 x i32]` → `i32`.
+- `s5_array_element_ir_type_handles_nested_arrays` — `[4 x [4 x i8]]`
+  → `[4 x i8]` (verifies the `split_once` boundary).
+- `s5_array_element_ir_type_returns_none_for_non_array` — primitives,
+  refs, structs, empty string all return `None`.
+- `s5_indexed_read_on_struct_field_emits_two_level_gep_and_load` —
+  full read pipeline on a non-register-block automaton; checks
+  the absence of `load volatile`.
+- `s5_indexed_read_on_register_block_emits_inttoptr_gep_and_volatile_load`
+  — read pipeline on a register-block automaton with a non-zero
+  field offset; checks `inttoptr (i64 1073758240 to [16 x i8]*)`,
+  the array GEP, and `load volatile i8`.
+- `s5_indexed_write_in_mutate_block_emits_two_level_gep_and_store`
+  — write pipeline on a non-register-block automaton; checks the
+  absence of `store volatile`.
+- `s5_indexed_write_on_register_block_emits_volatile_store` — write
+  pipeline on a register-block automaton; checks `store volatile
+  i8 65`.
+- `s5_indexed_field_in_transition_uses_self_owner` — verifies
+  `Self.field[i]` inside a `#transition` body resolves the owner
+  from `enclosing_owner` and emits `@Counter_init` with the right
+  GEP / store sequence.
+- `s5_indexed_write_alongside_plain_writes_in_same_mutate_block` —
+  mixed indexed + plain assigns in one `#mutate` block; verifies
+  the `fa.index.is_some()` dispatch routes each correctly.
+
+Total codegen tests: **85** (76 pre-slice-5 + 9 new). All green;
+clippy clean across the workspace.
+
 ### Added — Codegen slice 4: register-block volatile MMIO + interrupt section attribute (2026-05-07)
 
 Closes the v0.1 firmware codegen story. Slice 3 lowered non-

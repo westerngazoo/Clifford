@@ -835,14 +835,79 @@ impl<'a> Emitter<'a> {
         };
 
         for (fa, (loc, ir_ty)) in assigns.iter().zip(field_data.iter()) {
-            if fa.index.is_some() {
-                return Err(CodegenError::NotYetImplemented {
-                    what: "indexed field assignment (#mutate Auto { field[i] = … })",
-                });
+            if let Some(index_expr) = &fa.index {
+                // Slice 5: indexed field assignment. Lower the
+                // value first, then build the 2-level GEP (or
+                // inttoptr-then-GEP for register-block) and store.
+                let v = self.emit_expr(&fa.value)?;
+                self.emit_indexed_field_store(
+                    automaton,
+                    loc,
+                    ir_ty,
+                    index_expr,
+                    &v,
+                    is_register_block,
+                )?;
+            } else {
+                let v = self.emit_expr(&fa.value)?;
+                self.emit_field_store(automaton, &struct_name, loc, ir_ty, &v, is_register_block);
             }
-            let v = self.emit_expr(&fa.value)?;
-            self.emit_field_store(automaton, &struct_name, loc, ir_ty, &v, is_register_block);
         }
+        Ok(())
+    }
+
+    /// Slice 5: emit IR for `Auto.field[i] = value` inside a `#mutate`
+    /// block. Mirrors [`Self::emit_index_expr`] but writes instead of
+    /// reads, and walks the index expression up front (mutable borrow
+    /// reuse).
+    fn emit_indexed_field_store(
+        &mut self,
+        automaton: &str,
+        loc: &FieldLocation,
+        field_ir_ty: &str,
+        index_expr: &Expr,
+        value: &str,
+        is_register_block: bool,
+    ) -> Result<(), CodegenError> {
+        let element_ir_ty = array_element_ir_type(field_ir_ty).ok_or(
+            CodegenError::NotYetImplemented {
+                what: "indexed field assignment on non-array field",
+            },
+        )?;
+        let index_val = self.emit_expr(index_expr)?;
+        let index_ir_ty = self.expr_ir_type(index_expr);
+
+        // Stage 1: pointer to the array field itself.
+        let field_ptr = match loc {
+            FieldLocation::Struct { idx } => {
+                let p = self.fresh_value();
+                writeln!(
+                    &mut self.out,
+                    "  {p} = getelementptr %struct.{automaton}, %struct.{automaton}* @{automaton}.state, i32 0, i32 {idx}",
+                )
+                .ok();
+                p
+            }
+            FieldLocation::RegisterBlock { absolute_address } => {
+                format!("inttoptr (i64 {absolute_address} to {field_ir_ty}*)")
+            }
+        };
+
+        // Stage 2: pointer to the indexed element.
+        let elem_ptr = self.fresh_value();
+        writeln!(
+            &mut self.out,
+            "  {elem_ptr} = getelementptr {field_ir_ty}, {field_ir_ty}* {field_ptr}, i32 0, {index_ir_ty} {index_val}",
+        )
+        .ok();
+
+        // Stage 3: store.
+        let store_keyword = if is_register_block { "store volatile" } else { "store" };
+        writeln!(
+            &mut self.out,
+            "  {store_keyword} {element_ir_ty} {value}, {element_ir_ty}* {elem_ptr}",
+        )
+        .ok();
         Ok(())
     }
 
@@ -1106,10 +1171,145 @@ impl<'a> Emitter<'a> {
             // `Self.value` (`obj` is `Path([Self])` inside a
             // `#transition` body) resolves to the enclosing owner.
             ExprKind::FieldAccess { obj, field } => self.emit_field_access(obj, field),
+            // Slice 5: indexed read on an automaton-array field.
+            // `Counter.buf[3]` parses as
+            // `Index { obj: FieldAccess(Path([Counter]), "buf"), index: 3 }`.
+            // Lowers to a 2-level getelementptr (struct field → array
+            // element) plus a `load` of the element type.
+            ExprKind::Index { obj, index } => self.emit_index_expr(obj, index),
             other => Err(CodegenError::NotYetImplemented {
                 what: expr_kind_name(other),
             }),
         }
+    }
+
+    /// Slice 5: lower `obj[index]` for an automaton-array field.
+    ///
+    /// Today this handler supports only the canonical firmware shape
+    /// where `obj` is a `FieldAccess` on an automaton field whose
+    /// type is `[T; N]`. Indexing on local arrays / slices / tuples
+    /// requires the alloca-based borrow machinery (separate slice).
+    ///
+    /// The emitted IR is:
+    ///
+    /// ```text
+    /// %field = getelementptr %struct.<Auto>, %struct.<Auto>* @<Auto>.state, i32 0, i32 <field_idx>
+    /// %elem  = getelementptr [N x T], [N x T]* %field, i32 0, i32 <index>
+    /// %val   = load T, T* %elem
+    /// ```
+    ///
+    /// For register-block array fields, the first GEP is replaced by
+    /// `inttoptr (i64 <abs> to [N x T]*)` so the GEP-into-array
+    /// shape still applies, and the load is volatile.
+    fn emit_index_expr(&mut self, obj: &Expr, index: &Expr) -> Result<String, CodegenError> {
+        // Obj must be `FieldAccess { Path([Auto] | [Self]), field }`.
+        let (auto_name, field) = match &obj.kind {
+            ExprKind::FieldAccess { obj: inner_obj, field } => {
+                let auto_name = match &inner_obj.kind {
+                    ExprKind::Path(segs) if segs.len() == 1 => {
+                        if segs[0] == "Self" {
+                            self.enclosing_owner.clone().ok_or(
+                                CodegenError::NotYetImplemented {
+                                    what: "Self.field[i] outside a #transition body",
+                                },
+                            )?
+                        } else {
+                            segs[0].clone()
+                        }
+                    }
+                    _ => {
+                        return Err(CodegenError::NotYetImplemented {
+                            what: "Index where receiver isn't Auto.field / Self.field",
+                        });
+                    }
+                };
+                (auto_name, field.clone())
+            }
+            _ => {
+                return Err(CodegenError::NotYetImplemented {
+                    what: "Index where receiver isn't a field access (slice 5 supports Auto.field[i] only)",
+                });
+            }
+        };
+
+        // Resolve the field's location and IR type, then split the
+        // array IR type into `[N x T]` and `T`.
+        let (field_ir_ty, field_loc, is_register_block) = {
+            let info = self.automatons.get(&auto_name).ok_or_else(|| {
+                CodegenError::UnresolvedName { name: auto_name.clone() }
+            })?;
+            let (idx, ir_ty, offset) = info
+                .fields
+                .iter()
+                .enumerate()
+                .find_map(|(i, (n, t, off))| {
+                    if n == &field {
+                        Some((i, t.clone(), *off))
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| CodegenError::UnresolvedName {
+                    name: format!("{auto_name}.{field}"),
+                })?;
+            let loc = if info.is_register_block {
+                FieldLocation::RegisterBlock {
+                    absolute_address: info.base_address + offset.unwrap_or(0),
+                }
+            } else {
+                FieldLocation::Struct { idx }
+            };
+            (ir_ty, loc, info.is_register_block)
+        };
+
+        let element_ir_ty = array_element_ir_type(&field_ir_ty)
+            .ok_or(CodegenError::NotYetImplemented {
+                what: "indexed read on non-array field",
+            })?;
+
+        // Lower the index expression.
+        let index_val = self.emit_expr(index)?;
+        let index_ir_ty = self.expr_ir_type(index);
+
+        // Stage 1: pointer to the array field.
+        let field_ptr = match field_loc {
+            FieldLocation::Struct { idx } => {
+                let p = self.fresh_value();
+                writeln!(
+                    &mut self.out,
+                    "  {p} = getelementptr %struct.{auto_name}, %struct.{auto_name}* @{auto_name}.state, i32 0, i32 {idx}",
+                )
+                .ok();
+                p
+            }
+            FieldLocation::RegisterBlock { absolute_address } => {
+                // Skip the GEP for register-block fields — the
+                // `inttoptr` literal IS the field pointer.
+                format!(
+                    "inttoptr (i64 {absolute_address} to {field_ir_ty}*)"
+                )
+            }
+        };
+
+        // Stage 2: pointer to the indexed element. The array-GEP's
+        // first index is `0` (deref the pointer); second index is the
+        // element index (typed to match the supplied index).
+        let elem_ptr = self.fresh_value();
+        writeln!(
+            &mut self.out,
+            "  {elem_ptr} = getelementptr {field_ir_ty}, {field_ir_ty}* {field_ptr}, i32 0, {index_ir_ty} {index_val}",
+        )
+        .ok();
+
+        // Stage 3: load.
+        let val = self.fresh_value();
+        let load_keyword = if is_register_block { "load volatile" } else { "load" };
+        writeln!(
+            &mut self.out,
+            "  {val} = {load_keyword} {element_ir_ty}, {element_ir_ty}* {elem_ptr}",
+        )
+        .ok();
+        Ok(val)
     }
 
     /// Slice 3: lower an automaton field read. The emitted IR is:
@@ -1701,6 +1901,22 @@ fn compound_assign_opcode(op: AssignOp, _ir_ty: &str) -> &'static str {
         AssignOp::ShrEq => "lshr",
         AssignOp::Eq => "store", // unreachable — caller branches on Eq before calling
     }
+}
+
+/// Slice 5: parse `[N x T]` and return `T`. Used by indexed-field
+/// operations to know what type to load / store at the element
+/// pointer.
+///
+/// Returns `None` for non-array IR types (primitives, refs, structs,
+/// slices, etc.); the caller is expected to surface a
+/// `NotYetImplemented` for those cases.
+fn array_element_ir_type(ir_ty: &str) -> Option<String> {
+    let body = ir_ty.strip_prefix('[')?;
+    let body = body.strip_suffix(']')?;
+    // Body is `<N> x <T>`. Split on the FIRST ` x ` only, so element
+    // types containing spaces (e.g. `[4 x [4 x i8]]`) survive intact.
+    let (_n, t) = body.split_once(" x ")?;
+    Some(t.trim().to_owned())
 }
 
 /// True if the IR type-text names an integer LLVM type (`i1`, `i8`,
@@ -2919,6 +3135,210 @@ mod tests {
     fn s4_parse_address_literal_malformed_returns_none() {
         assert_eq!(parse_address_literal("0xZZ"), None);
         assert_eq!(parse_address_literal("not_a_number"), None);
+    }
+
+    // ─── Slice 5: indexed field read / write on automaton arrays ─────────
+
+    #[test]
+    fn s5_array_element_ir_type_extracts_element() {
+        // Plain primitive arrays.
+        assert_eq!(
+            array_element_ir_type("[64 x i8]").as_deref(),
+            Some("i8"),
+            "element of [64 x i8] should be i8"
+        );
+        assert_eq!(
+            array_element_ir_type("[16 x i32]").as_deref(),
+            Some("i32"),
+            "element of [16 x i32] should be i32"
+        );
+    }
+
+    #[test]
+    fn s5_array_element_ir_type_handles_nested_arrays() {
+        // Nested array element type contains spaces; the helper splits
+        // on the FIRST ` x ` only so the inner array survives intact.
+        assert_eq!(
+            array_element_ir_type("[4 x [4 x i8]]").as_deref(),
+            Some("[4 x i8]"),
+            "nested array element should preserve inner array"
+        );
+    }
+
+    #[test]
+    fn s5_array_element_ir_type_returns_none_for_non_array() {
+        assert_eq!(array_element_ir_type("i32"), None);
+        assert_eq!(array_element_ir_type("i8*"), None);
+        assert_eq!(array_element_ir_type("%struct.Counter"), None);
+        assert_eq!(array_element_ir_type(""), None);
+    }
+
+    #[test]
+    fn s5_indexed_read_on_struct_field_emits_two_level_gep_and_load() {
+        // `Counter.buf[3]` on a non-register-block automaton: GEP to
+        // the array field, GEP to the element, plain load.
+        let src = "\
+            #automaton Counter { buf: [u8; 64]; }\n\
+            #effect peek() #mutates: [Counter] { let _x: u8 = Counter.buf[3u32]; return; }\n\
+        ";
+        let ir = lower_str(src).expect("lower indexed read");
+        // Stage 1: GEP into struct to grab the field pointer.
+        assert!(
+            ir.contains("getelementptr %struct.Counter, %struct.Counter* @Counter.state, i32 0, i32 0"),
+            "expected struct-field GEP; got:\n{ir}"
+        );
+        // Stage 2: GEP into the array using the index.
+        assert!(
+            ir.contains("getelementptr [64 x i8], [64 x i8]*"),
+            "expected array-element GEP on [64 x i8]; got:\n{ir}"
+        );
+        // Stage 3: plain (non-volatile) load of the element type.
+        assert!(
+            ir.contains("load i8, i8*"),
+            "expected plain load i8; got:\n{ir}"
+        );
+        // Should NOT be volatile for non-register-block.
+        assert!(
+            !ir.contains("load volatile i8"),
+            "non-register-block read must not be volatile; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s5_indexed_read_on_register_block_emits_inttoptr_gep_and_volatile_load() {
+        // Register-block array field: skip the struct-field GEP (use
+        // `inttoptr` of the absolute MMIO address instead), then GEP
+        // into the array, then volatile load.
+        let src = "\
+            #automaton Uart {\n  \
+              #address: 0x4000_4000;\n  \
+              fifo: [u8; 16] #offset: 0x20;\n\
+            }\n\
+            #effect read_byte() #mutates: [Uart] { let _b: u8 = Uart.fifo[2u32]; return; }\n\
+        ";
+        let ir = lower_str(src).expect("lower mmio array read");
+        // 0x4000_4000 + 0x20 = 0x4000_4020 = 1073758240.
+        assert!(
+            ir.contains("inttoptr (i64 1073758240 to [16 x i8]*)"),
+            "expected inttoptr to array type at base+offset; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("getelementptr [16 x i8], [16 x i8]*"),
+            "expected array-element GEP; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("load volatile i8, i8*"),
+            "MMIO array read must be volatile load; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s5_indexed_write_in_mutate_block_emits_two_level_gep_and_store() {
+        // `#mutate Counter { buf[3] = 5u8 };` — block form is the
+        // canonical surface for indexed assignment.
+        let src = "\
+            #automaton Counter { buf: [u8; 64]; }\n\
+            #effect poke() #mutates: [Counter] { #mutate Counter { buf[3u32] = 5u8 }; }\n\
+        ";
+        let ir = lower_str(src).expect("lower indexed write");
+        assert!(
+            ir.contains("getelementptr %struct.Counter, %struct.Counter* @Counter.state, i32 0, i32 0"),
+            "expected struct-field GEP for write; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("getelementptr [64 x i8], [64 x i8]*"),
+            "expected array-element GEP for write; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("store i8 5, i8*"),
+            "expected plain store i8; got:\n{ir}"
+        );
+        assert!(
+            !ir.contains("store volatile i8"),
+            "non-register-block write must not be volatile; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s5_indexed_write_on_register_block_emits_volatile_store() {
+        // `#mutate Uart { fifo[2] = 0xAAu8 };` on a register-block
+        // automaton: inttoptr → array GEP → volatile store.
+        let src = "\
+            #automaton Uart {\n  \
+              #address: 0x4000_4000;\n  \
+              fifo: [u8; 16] #offset: 0x20;\n\
+            }\n\
+            #effect tx() #mutates: [Uart] { #mutate Uart { fifo[2u32] = 65u8 }; }\n\
+        ";
+        let ir = lower_str(src).expect("lower mmio array write");
+        assert!(
+            ir.contains("inttoptr (i64 1073758240 to [16 x i8]*)"),
+            "expected inttoptr at base+offset; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("getelementptr [16 x i8], [16 x i8]*"),
+            "expected array-element GEP; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("store volatile i8 65, i8*"),
+            "MMIO array write must be volatile store; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s5_indexed_field_in_transition_uses_self_owner() {
+        // Inside a `#transition` body, `Self.buf[0u32]` resolves the
+        // owner automaton from the enclosing context, not from the
+        // path. Verifies the `Self` → enclosing-owner branch in
+        // `emit_index_expr`.
+        let src = "\
+            #automaton Counter {\n  \
+              buf: [u8; 4];\n  \
+              #transition init { #mutate Counter { buf[0u32] = 1u8 }; }\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower transition with indexed write");
+        // Transition body must touch the right struct + global.
+        assert!(
+            ir.contains("define void @Counter_init()"),
+            "expected mangled transition fn; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("getelementptr %struct.Counter, %struct.Counter* @Counter.state, i32 0, i32 0"),
+            "expected struct-field GEP for buf; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("store i8 1, i8*"),
+            "expected store of 1 into buf; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s5_indexed_write_alongside_plain_writes_in_same_mutate_block() {
+        // Mixing indexed and non-indexed assigns in one `#mutate`
+        // block. Each assignment lowers independently per the
+        // `fa.index.is_some()` dispatch.
+        let src = "\
+            #automaton T { count: u32; buf: [u8; 8]; }\n\
+            #effect setup() #mutates: [T] {\n  \
+              #mutate T { count = 7u32, buf[1u32] = 9u8 };\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower mixed mutate");
+        // Plain field write: store directly through struct-field GEP.
+        assert!(
+            ir.contains("store i32 7, i32*"),
+            "expected plain store of count; got:\n{ir}"
+        );
+        // Indexed field write: array-element GEP then store.
+        assert!(
+            ir.contains("getelementptr [8 x i8], [8 x i8]*"),
+            "expected array-element GEP for buf; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("store i8 9, i8*"),
+            "expected store i8 9 for buf[1]; got:\n{ir}"
+        );
     }
 
     // ─── Decision #22 codegen: memory-ordering fences ────────────────────

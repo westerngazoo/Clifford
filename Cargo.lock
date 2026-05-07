@@ -50,8 +50,13 @@ dependencies = [
 name = "clifford-codegen"
 version = "0.1.0"
 dependencies = [
+ "clifford-ast",
  "clifford-effect",
+ "clifford-lexer",
  "clifford-ortho",
+ "clifford-parser",
+ "clifford-resolve",
+ "clifford-types",
  "thiserror",
 ]
 
