@@ -7,6 +7,107 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Codegen slice 7: integer cast expressions (2026-05-10)
+
+Lowers `expr as Type` for the integer-to-integer cases that v0.1
+firmware actually uses (widening / narrowing across `i1`, `i8`,
+`i16`, `i32`, `i64`, `i128`). Float casts and pointer-int casts
+remain `NotYetImplemented` and surface a structured error.
+
+**The headline shape — integer casts now lower:**
+
+```clifford
+@fn widen_unsigned() -> u32 { return 5u8 as u32; }      // zext
+@fn widen_signed()   -> i32 { let v: i8 = -3i8; return v as i32; }   // sext
+@fn narrow()         -> u8  { return 5u32 as u8; }      // trunc
+@fn bool_to_int()    -> u32 { return true as u32; }     // zext i1
+@fn redundant()      -> u32 { return 5u32 as u32; }     // no-op
+```
+
+→
+
+```llvm
+%v1 = zext i8 5 to i32                  ; widen unsigned
+%v2 = sext i8 %v_signed to i32          ; widen signed
+%v3 = trunc i32 5 to i8                 ; narrow
+%v4 = zext i1 1 to i32                  ; bool to int
+ret i32 5                               ; redundant cast: no instruction
+```
+
+The opcode is selected from the source / dest IR types and the
+source's signedness:
+
+| dest vs source            | opcode  | notes                          |
+|---------------------------|---------|--------------------------------|
+| same IR type              | (none)  | thread the SSA value through   |
+| dest narrower             | `trunc` | sign-agnostic at the IR level  |
+| dest wider, source signed | `sext`  | preserve sign on widening      |
+| dest wider, source unsigned | `zext` | zero-fill upper bits          |
+
+**Implementation (`crates/codegen/src/lib.rs`):**
+
+- New `Emitter::emit_cast_expr(value, ty)` is the entry point.
+  Computes the source IR type via `expr_ir_type` and the dest IR
+  type via `lower_type` of the user-written `TypeExpr`. If both are
+  identical, returns the source SSA value as-is (no instruction).
+  Otherwise, dispatches on the bit widths to pick `trunc` / `sext`
+  / `zext`.
+- New `int_bits(ir_ty)` free helper maps `i1` / `i8` / `i16` /
+  `i32` / `i64` / `i128` → bit count. Returns `None` for non-integer
+  IR types (`void`, `i32*`, `[N x T]`, `{T1, T2}`, `float`, …) so
+  the caller can dispatch to a different code path.
+- Source signedness is determined via the existing
+  `expr_is_signed_int` helper, which consults the typing record
+  first and falls back to literal-suffix inspection.
+- `emit_expr` dispatch grew a `Cast { value, ty }` arm; the
+  fall-through `NotYetImplemented` arm only catches the remaining
+  unimplemented variants.
+
+**No-op casts:** the `src_ir_ty == dst_ir_ty` short-circuit means
+that redundant casts (`5u32 as u32`, `v as TypeOf(v)`) emit no
+instruction. This keeps the IR clean and avoids confusing LLVM with
+spurious `bitcast` ops.
+
+**Bool casts:** `bool` lowers to `i1`. Casting `bool` to a wider
+integer goes through `zext` (bool is treated as unsigned for
+widening, matching Clifford's spec semantics — `true as u32` is
+`1`, not `-1`).
+
+**Deferred to later slices:**
+
+- Float casts (`f32` ↔ `f64`, `f32` ↔ `i32`, etc.) — `fptrunc` /
+  `fpext` / `fptoui` / `sitofp` / `fptosi` / `uitofp`. The
+  firmware tier doesn't use floats yet; deferred until a host /
+  scientific-computing slice needs them.
+- Pointer ↔ integer casts (`ptrtoint` / `inttoptr` outside of the
+  register-block address machinery). Decision #19 already covers
+  the `#unchecked_cast` shape for this case.
+- Reference type casts (e.g. `&T` to `&U` of compatible layout).
+  Most of these should go through `#unchecked_cast` per Decision
+  #17, not the regular `as` operator.
+
+**Tests added (`crates/codegen/src/lib.rs::tests`):**
+
+- `s7_int_bits_table` — direct coverage of every supported width.
+- `s7_int_bits_none_for_non_integer` — non-integer IR types return
+  `None` (`void`, `i32*`, `[N x T]`, `{T1, T2}`, `float`, empty).
+- `s7_widening_unsigned_emits_zext` — `5u8 as u32` → `zext`.
+- `s7_widening_signed_emits_sext` — `-3i8 as i32` → `sext`.
+- `s7_narrowing_emits_trunc` — `5u32 as u8` → `trunc`.
+- `s7_same_type_cast_is_noop` — `5u32 as u32` emits no
+  `zext`/`sext`/`trunc`; the literal `5` is returned directly.
+- `s7_bool_to_int_emits_zext` — `true as u32` → `zext i1 1 to i32`.
+- `s7_chained_cast_widening_then_narrowing` — `(5u8 as u32) as u16`
+  emits both `zext` and `trunc`.
+- `s7_cast_used_inside_larger_expression` — cast result feeds an
+  `add`; verifies SSA threading.
+- `s7_signed_narrowing_uses_trunc_not_sext` — `-1i32 as i8` —
+  signed narrowing is still `trunc` (sign doesn't matter for
+  narrowing at the IR level).
+
+Total codegen tests: **105** (95 pre-slice-7 + 10 new). All green;
+clippy clean across the workspace.
+
 ### Added — Codegen slice 6: tuple / array / array-repeat literals as values (2026-05-09)
 
 Lowers the three remaining aggregate-literal expression shapes that
