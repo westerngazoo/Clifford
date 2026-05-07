@@ -1177,6 +1177,21 @@ impl<'a> Emitter<'a> {
             // Lowers to a 2-level getelementptr (struct field → array
             // element) plus a `load` of the element type.
             ExprKind::Index { obj, index } => self.emit_index_expr(obj, index),
+            // Slice 6: aggregate literals (tuples + arrays).
+            // `(a, b, c)` and `[a, b, c]` lower to an `insertvalue`
+            // chain on `undef` of the aggregate IR type. Tuples
+            // become `{T1, T2, …}` structs; arrays become `[N x T]`.
+            ExprKind::Tuple(elems) => self.emit_tuple_expr(expr, elems),
+            ExprKind::Array(elems) => self.emit_array_expr(expr, elems),
+            // Slice 6: array-repeat literals.
+            // `[expr; count]` lowers to `count` insertvalue ops
+            // chained on `undef`, all using the same evaluated
+            // value. The count must be a const integer literal
+            // today; non-const counts need a runtime memset / loop
+            // and are deferred.
+            ExprKind::ArrayRepeat { value, count } => {
+                self.emit_array_repeat_expr(expr, value, count)
+            }
             other => Err(CodegenError::NotYetImplemented {
                 what: expr_kind_name(other),
             }),
@@ -1310,6 +1325,122 @@ impl<'a> Emitter<'a> {
         )
         .ok();
         Ok(val)
+    }
+
+    /// Slice 6: lower a tuple literal `(a, b, …)` to an `insertvalue`
+    /// chain on `undef` of the tuple's struct IR type.
+    ///
+    /// ```text
+    /// %t0 = insertvalue {T1, T2, T3} undef, T1 <a>, 0
+    /// %t1 = insertvalue {T1, T2, T3} %t0, T2 <b>, 1
+    /// %t2 = insertvalue {T1, T2, T3} %t1, T3 <c>, 2
+    /// ```
+    ///
+    /// The aggregate IR type comes from `expr_ir_type` (i.e. from the
+    /// typing record when present, else a syntactic fallback).
+    fn emit_tuple_expr(
+        &mut self,
+        expr: &Expr,
+        elems: &[Expr],
+    ) -> Result<String, CodegenError> {
+        let agg_ty = self.expr_ir_type(expr);
+        self.emit_aggregate_insertvalue_chain(&agg_ty, elems)
+    }
+
+    /// Slice 6: lower an array literal `[a, b, …]` to an `insertvalue`
+    /// chain on `undef` of the array's `[N x T]` IR type. Same shape
+    /// as [`Self::emit_tuple_expr`] — the LLVM `insertvalue`
+    /// instruction is uniform across struct and array aggregates.
+    fn emit_array_expr(
+        &mut self,
+        expr: &Expr,
+        elems: &[Expr],
+    ) -> Result<String, CodegenError> {
+        if elems.is_empty() {
+            // `[]` of zero length isn't useful in v0.1; the type
+            // checker rarely produces a usable element type for it.
+            return Err(CodegenError::NotYetImplemented {
+                what: "empty array literal `[]`",
+            });
+        }
+        let agg_ty = self.expr_ir_type(expr);
+        self.emit_aggregate_insertvalue_chain(&agg_ty, elems)
+    }
+
+    /// Slice 6: lower `[value; count]` array-repeat literal. The
+    /// count must be a const integer literal today; non-const counts
+    /// (computed sizes, generic-bound counts, etc.) are deferred to a
+    /// later slice that needs a runtime loop.
+    ///
+    /// The value expression is emitted **once** and then re-used in
+    /// every `insertvalue`; this preserves the semantics of "the same
+    /// value at every index" without re-evaluating side-effecting
+    /// expressions (which the type checker should reject for
+    /// `[expr; N]` anyway, but defensive emission is cheap).
+    fn emit_array_repeat_expr(
+        &mut self,
+        expr: &Expr,
+        value: &Expr,
+        count: &Expr,
+    ) -> Result<String, CodegenError> {
+        let n = const_int_count(count).ok_or(CodegenError::NotYetImplemented {
+            what: "array-repeat count that isn't a const integer literal",
+        })?;
+        let agg_ty = self.expr_ir_type(expr);
+        let elem_value = self.emit_expr(value)?;
+        let elem_ir_ty = self.expr_ir_type(value);
+
+        let mut current: String = "undef".to_owned();
+        for i in 0..n {
+            let next = self.fresh_value();
+            writeln!(
+                &mut self.out,
+                "  {next} = insertvalue {agg_ty} {current}, {elem_ir_ty} {elem_value}, {i}",
+            )
+            .ok();
+            current = next;
+        }
+        Ok(current)
+    }
+
+    /// Slice 6 shared core: walk `elems`, emit each element, and
+    /// thread the SSA values into a chain of `insertvalue` ops on
+    /// `undef` of `agg_ty`. Returns the final aggregate SSA name.
+    ///
+    /// Empty `elems` returns `"undef"` directly so callers don't
+    /// emit a useless `insertvalue` of nothing; the public-facing
+    /// callers (tuple / array) reject empty inputs upstream so this
+    /// branch isn't currently exercisable from the language surface.
+    fn emit_aggregate_insertvalue_chain(
+        &mut self,
+        agg_ty: &str,
+        elems: &[Expr],
+    ) -> Result<String, CodegenError> {
+        if elems.is_empty() {
+            return Ok("undef".to_owned());
+        }
+        // Emit each element first; capture (ir_type, ssa_value) pairs
+        // before we start writing the insertvalue chain. This avoids
+        // interleaving element-evaluation IR with the chain ops, which
+        // keeps the output readable.
+        let mut emitted: Vec<(String, String)> = Vec::with_capacity(elems.len());
+        for e in elems {
+            let v = self.emit_expr(e)?;
+            let t = self.expr_ir_type(e);
+            emitted.push((t, v));
+        }
+
+        let mut current: String = "undef".to_owned();
+        for (i, (ir_ty, value)) in emitted.iter().enumerate() {
+            let next = self.fresh_value();
+            writeln!(
+                &mut self.out,
+                "  {next} = insertvalue {agg_ty} {current}, {ir_ty} {value}, {i}",
+            )
+            .ok();
+            current = next;
+        }
+        Ok(current)
     }
 
     /// Slice 3: lower an automaton field read. The emitted IR is:
@@ -1919,6 +2050,22 @@ fn array_element_ir_type(ir_ty: &str) -> Option<String> {
     Some(t.trim().to_owned())
 }
 
+/// Slice 6: extract a const integer count from an AST expression
+/// suitable for an array-repeat `[v; count]` literal. Returns `Some(n)`
+/// only if `count` is a literal integer node (decimal / hex / binary)
+/// whose parsed value fits in `usize`. Returns `None` for any other
+/// expression shape — callers surface that as `NotYetImplemented`.
+fn const_int_count(expr: &Expr) -> Option<usize> {
+    let raw = match &expr.kind {
+        ExprKind::IntLit(s) => parse_int_literal(s).ok()?.0,
+        ExprKind::HexLit(s) => parse_hex_literal(s).ok()?.0,
+        ExprKind::BinLit(s) => parse_bin_literal(s).ok()?.0,
+        ExprKind::Paren(inner) => return const_int_count(inner),
+        _ => return None,
+    };
+    raw.parse::<usize>().ok()
+}
+
 /// True if the IR type-text names an integer LLVM type (`i1`, `i8`,
 /// `i16`, `i32`, `i64`, `i128`, …). Used to gate integer-only ops
 /// (the SSA-add-zero binding idiom; integer-shape unary `-` and
@@ -2357,15 +2504,22 @@ mod tests {
     // ─── Error paths ─────────────────────────────────────────────────────
 
     #[test]
-    fn unsupported_expression_emits_e0810() {
-        // Tuple expressions don't lower in slice 1.
+    fn tuple_expression_now_lowered_per_slice_6() {
+        // Renamed from `unsupported_expression_emits_e0810`. Slice 1
+        // surfaced tuples as `NotYetImplemented`; slice 6 lowers them
+        // to an `insertvalue` chain on `undef` of the tuple's struct
+        // IR type. The test now asserts the slice-6 surface.
         let src = "@fn t() { let _x := (1u32, 2u32); return; }";
-        let errors = lower_str(src).expect_err("expected E0810 for tuple");
-        let saw = errors.iter().any(|e| {
-            matches!(e, CodegenError::NotYetImplemented { what }
-                if *what == "tuple expression")
-        });
-        assert!(saw, "expected NotYetImplemented(tuple); got {errors:?}");
+        let ir = lower_str(src).expect("slice 6 lowers tuple literal");
+        // Two insertvalue ops on `{i32, i32} undef`, indices 0 and 1.
+        assert!(
+            ir.contains("insertvalue {i32, i32} undef, i32 1, 0"),
+            "expected first insertvalue at index 0; got:\n{ir}"
+        );
+        assert!(
+            ir.contains(", i32 2, 1"),
+            "expected second insertvalue at index 1; got:\n{ir}"
+        );
     }
 
     #[test]
@@ -3338,6 +3492,206 @@ mod tests {
         assert!(
             ir.contains("store i8 9, i8*"),
             "expected store i8 9 for buf[1]; got:\n{ir}"
+        );
+    }
+
+    // ─── Slice 6: tuple / array / array-repeat literal expressions ───────
+
+    #[test]
+    fn s6_const_int_count_parses_decimal_hex_binary() {
+        use clifford_ast::{Expr, ExprKind};
+        use clifford_lexer::Span;
+        let span = Span::new(0, 0);
+        let dec = Expr {
+            kind: ExprKind::IntLit("64u32".to_owned()),
+            span,
+        };
+        let hex = Expr {
+            kind: ExprKind::HexLit("0x10u32".to_owned()),
+            span,
+        };
+        let bin = Expr {
+            kind: ExprKind::BinLit("0b1000u32".to_owned()),
+            span,
+        };
+        assert_eq!(const_int_count(&dec), Some(64));
+        assert_eq!(const_int_count(&hex), Some(16));
+        assert_eq!(const_int_count(&bin), Some(8));
+    }
+
+    #[test]
+    fn s6_const_int_count_returns_none_for_non_literal() {
+        use clifford_ast::{Expr, ExprKind};
+        use clifford_lexer::Span;
+        let span = Span::new(0, 0);
+        let path = Expr {
+            kind: ExprKind::Path(vec!["n".to_owned()]),
+            span,
+        };
+        assert_eq!(const_int_count(&path), None);
+    }
+
+    #[test]
+    fn s6_tuple_literal_lowers_to_insertvalue_chain() {
+        // 3-element tuple of mixed types: (u32, bool, u8). Type
+        // becomes `{i32, i1, i8}`. Three insertvalues at indices
+        // 0, 1, 2.
+        let src = "@fn t() { let _x: (u32, bool, u8) = (5u32, true, 7u8); return; }";
+        let ir = lower_str(src).expect("lower 3-tuple");
+        assert!(
+            ir.contains("insertvalue {i32, i1, i8} undef, i32 5, 0"),
+            "expected first insertvalue (i32, idx 0); got:\n{ir}"
+        );
+        assert!(
+            ir.contains(", i1 1, 1"),
+            "expected i1 (true) at idx 1; got:\n{ir}"
+        );
+        assert!(
+            ir.contains(", i8 7, 2"),
+            "expected i8 7 at idx 2; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s6_two_tuple_with_different_element_types() {
+        let src = "@fn p() { let _x: (u32, bool) = (42u32, false); return; }";
+        let ir = lower_str(src).expect("lower 2-tuple");
+        assert!(
+            ir.contains("insertvalue {i32, i1} undef, i32 42, 0"),
+            "expected i32 42 at idx 0; got:\n{ir}"
+        );
+        assert!(
+            ir.contains(", i1 0, 1"),
+            "expected i1 0 (false) at idx 1; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s6_array_literal_lowers_to_insertvalue_chain() {
+        // Three-element u32 array. Type becomes `[3 x i32]`. Three
+        // insertvalues at indices 0, 1, 2 with i32 element type.
+        let src = "@fn a() { let _x: [u32; 3] = [10u32, 20u32, 30u32]; return; }";
+        let ir = lower_str(src).expect("lower 3-array");
+        assert!(
+            ir.contains("insertvalue [3 x i32] undef, i32 10, 0"),
+            "expected first insertvalue [3 x i32] idx 0; got:\n{ir}"
+        );
+        assert!(
+            ir.contains(", i32 20, 1"),
+            "expected i32 20 at idx 1; got:\n{ir}"
+        );
+        assert!(
+            ir.contains(", i32 30, 2"),
+            "expected i32 30 at idx 2; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s6_array_repeat_literal_const_count() {
+        // `[0u8; 4]` → four insertvalues all with the same value.
+        let src = "@fn b() { let _x: [u8; 4] = [0u8; 4]; return; }";
+        let ir = lower_str(src).expect("lower array repeat");
+        // 4 insertvalues at indices 0..=3 — one per element.
+        for idx in 0..4 {
+            let needle = format!(", i8 0, {idx}");
+            assert!(
+                ir.contains(&needle),
+                "missing insertvalue at idx {idx}; got:\n{ir}"
+            );
+        }
+        // Aggregate type appears verbatim on each insertvalue line.
+        assert_eq!(
+            ir.matches("insertvalue [4 x i8]").count(),
+            4,
+            "expected exactly 4 insertvalue ops on [4 x i8]; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s6_array_repeat_with_non_constant_value_emits_value_once() {
+        // `[v; 3]` where `v` is an SSA name (not a constant). The
+        // value expression is emitted once and reused in every
+        // insertvalue. We verify the SSA name appears in three
+        // insertvalues.
+        let src = "\
+            @fn c() {\n  \
+              let v: u32 = 0u32 + 1u32;\n  \
+              let _arr: [u32; 3] = [v; 3];\n  \
+              return;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower array repeat with non-const value");
+        // 3 insertvalues on [3 x i32].
+        assert_eq!(
+            ir.matches("insertvalue [3 x i32]").count(),
+            3,
+            "expected 3 insertvalue ops; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s6_array_repeat_zero_count_emits_nothing() {
+        // `[0u8; 0]` is an edge case but a const count of 0 is legal;
+        // the resulting aggregate is `[0 x i8] undef` with no
+        // insertvalues. We check the chain returns a usable SSA name
+        // (or undef directly).
+        let src = "@fn d() { let _x: [u8; 0] = [0u8; 0]; return; }";
+        let ir = lower_str(src).expect("lower zero-count repeat");
+        // No insertvalue should appear; the aggregate is just undef.
+        assert_eq!(
+            ir.matches("insertvalue [0 x i8]").count(),
+            0,
+            "expected zero insertvalue ops for [0 x i8; 0]; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s6_array_repeat_non_const_count_returns_e0810() {
+        // `[v; n]` where `n` is a runtime variable can't be lowered
+        // to a static-count insertvalue chain; surface as
+        // NotYetImplemented.
+        let src = "\
+            @fn e() {\n  \
+              let n: u32 = 4u32;\n  \
+              let _arr: [u8; 4] = [0u8; n];\n  \
+              return;\n\
+            }\n\
+        ";
+        let errors = lower_str(src).expect_err("expected NotYetImplemented");
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            CodegenError::NotYetImplemented { what }
+                if *what == "array-repeat count that isn't a const integer literal"
+        ));
+        assert!(
+            saw,
+            "expected NotYetImplemented(array-repeat count); got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn s6_nested_tuple_in_array_literal() {
+        // `[(1u32, 2u32), (3u32, 4u32)]` — array of tuples.
+        // Outer is `[2 x {i32, i32}]`; each element is a tuple
+        // value built by its own insertvalue chain.
+        let src = "\
+            @fn f() {\n  \
+              let _x: [(u32, u32); 2] = [(1u32, 2u32), (3u32, 4u32)];\n  \
+              return;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower nested tuple-in-array");
+        // Two outer insertvalues on [2 x {i32, i32}] aggregate.
+        assert_eq!(
+            ir.matches("insertvalue [2 x {i32, i32}]").count(),
+            2,
+            "expected 2 outer insertvalues on array; got:\n{ir}"
+        );
+        // Four inner insertvalues on {i32, i32} (two per tuple).
+        assert_eq!(
+            ir.matches("insertvalue {i32, i32}").count(),
+            4,
+            "expected 4 inner tuple insertvalues; got:\n{ir}"
         );
     }
 
