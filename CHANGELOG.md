@@ -7,6 +7,163 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Codegen slice 3: §8.4 automaton state + effects + transitions + `#mutate` (2026-05-07)
+
+The substantive v0.1 firmware piece. Slice 1 lowered `@fn` bodies;
+slice 2 added typing integration + composite types + deref. Slice 3
+covers the §8.4 surface: per-automaton state structs, effect /
+transition / interrupt LLVM functions, `#mutate` block + sugar
+mutation, and automaton field reads through `getelementptr` + `load`.
+
+**The headline shape — a full v0.1 firmware program now lowers:**
+
+```clifford
+#automaton Counter { value: u32; }
+#effect bump() #mutates: [Counter] { Counter.value += 1u32; }
+#effect reset() #mutates: [Counter] { Counter.value = 0u32; }
+#effect main() #mutates: [Counter] {
+  #> bump();
+  #> bump();
+  #> reset();
+}
+```
+
+→
+
+```llvm
+%struct.Counter = type { i32 }
+@Counter.state = global %struct.Counter zeroinitializer
+
+define void @bump() {
+entry:
+  %tmp.0 = getelementptr %struct.Counter, %struct.Counter* @Counter.state, i32 0, i32 0
+  %tmp.1 = load i32, i32* %tmp.0
+  %tmp.2 = add i32 %tmp.1, 1
+  store i32 %tmp.2, i32* %tmp.0
+  ret void
+}
+
+define void @reset() { … }   ; getelementptr + store i32 0
+define void @main() {
+entry:
+  call void @bump()
+  call void @bump()
+  call void @reset()
+  ret void
+}
+```
+
+**Implementation (`crates/codegen/src/lib.rs`):**
+
+- New `AutomatonInfo { name, fields: Vec<(String, String)>,
+  is_register_block: bool }`. The `fields` vec preserves declaration
+  order — its index is the LLVM struct field index used by
+  `getelementptr`.
+- `Emitter` gains `automatons: HashMap<String, AutomatonInfo>` (built
+  by pass 1) and `enclosing_owner: Option<String>` (set when emitting
+  a `#transition` body so `Self.field` reads resolve correctly).
+- New three-pass `lower()`:
+  1. `collect_automatons` — walks every `Item::Automaton`, lowers
+     each field's IR type, populates the registry.
+  2. `emit_automaton_state_structs` — emits
+     `%struct.<Name> = type { … }` and
+     `@<Name>.state = global %struct.<Name> zeroinitializer` for
+     every non-register-block automaton.
+  3. Function emission — `@fn` (slice 1+), `#effect` (new),
+     `#interrupt` (new), and per-automaton `#transition`s (new).
+- New `Emitter::emit_effect` — lowers like `@fn` but in
+  imperative-layer context (mutation statements / proc calls work).
+- New `Emitter::emit_interrupt` — same shape as effect; the source
+  name becomes the LLVM linker symbol per Decision #10. Section
+  attribute (`.interrupts`) and target-specific calling convention
+  defer to slice 4.
+- New `Emitter::emit_automaton_transitions` — walks each automaton's
+  inner `#transition`s. Each transition becomes
+  `define void @<Owner>_<transition_name>()` (namespaced) so
+  cross-automaton names don't clash.
+- New `Emitter::emit_mutate` — `#mutate Auto { f1 = e1, f2 = e2 };`
+  lowers to a sequence of `getelementptr` + `store` per field.
+- New `Emitter::emit_mutate_short` — `Auto.field <op>= expr;` sugar.
+  `=` is a plain `store`; `<op>=` is `load` + op + `store`. Compound
+  ops (`+= -= *= /= %= &= |= ^= <<= >>=`) handled via
+  `compound_assign_opcode` helper.
+- New `Emitter::emit_proc_call` — `#> name(args);` lowers to an
+  LLVM `call`. The callee symbol is mangled `<Owner>_<name>` if the
+  resolver records it as a transition of the enclosing automaton;
+  otherwise emit the bare name (effect / interrupt).
+- New `Emitter::emit_field_access` — `Auto.field` /
+  `Self.field` (in expression position) lowers to `getelementptr` +
+  `load`. `Self` resolves to `enclosing_owner` (set by the transition
+  emission); outside a transition, `Self.field` surfaces as
+  `NotYetImplemented`.
+- New `compound_assign_opcode(op, ir_ty)` free helper — maps each
+  `AssignOp` variant to the LLVM opcode for its load+op+store
+  expansion.
+
+**What slice 3 deliberately defers (slice 4+):**
+
+- **Register-block automatons** (`#address: 0x…`). Their fields lower
+  to volatile loads/stores at fixed addresses (Decision #6), not
+  through a global state struct. Slice 3 records the
+  `is_register_block` flag and surfaces `NotYetImplemented` on any
+  attempt to mutate or read a register-block field.
+- **Multi-state automatons** with `#states: [Init, Running, Halted]`
+  — need a state-tag field added to the struct and `#> proc()` calls
+  to dispatch on current state. Slice 3 lowers monoid (single-state
+  / no `#states` clause) automatons only.
+- **Transition-atomicity wrapping** (Refinement #5e): `cli`/`sti` for
+  `R(A)` overlap on Cortex-M, `LDREX`/`STREX` on Cortex-A, etc.
+  Decision #21 / #26 territory; slice 4+.
+- **Interrupt section attribute** (`.interrupts`) and target-specific
+  calling convention. Slice 4.
+- **Indexed field assignment** (`#mutate Counter { buf[3] = …}`).
+  Needs 2-level GEP. Slice 4.
+- **Bit-field RMW** with target-atomic when concurrent writer exists
+  (Decision #20). Slice 5+.
+- **Generic effect monomorphisation** (Decision #16's
+  `(generic_effect, interface_arg)` specialisation). Needs the
+  monomorphisation pass.
+- **`#interface` / `#impl` method bodies** — parser-slice work first.
+- **Effect return values** at proc-call sites — slice 3 emits all
+  proc calls as `call void`; the typing-aware return-type plumbing
+  for effects/transitions is slice 4.
+- **Sigma loops** (§5.8 + §8.4 codegen).
+
+**Tests (15 new slice-3 tests, codegen crate now 51 total, was 36):**
+
+- Single-field automaton emits state struct + global.
+- Multi-field struct preserves declaration-order layout
+  (`%struct.Multi = type { i32, i1, i8 }`).
+- Register-block automaton skipped (no struct emitted).
+- Effect lowers to `define`.
+- `Auto.field = expr;` → GEP + store.
+- `Auto.field += expr;` → GEP + load + add + store.
+- `#mutate Auto { f1 = …, f2 = … };` block form → multiple GEP +
+  store pairs.
+- Field read in effect body → GEP + load.
+- Transition lowers to namespaced `@<Owner>_<name>` fn.
+- `Self.field` (read position) inside transition resolves to owner.
+- Proc call to effect uses bare name; proc call to transition uses
+  namespaced `<Owner>_<name>`.
+- Interrupt emits with source name as linker symbol.
+- Register-block field read → E0810 (slice 4 work).
+- Full canonical Counter program (automaton + effects with mutation
+  sugar + compound assign + proc calls) lowers cleanly.
+
+The pre-slice-3 test `non_fn_items_silently_skipped` was renamed to
+`non_fn_items_now_lowered_per_slice_3` and updated to assert the
+new state-struct emission.
+
+Workspace remains green; clippy clean.
+
+**v0.1 firmware milestone status:** the codegen surface now covers
+the full *non-register-block, monoid-automaton* program shape. A
+program with `@fn`s, `#effect`s, `#interrupt`s, monoid `#automaton`s
+with `#mutate` / sugar / `#> proc()` / field reads goes from `.cl`
+source all the way to runnable `.ll` IR through the full pipeline.
+The remaining v0.1 firmware pieces — register-block lowering,
+multi-state automatons, interrupt section attributes — are slice 4.
+
 ### Added — Codegen slice 2: `Typing` integration + sign-aware ops + composite types + deref/negation (2026-05-07)
 
 Second codegen slice. Slice 1 lowered `@fn` bodies using syntactic
