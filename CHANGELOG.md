@@ -7,6 +7,178 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Codegen slice 4: register-block volatile MMIO + interrupt section attribute (2026-05-07)
+
+Closes the v0.1 firmware codegen story. Slice 3 lowered non-
+register-block automatons via state struct + `getelementptr`; slice
+4 adds the **Decision #6 register-block surface** (volatile loads /
+stores at fixed MMIO addresses) and **Decision #10 interrupt
+section attribute** (`section ".interrupts"` so the linker can
+place all interrupt handlers in a contiguous block for the vector
+table).
+
+**The headline shape — a real MMIO driver now lowers:**
+
+```clifford
+#automaton Uart {
+  #address: 0x4000_4000;
+  tx_data: u32 #offset: 0x00;
+  status:  u32 #offset: 0x18;
+  #transition send { Uart.tx_data = 65u32; }   // 'A'
+}
+
+#interrupt USART1_IRQ() #mutates: [Uart] #priority: HIGH {
+  #> send();
+}
+```
+
+→
+
+```llvm
+define void @Uart_send() {
+entry:
+  store volatile i32 65, i32* inttoptr (i64 1073758208 to i32*)
+  ret void
+}
+
+define void @USART1_IRQ() section ".interrupts" {
+entry:
+  call void @Uart_send()
+  ret void
+}
+```
+
+(`0x4000_4000` = 1073758208; the volatile store goes directly to
+that MMIO address with no intermediate buffering.)
+
+**Implementation (`crates/codegen/src/lib.rs`):**
+
+- `AutomatonInfo.fields` evolved from `(name, ir_type)` tuples to
+  `(name, ir_type, optional_offset)` triples. Non-register-block
+  fields keep `optional_offset = None` (they index into the state
+  struct); register-block fields carry `Some(offset_value)` (their
+  MMIO offset relative to the automaton's `#address:` base).
+- New `AutomatonInfo.base_address: u64` — parsed from the
+  `#address: 0xHEX` clause via the new
+  `parse_address_literal` helper. Sum of `base_address + offset` is
+  the absolute MMIO address for each register-block field access.
+- New `parse_address_literal(s)` free helper: recognises hex
+  (`0x4000_0000`), binary (`0b1010`), and decimal (`42`) literals
+  with `_` separators.
+- New `FieldLocation` enum with two variants:
+  - `Struct { idx: usize }` — non-register-block field; lowers via
+    `getelementptr` against `@<Auto>.state` (slice-3 path).
+  - `RegisterBlock { absolute_address: u64 }` — register-block
+    field; lowers via `inttoptr (i64 <abs> to <T>*)` plus volatile
+    load / store (slice-4 path).
+- New `Emitter::emit_field_load(automaton, struct_name, loc,
+  ir_ty)` and `Emitter::emit_field_store(... value ...)` helpers
+  consolidate the dispatch on `FieldLocation`. Used by
+  `emit_field_access` (read), `emit_mutate` (block form), and
+  `emit_mutate_short` (sugar).
+- `emit_field_access` rewritten to support both branches; emits
+  `load volatile <T>, <T>* inttoptr (i64 <abs> to <T>*)` for the
+  register-block case.
+- `emit_mutate` and `emit_mutate_short` rewritten to dispatch
+  through the new helpers; compound assigns (`Mmio.ctl |= 1u32;`)
+  on register-block fields lower to `load volatile + or + store
+  volatile` at the MMIO address.
+- `emit_automaton_transitions` no longer skips register-block
+  automatons; transitions inside register-block automatons (e.g.
+  the `Uart_send` example) now lower with their bodies going
+  through the volatile-load/store path.
+- `emit_interrupt` adds `section ".interrupts"` to the `define`
+  line per Decision #10. Linker symbol still equals the source
+  name. Target-specific calling convention (`thumb_intrcc`, etc.)
+  remains a future slice when the target-data-layout pass lands;
+  LLVM's default cc handles the common Cortex-M / RISC-V cases for
+  v0.1.
+
+**New `Emitter` field:** `transition_owners: HashMap<String, String>`.
+Built at pass 1 alongside the automaton registry. Maps every
+transition's name → its owning automaton, used by the proc-call
+lowering to mangle cross-callable transition references (e.g.
+`#> send()` from inside an `#interrupt` whose `#mutates` lists the
+transition's automaton). Slice 3's mangling logic only handled the
+intra-transition case via `enclosing_owner`; slice 4 closes the
+gap.
+
+**`emit_proc_call` refactored** to do a clean two-step resolution:
+
+1. Consult `Resolution::lookup` for the call's `BindingRef::Proc {
+   ctx, … }`.
+2. If `ctx == CallContext::Transition`, find the owner: prefer
+   `enclosing_owner` (intra-transition case), fall back to
+   `transition_owners` (cross-callable case). Mangle as
+   `<Owner>_<name>`.
+3. Otherwise emit the bare name (effect / interrupt linker symbol
+   = source name).
+
+**Volatile-load/store atomicity (Decision #6 contract):** the IR
+`store volatile` / `load volatile` of word-sized integers
+(`i8` / `i16` / `i32` / `i64` for `u8/i8` … `u64/i64`) is a
+single hardware instruction on every supported target. Decision
+#6's "register access goes through normal `#mutate` machinery on
+register-block automata" claim translates directly to LLVM's
+volatile semantics — no manual atomic-instruction selection
+needed for v0.1's word-aligned register fields.
+
+**Tests (15 new slice-4 tests, codegen crate now 76 total, was 61):**
+
+- Register-block field read → volatile load at absolute address.
+- Register-block field write → volatile store at absolute address.
+- Field offset added to base correctly (`base + 0x04` vs
+  `base + 0x00`).
+- Register-block automaton no longer emits a state struct or
+  global state (slice-3 invariant preserved).
+- Compound assign (`|=`) on register-block field → volatile load
+  + or + volatile store.
+- `#mutate Mmio { ctl = …, status = … };` block form on register-
+  block: each field gets its own absolute address.
+- Register-block transition lowers (slice-3 punted on this; slice 4
+  closes it).
+- Interrupt `define` line carries `section ".interrupts"`.
+- Effect (non-interrupt) does NOT carry section attribute.
+- Interrupt with `Acquire` fence: section attr + fence coexist.
+- End-to-end MMIO program (Uart with transition, IRQ dispatching
+  it, full pipeline through codegen).
+- `parse_address_literal`: hex / decimal / binary / malformed →
+  None.
+
+The slice-3 `s3_register_block_field_access_emits_e0810` test was
+renamed to `s3_register_block_field_access_now_supported_per_slice_4`
+and updated to assert the volatile-load form.
+
+Workspace remains green; clippy clean.
+
+**v0.1 firmware milestone reached.** The codegen surface now covers
+the *complete* v0.1 firmware program shape:
+
+- Pure `@fn`s (slice 1): primitives, arithmetic, calls.
+- Composite types + typing (slice 2): refs, arrays, slices,
+  tuples, deref, signed/unsigned ops.
+- Automaton state + effects + transitions + `#mutate` (slice 3).
+- Decision #22 fences (Acquire / Release / SeqCst).
+- Register-block MMIO + interrupt sections (slice 4).
+
+A real firmware program — UART driver, GPIO toggler, scheduler —
+now goes from `.cl` source through lexer / parser / resolve /
+types / check / effect / ortho all the way to runnable `.ll` IR.
+
+What's still on the deck for v0.2+:
+
+- Multi-state automatons with state-tag dispatch.
+- Sigma loops.
+- Indexed field assignment (`Counter.buf[3] = …`).
+- Borrow expressions (`&x` → `alloca + store`).
+- Tuple/array literals as values.
+- Index expressions (`x[i]`).
+- Generic effect monomorphisation (Decision #16).
+- Bit-field RMW (Decision #20).
+- Decision #21 / #26 lock machinery (v0.7+).
+- CLI driver (`cliffordc build foo.cl`).
+- End-to-end QEMU integration test (`.ll` → `llc` → linked binary).
+
 ### Added — Decision #22 codegen: LLVM memory-ordering fences for `Acquire` / `Release` / `SeqCst` (2026-05-07)
 
 Closes the codegen gap from Decision #22 / ADR 0003. The earlier

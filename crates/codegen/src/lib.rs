@@ -236,11 +236,20 @@ struct Emitter<'a> {
     /// expression's type. Used by [`Self::expr_ir_type`] to pick the
     /// right LLVM IR type without falling back to syntactic guesses.
     typing: &'a Typing,
-    /// Slice 3: registry of every non-register-block `#automaton` in
-    /// the program. Maps name → field-offset table so `#mutate` and
-    /// `Auto.field` lowering can pick the right `getelementptr`
-    /// index without re-walking the AST.
+    /// Slice 3: registry of every `#automaton` in the program. Maps
+    /// name → field-offset table so `#mutate` and `Auto.field`
+    /// lowering can pick the right `getelementptr` index without
+    /// re-walking the AST. Slice 4 extends this with per-field MMIO
+    /// offsets for register-block automatons.
     automatons: HashMap<String, AutomatonInfo>,
+    /// Slice 4: maps transition-name → owner-automaton-name. Used by
+    /// the proc-call lowering path when the call is to a transition
+    /// from *outside* a transition body (e.g. an `#effect` calling a
+    /// transition, or an `#interrupt` dispatching one). The
+    /// `enclosing_owner` field handles the in-transition case
+    /// (slice 3); this map closes the cross-callable case.
+    /// Built at pass-1 time alongside the automaton registry.
+    transition_owners: HashMap<String, String>,
     /// Slice 3: current owning automaton when emitting a
     /// `#transition` body. `None` outside of transitions. Used to
     /// resolve `Self.field` to the correct automaton.
@@ -256,23 +265,31 @@ struct Emitter<'a> {
     errors: Vec<CodegenError>,
 }
 
-/// Per-automaton info captured in pass 1 (slice 3). The `fields` vec
+/// Per-automaton info captured in pass 1 (slice 3+). The `fields` vec
 /// preserves declaration order so `getelementptr` indices match LLVM
-/// struct layout.
+/// struct layout (for non-register-block automatons) or `(name, IR
+/// type, optional offset)` for register-block fields (slice 4).
 struct AutomatonInfo {
     /// Source name (matches `AutomatonDecl.name`).
     #[allow(dead_code)] // recorded for diagnostics; the map key is the canonical lookup
     name: String,
-    /// `(field_name, ir_type)` pairs in declaration order. The index
-    /// in this vec is the LLVM struct field index used by `getelementptr`.
-    fields: Vec<(String, String)>,
+    /// `(field_name, ir_type, optional_offset)` triples in declaration
+    /// order. For non-register-block automatons, `optional_offset`
+    /// is always `None` and the index in this vec is the LLVM struct
+    /// field index used by `getelementptr`. For register-block
+    /// automatons, every field has `Some(offset_value)` (parsed from
+    /// the `#offset: 0xHEX` clause; `clifford-check` enforces that
+    /// every register-block field has an `#offset`).
+    fields: Vec<(String, String, Option<u64>)>,
     /// `true` if this automaton is a register block (`#address: 0x…`
-    /// clause present). Slice 3 records the flag but does NOT lower
-    /// register-block fields — that's slice 4 work via volatile
-    /// loads/stores at `address + offset`. For slice 3, register-block
-    /// automatons skip state-struct emission and any reference to them
-    /// in lowered code surfaces as `NotYetImplemented`.
+    /// clause present). Register-block automatons skip state-struct
+    /// emission; field accesses lower to volatile loads/stores at
+    /// `address + offset` (Decision #6).
     is_register_block: bool,
+    /// Slice 4: parsed base address for register-block automatons,
+    /// `0` for non-register-block. Sum of `address` + each field's
+    /// `offset` is the absolute MMIO address of that field.
+    base_address: u64,
 }
 
 /// One per-function local binding: source name + SSA-value ref + IR
@@ -294,6 +311,7 @@ impl<'a> Emitter<'a> {
             resolution,
             typing,
             automatons: HashMap::new(),
+            transition_owners: HashMap::new(),
             enclosing_owner: None,
             pending_exit_fence: None,
             errors: Vec::new(),
@@ -302,26 +320,65 @@ impl<'a> Emitter<'a> {
 
     /// Pass 1: build the [`AutomatonInfo`] registry from every
     /// `Item::Automaton` in the program. Records field-name → IR
-    /// type and the index for each field's GEP offset.
+    /// type and:
+    /// - For non-register-block automatons: the field's index in the
+    ///   `getelementptr` table.
+    /// - For register-block automatons (`#address: 0x…`): the
+    ///   per-field offset, parsed from the `#offset: 0xHEX` clause.
+    ///   Slice 4 then lowers register-block field accesses to
+    ///   volatile loads/stores at `base_address + offset`.
     fn collect_automatons(&mut self, program: &Program) {
         for item in &program.items {
             if let Item::Automaton(decl) = item {
-                let mut fields: Vec<(String, String)> = Vec::with_capacity(decl.fields.len());
+                let is_register_block = decl.address.is_some();
+                let base_address = decl
+                    .address
+                    .as_ref()
+                    .and_then(|a| parse_address_literal(&a.value))
+                    .unwrap_or(0);
+
+                let mut fields: Vec<(String, String, Option<u64>)> =
+                    Vec::with_capacity(decl.fields.len());
                 for f in &decl.fields {
                     let ir_ty = self.lower_type(&f.ty).unwrap_or_else(|e| {
                         self.errors.push(e);
                         "i32".to_owned()
                     });
-                    fields.push((f.name.clone(), ir_ty));
+                    let offset = if is_register_block {
+                        // `clifford-check` enforces that every
+                        // register-block field has `#offset:` per
+                        // Decision #6, so a missing offset here is an
+                        // upstream-validation gap. Defensive: record
+                        // 0 and continue. The diagnostic surfaces
+                        // upstream.
+                        f.offset
+                            .as_deref()
+                            .and_then(parse_address_literal)
+                            .or(Some(0))
+                    } else {
+                        None
+                    };
+                    fields.push((f.name.clone(), ir_ty, offset));
                 }
                 self.automatons.insert(
                     decl.name.clone(),
                     AutomatonInfo {
                         name: decl.name.clone(),
                         fields,
-                        is_register_block: decl.address.is_some(),
+                        is_register_block,
+                        base_address,
                     },
                 );
+                // Slice 4: record transition→owner mapping so
+                // proc-call lowering can mangle cross-callable
+                // transition references like `#> send()` from inside
+                // an `#interrupt` that lists the transition's
+                // automaton in its `#mutates`.
+                for tr in &decl.transitions {
+                    self.transition_owners
+                        .entry(tr.name.clone())
+                        .or_insert_with(|| decl.name.clone());
+                }
             }
         }
     }
@@ -342,7 +399,7 @@ impl<'a> Emitter<'a> {
                 continue;
             };
             // Emit struct type.
-            let parts: Vec<String> = info.fields.iter().map(|(_, ty)| ty.clone()).collect();
+            let parts: Vec<String> = info.fields.iter().map(|(_, ty, _)| ty.clone()).collect();
             writeln!(
                 &mut self.out,
                 "%struct.{name} = type {{ {fields} }}",
@@ -452,12 +509,17 @@ impl<'a> Emitter<'a> {
         let ordering = memory_ordering_from_traits(&decl.trait_list);
         self.pending_exit_fence = ordering.exit;
 
-        // Linker symbol = source name (Decision #10). Slice 4 will
-        // add the `section ".interrupts"` and target-specific calling
-        // convention (`cc 87` for ARM thumb-cc, etc.).
+        // Linker symbol = source name (Decision #10). Slice 4 adds
+        // the `section ".interrupts"` attribute so the linker places
+        // every `#interrupt` handler in a single contiguous section
+        // the startup code can reference for the vector table.
+        // Target-specific calling-convention attribute (e.g.
+        // `cc 87` for ARM `thumb_intrcc`) is left to a later slice
+        // when the target-data-layout pass lands; LLVM's default
+        // target cc handles common cases for v0.1.
         writeln!(
             &mut self.out,
-            "define {ret_ty} @{name}({params}) {{",
+            "define {ret_ty} @{name}({params}) section \".interrupts\" {{",
             name = decl.name,
             params = sig_parts.join(", "),
         )
@@ -479,11 +541,11 @@ impl<'a> Emitter<'a> {
     /// { … } }`) so there's no name clash across automatons. The
     /// owning-automaton context is set so `Self.field` reads resolve.
     fn emit_automaton_transitions(&mut self, decl: &AutomatonDecl) {
-        if decl.address.is_some() {
-            // Register-block automaton — slice 4. Transitions on register
-            // blocks need the volatile-load/store machinery.
-            return;
-        }
+        // Slice 4: register-block automatons CAN have transitions
+        // now — their field accesses go through volatile loads/stores
+        // instead of the GEP+load/store path. Transitions on
+        // register blocks were the slice-3 deferral that this slice
+        // closes.
         for tr in &decl.transitions {
             self.emit_transition(&decl.name, tr);
         }
@@ -733,67 +795,133 @@ impl<'a> Emitter<'a> {
         automaton: &str,
         assigns: &[FieldAssign],
     ) -> Result<(), CodegenError> {
-        // Snapshot the field info so we can release the borrow before
-        // calling `emit_expr` (which needs `&mut self`).
-        let (struct_name, field_data): (String, Vec<(usize, String)>) = {
+        // Snapshot per-field locations so we can release the &-borrow
+        // on `self.automatons` before calling `emit_expr` (which
+        // needs `&mut self`). For each assign, capture
+        // (location, ir_ty).
+        let (is_register_block, struct_name, field_data) = {
             let info = self.automatons.get(automaton).ok_or_else(|| {
                 CodegenError::UnresolvedName {
                     name: automaton.to_owned(),
                 }
             })?;
-            if info.is_register_block {
-                return Err(CodegenError::NotYetImplemented {
-                    what: "#mutate on register-block automaton (volatile-store lowering is slice 4)",
-                });
-            }
             let struct_name = format!("%struct.{automaton}");
-            let mut entries = Vec::with_capacity(assigns.len());
+            let mut entries: Vec<(FieldLocation, String)> = Vec::with_capacity(assigns.len());
             for fa in assigns {
-                let (idx, ir_ty) = info
+                let (idx, ir_ty, offset) = info
                     .fields
                     .iter()
                     .enumerate()
-                    .find_map(|(i, (n, t))| if n == &fa.field { Some((i, t.clone())) } else { None })
+                    .find_map(|(i, (n, t, off))| {
+                        if n == &fa.field {
+                            Some((i, t.clone(), *off))
+                        } else {
+                            None
+                        }
+                    })
                     .ok_or_else(|| CodegenError::UnresolvedName {
                         name: format!("{automaton}.{}", fa.field),
                     })?;
-                entries.push((idx, ir_ty));
+                let loc = if info.is_register_block {
+                    FieldLocation::RegisterBlock {
+                        absolute_address: info.base_address + offset.unwrap_or(0),
+                    }
+                } else {
+                    FieldLocation::Struct { idx }
+                };
+                entries.push((loc, ir_ty));
             }
-            (struct_name, entries)
+            (info.is_register_block, struct_name, entries)
         };
 
-        for (fa, (idx, ir_ty)) in assigns.iter().zip(field_data.iter()) {
-            // Slice 3 punt: array-element index forms (`field[i] =
-            // expr`) need a 2-level GEP and aren't part of this
-            // slice's mutation surface.
+        for (fa, (loc, ir_ty)) in assigns.iter().zip(field_data.iter()) {
             if fa.index.is_some() {
                 return Err(CodegenError::NotYetImplemented {
                     what: "indexed field assignment (#mutate Auto { field[i] = … })",
                 });
             }
             let v = self.emit_expr(&fa.value)?;
-            let ptr = self.fresh_value();
-            writeln!(
-                &mut self.out,
-                "  {ptr} = getelementptr {struct_name}, {struct_name}* @{automaton}.state, i32 0, i32 {idx}",
-                struct_name = struct_name,
-                automaton = automaton,
-                idx = idx,
-            )
-            .ok();
-            writeln!(
-                &mut self.out,
-                "  store {ir_ty} {v}, {ir_ty}* {ptr}",
-                ir_ty = ir_ty,
-                v = v,
-                ptr = ptr,
-            )
-            .ok();
+            self.emit_field_store(automaton, &struct_name, loc, ir_ty, &v, is_register_block);
         }
         Ok(())
     }
 
-    /// Slice 3: lower `Auto.field <op>= expr;` sugar.
+    /// Slice 3+ helper: emit the IR for storing `value` into a single
+    /// automaton field. Branches on `loc`:
+    ///
+    /// - `Struct { idx }` (non-register-block) — `getelementptr` +
+    ///   `store`.
+    /// - `RegisterBlock { absolute_address }` (slice 4) —
+    ///   `store volatile <ir_ty> <value>, <ir_ty>* inttoptr (i64 …
+    ///   to <ir_ty>*)`.
+    fn emit_field_store(
+        &mut self,
+        automaton: &str,
+        struct_name: &str,
+        loc: &FieldLocation,
+        ir_ty: &str,
+        value: &str,
+        is_register_block: bool,
+    ) {
+        match loc {
+            FieldLocation::Struct { idx } => {
+                let ptr = self.fresh_value();
+                writeln!(
+                    &mut self.out,
+                    "  {ptr} = getelementptr {struct_name}, {struct_name}* @{automaton}.state, i32 0, i32 {idx}",
+                )
+                .ok();
+                writeln!(&mut self.out, "  store {ir_ty} {value}, {ir_ty}* {ptr}").ok();
+            }
+            FieldLocation::RegisterBlock { absolute_address } => {
+                let _ = is_register_block; // tag for diagnostic-future use
+                writeln!(
+                    &mut self.out,
+                    "  store volatile {ir_ty} {value}, {ir_ty}* inttoptr (i64 {abs} to {ir_ty}*)",
+                    abs = absolute_address,
+                )
+                .ok();
+            }
+        }
+    }
+
+    /// Slice 3+ helper: emit the IR for loading the current value of
+    /// a single automaton field. Mirrors [`Self::emit_field_store`]'s
+    /// dispatch on `FieldLocation`. Returns the SSA value name
+    /// holding the loaded value.
+    fn emit_field_load(
+        &mut self,
+        automaton: &str,
+        struct_name: &str,
+        loc: &FieldLocation,
+        ir_ty: &str,
+    ) -> String {
+        match loc {
+            FieldLocation::Struct { idx } => {
+                let ptr = self.fresh_value();
+                writeln!(
+                    &mut self.out,
+                    "  {ptr} = getelementptr {struct_name}, {struct_name}* @{automaton}.state, i32 0, i32 {idx}",
+                )
+                .ok();
+                let val = self.fresh_value();
+                writeln!(&mut self.out, "  {val} = load {ir_ty}, {ir_ty}* {ptr}").ok();
+                val
+            }
+            FieldLocation::RegisterBlock { absolute_address } => {
+                let val = self.fresh_value();
+                writeln!(
+                    &mut self.out,
+                    "  {val} = load volatile {ir_ty}, {ir_ty}* inttoptr (i64 {abs} to {ir_ty}*)",
+                    abs = absolute_address,
+                )
+                .ok();
+                val
+            }
+        }
+    }
+
+    /// Slice 3+: lower `Auto.field <op>= expr;` sugar.
     fn emit_mutate_short(
         &mut self,
         automaton: &str,
@@ -801,78 +929,66 @@ impl<'a> Emitter<'a> {
         op: AssignOp,
         value: &Expr,
     ) -> Result<(), CodegenError> {
-        let (struct_name, idx, ir_ty, is_register_block) = {
+        let (struct_name, loc, ir_ty, is_register_block) = {
             let info = self.automatons.get(automaton).ok_or_else(|| {
                 CodegenError::UnresolvedName {
                     name: automaton.to_owned(),
                 }
             })?;
-            let (idx, ir_ty) = info
+            let (idx, ir_ty, offset) = info
                 .fields
                 .iter()
                 .enumerate()
-                .find_map(|(i, (n, t))| if n == field { Some((i, t.clone())) } else { None })
+                .find_map(|(i, (n, t, off))| {
+                    if n == field {
+                        Some((i, t.clone(), *off))
+                    } else {
+                        None
+                    }
+                })
                 .ok_or_else(|| CodegenError::UnresolvedName {
                     name: format!("{automaton}.{field}"),
                 })?;
+            let loc = if info.is_register_block {
+                FieldLocation::RegisterBlock {
+                    absolute_address: info.base_address + offset.unwrap_or(0),
+                }
+            } else {
+                FieldLocation::Struct { idx }
+            };
             (
                 format!("%struct.{automaton}"),
-                idx,
+                loc,
                 ir_ty,
                 info.is_register_block,
             )
         };
-        if is_register_block {
-            return Err(CodegenError::NotYetImplemented {
-                what: "mutation-sugar on register-block field (volatile-store is slice 4)",
-            });
-        }
 
         let new_value = self.emit_expr(value)?;
-        let ptr = self.fresh_value();
-        writeln!(
-            &mut self.out,
-            "  {ptr} = getelementptr {struct_name}, {struct_name}* @{automaton}.state, i32 0, i32 {idx}",
-            struct_name = struct_name,
-            automaton = automaton,
-            idx = idx,
-        )
-        .ok();
 
         // For `=`, emit a plain store. For `<op>=`, load the current
         // value, apply the op, store the result.
         let final_value = if matches!(op, AssignOp::Eq) {
             new_value
         } else {
-            let cur = self.fresh_value();
-            writeln!(
-                &mut self.out,
-                "  {cur} = load {ir_ty}, {ir_ty}* {ptr}",
-                ir_ty = ir_ty,
-                ptr = ptr,
-            )
-            .ok();
+            let cur = self.emit_field_load(automaton, &struct_name, &loc, &ir_ty);
             let opcode = compound_assign_opcode(op, &ir_ty);
             let combined = self.fresh_value();
             writeln!(
                 &mut self.out,
                 "  {combined} = {opcode} {ir_ty} {cur}, {new_value}",
-                opcode = opcode,
-                ir_ty = ir_ty,
-                cur = cur,
-                new_value = new_value,
             )
             .ok();
             combined
         };
-        writeln!(
-            &mut self.out,
-            "  store {ir_ty} {final_value}, {ir_ty}* {ptr}",
-            ir_ty = ir_ty,
-            final_value = final_value,
-            ptr = ptr,
-        )
-        .ok();
+        self.emit_field_store(
+            automaton,
+            &struct_name,
+            &loc,
+            &ir_ty,
+            &final_value,
+            is_register_block,
+        );
         Ok(())
     }
 
@@ -896,43 +1012,53 @@ impl<'a> Emitter<'a> {
             arg_strs.push(format!("{ty} {v}"));
         }
 
-        // Decide the call symbol: if the proc resolves as a transition
-        // of the *current* enclosing owner, namespace it. Otherwise
-        // emit the bare name (effect / interrupt — both use their
-        // source name as the linker symbol).
+        // Decide the call symbol via two-step resolution:
         //
-        // Slice-3 simplification: we don't yet round-trip through
-        // `Resolution::BindingRef::Proc { ctx, … }` to pick effect-
-        // vs-transition shape. Heuristic: if `enclosing_owner` is set
-        // AND the name matches one of that automaton's transitions,
-        // emit `<owner>_<name>`. Otherwise emit `<name>`. This is
-        // correct for the canonical case of a transition calling
-        // another transition of the same automaton, and for any
-        // effect/interrupt call site.
-        let mangled = match self.enclosing_owner.as_deref() {
-            Some(owner) => {
-                let owns_transition = self
-                    .resolution
-                    .lookup(stmt.span)
-                    .and_then(|b| match b {
-                        clifford_resolve::BindingRef::Proc { name: callee_name, ctx, .. } => {
-                            if matches!(ctx, clifford_resolve::CallContext::Transition) {
-                                Some(callee_name.clone())
-                            } else {
-                                None
-                            }
-                        }
-                        _ => None,
-                    })
-                    .map(|callee| callee == name)
-                    .unwrap_or(false);
-                if owns_transition {
-                    format!("{owner}_{name}")
-                } else {
-                    name.to_owned()
-                }
+        // 1. Consult `Resolution::lookup` on the proc-call's statement
+        //    span. The resolver tags every `#> name(args)` with a
+        //    `BindingRef::Proc { ctx, … }` where `ctx` is one of:
+        //    - `CallContext::Identity` — callee is a top-level
+        //      `#effect` / `#interrupt`. Linker symbol = source name.
+        //    - `CallContext::Transition` — callee is a `#transition`.
+        //      Linker symbol = `<Owner>_<name>`.
+        //    - `CallContext::Generic` — interface-method call (slice 5+).
+        // 2. For a transition call, the owner is either:
+        //    - The enclosing transition's owner (`enclosing_owner`)
+        //      when one transition calls a sibling.
+        //    - Otherwise: the registry's `transition_owners` map,
+        //      which records the owner of every transition declared
+        //      anywhere in the program. This handles the cross-
+        //      callable case (an effect / interrupt dispatching a
+        //      transition by name).
+        let is_transition_call = self
+            .resolution
+            .lookup(stmt.span)
+            .map(|b| {
+                matches!(
+                    b,
+                    clifford_resolve::BindingRef::Proc {
+                        ctx: clifford_resolve::CallContext::Transition,
+                        ..
+                    }
+                )
+            })
+            .unwrap_or(false);
+        let mangled = if is_transition_call {
+            let owner = self
+                .enclosing_owner
+                .as_deref()
+                .map(str::to_owned)
+                .or_else(|| self.transition_owners.get(name).cloned())
+                .unwrap_or_default();
+            if owner.is_empty() {
+                // No owner found — emit bare name as a defensive
+                // fallback. Should not happen in well-formed programs.
+                name.to_owned()
+            } else {
+                format!("{owner}_{name}")
             }
-            None => name.to_owned(),
+        } else {
+            name.to_owned()
         };
 
         // Slice 3 emits the call as `void` return type — effects'
@@ -1015,51 +1141,80 @@ impl<'a> Emitter<'a> {
             }
             _ => {
                 return Err(CodegenError::NotYetImplemented {
-                    what: "non-path receiver in FieldAccess (slice 3 supports Auto.field / Self.field)",
+                    what: "non-path receiver in FieldAccess (slice 3+ supports Auto.field / Self.field)",
                 });
             }
         };
 
-        let (struct_name, idx, ir_ty) = {
+        // Slice 4 split: register-block field reads use volatile
+        // load at `inttoptr (i64 base+offset to T*)`; non-register-
+        // block reads use the slice-3 GEP+load shape.
+        let (is_register_block, abs_addr_or_idx, ir_ty) = {
             let info = self.automatons.get(&auto_name).ok_or_else(|| {
                 CodegenError::UnresolvedName {
                     name: auto_name.clone(),
                 }
             })?;
-            if info.is_register_block {
-                return Err(CodegenError::NotYetImplemented {
-                    what: "field read on register-block automaton (volatile-load is slice 4)",
-                });
-            }
-            let (idx, ir_ty) = info
+            let (idx, ir_ty, offset) = info
                 .fields
                 .iter()
                 .enumerate()
-                .find_map(|(i, (n, t))| if n == field { Some((i, t.clone())) } else { None })
+                .find_map(|(i, (n, t, off))| {
+                    if n == field {
+                        Some((i, t.clone(), *off))
+                    } else {
+                        None
+                    }
+                })
                 .ok_or_else(|| CodegenError::UnresolvedName {
                     name: format!("{auto_name}.{field}"),
                 })?;
-            (format!("%struct.{auto_name}"), idx, ir_ty)
+            if info.is_register_block {
+                let abs = info.base_address + offset.unwrap_or(0);
+                (true, abs, ir_ty)
+            } else {
+                (false, idx as u64, ir_ty)
+            }
         };
 
-        let ptr = self.fresh_value();
-        writeln!(
-            &mut self.out,
-            "  {ptr} = getelementptr {struct_name}, {struct_name}* @{auto_name}.state, i32 0, i32 {idx}",
-            struct_name = struct_name,
-            auto_name = auto_name,
-            idx = idx,
-        )
-        .ok();
-        let val = self.fresh_value();
-        writeln!(
-            &mut self.out,
-            "  {val} = load {ir_ty}, {ir_ty}* {ptr}",
-            ir_ty = ir_ty,
-            ptr = ptr,
-        )
-        .ok();
-        Ok(val)
+        if is_register_block {
+            // Register-block field read — volatile load at the
+            // computed absolute MMIO address. Decision #6's per-
+            // operation atomicity contract holds at the LLVM level
+            // because volatile loads of word-sized integers are
+            // single-instruction on every supported target.
+            let val = self.fresh_value();
+            writeln!(
+                &mut self.out,
+                "  {val} = load volatile {ir_ty}, {ir_ty}* inttoptr (i64 {abs} to {ir_ty}*)",
+                ir_ty = ir_ty,
+                abs = abs_addr_or_idx,
+            )
+            .ok();
+            Ok(val)
+        } else {
+            // Non-register-block — slice-3 GEP+load.
+            let struct_name = format!("%struct.{auto_name}");
+            let idx = abs_addr_or_idx as usize;
+            let ptr = self.fresh_value();
+            writeln!(
+                &mut self.out,
+                "  {ptr} = getelementptr {struct_name}, {struct_name}* @{auto_name}.state, i32 0, i32 {idx}",
+                struct_name = struct_name,
+                auto_name = auto_name,
+                idx = idx,
+            )
+            .ok();
+            let val = self.fresh_value();
+            writeln!(
+                &mut self.out,
+                "  {val} = load {ir_ty}, {ir_ty}* {ptr}",
+                ir_ty = ir_ty,
+                ptr = ptr,
+            )
+            .ok();
+            Ok(val)
+        }
     }
 
     /// Emit an SSA-binding identity instruction so a value gets a
@@ -1426,6 +1581,41 @@ const fn primitive_ir_type(p: PrimitiveType) -> &'static str {
         PrimitiveType::Usize | PrimitiveType::Isize => "i64",
         PrimitiveType::F32 => "float",
         PrimitiveType::F64 => "double",
+    }
+}
+
+/// Where an automaton field lives. Slice 3 introduced the
+/// distinction implicitly; slice 4 makes it explicit so register-
+/// block fields lower through volatile loads/stores at fixed
+/// addresses (per Decision #6) and non-register-block fields lower
+/// through `getelementptr` against the global state struct.
+#[derive(Debug, Clone, Copy)]
+enum FieldLocation {
+    /// Non-register-block field — index into the
+    /// `%struct.<Auto>` layout. `getelementptr` against
+    /// `@<Auto>.state` with this index recovers the field's
+    /// pointer.
+    Struct { idx: usize },
+    /// Register-block field — fixed MMIO address. The full
+    /// address is `automaton.base_address + field.offset`,
+    /// pre-summed at registry-build time (slice 4). The IR
+    /// emits `inttoptr (i64 <abs> to <T>*)` and uses volatile
+    /// loads/stores for atomicity per Decision #6.
+    RegisterBlock { absolute_address: u64 },
+}
+
+/// Parse a hex-form address literal (`"0x4000_0000"` /
+/// `"0xFF"` etc., possibly with `_` separators) to a `u64` value.
+/// Decimal literals are also accepted as a defensive convenience.
+/// Returns `None` if the literal is malformed.
+fn parse_address_literal(s: &str) -> Option<u64> {
+    let trimmed: String = s.chars().filter(|c| *c != '_').collect();
+    if let Some(body) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+        u64::from_str_radix(body, 16).ok()
+    } else if let Some(body) = trimmed.strip_prefix("0b").or_else(|| trimmed.strip_prefix("0B")) {
+        u64::from_str_radix(body, 2).ok()
+    } else {
+        trimmed.parse::<u64>().ok()
     }
 }
 
@@ -2479,18 +2669,256 @@ mod tests {
     }
 
     #[test]
-    fn s3_register_block_field_access_emits_e0810() {
+    fn s3_register_block_field_access_now_supported_per_slice_4() {
+        // Renamed from `..._emits_e0810`. Slice 3 surfaced register-
+        // block field access as `NotYetImplemented`; slice 4 lowers
+        // it to a volatile load at the absolute MMIO address.
         let src = "\
             #automaton Mmio { #address: 0x4000_0000; ctl: u32 #offset: 0x00; }\n\
             #effect r() #mutates: [Mmio] { let _x: u32 = Mmio.ctl; return; }\n\
         ";
-        let errors = lower_str(src).expect_err("expected E0810 for register-block read");
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            CodegenError::NotYetImplemented { what }
-                if what.contains("register-block")
-        ));
-        assert!(saw, "expected NotYetImplemented(register-block); got {errors:?}");
+        let ir = lower_str(src).expect("slice 4 lowers register-block reads");
+        // 0x40000000 = 1073741824
+        assert!(
+            ir.contains("load volatile i32, i32* inttoptr (i64 1073741824 to i32*)"),
+            "expected volatile load at MMIO address; got:\n{ir}"
+        );
+    }
+
+    // ─── Slice 4: register-block volatile loads/stores ───────────────────
+
+    #[test]
+    fn s4_register_block_field_read_volatile_load() {
+        // `Mmio.ctl` for `#automaton Mmio { #address: 0x4000_0000;
+        // ctl: u32 #offset: 0x00; }` → volatile load at 0x40000000.
+        let src = "\
+            #automaton Mmio { #address: 0x4000_0000; ctl: u32 #offset: 0x00; }\n\
+            #effect r() #mutates: [Mmio] { let _x: u32 = Mmio.ctl; return; }\n\
+        ";
+        let ir = lower_str(src).expect("lower mmio read");
+        assert!(
+            ir.contains("load volatile i32, i32* inttoptr (i64 1073741824 to i32*)"),
+            "expected volatile load at 0x40000000; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s4_register_block_field_write_volatile_store() {
+        let src = "\
+            #automaton Mmio { #address: 0x4000_0000; ctl: u32 #offset: 0x00; }\n\
+            #effect w() #mutates: [Mmio] { Mmio.ctl = 5u32; }\n\
+        ";
+        let ir = lower_str(src).expect("lower mmio write");
+        assert!(
+            ir.contains("store volatile i32 5, i32* inttoptr (i64 1073741824 to i32*)"),
+            "expected volatile store at 0x40000000; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s4_register_block_field_offset_added_to_base() {
+        // Field at offset 0x04 on a base of 0x4000_0000 → absolute
+        // 0x4000_0004 = 1073741828.
+        let src = "\
+            #automaton Mmio { #address: 0x4000_0000; status: u32 #offset: 0x04; }\n\
+            #effect r() #mutates: [Mmio] { let _s: u32 = Mmio.status; return; }\n\
+        ";
+        let ir = lower_str(src).expect("lower offset read");
+        assert!(
+            ir.contains("inttoptr (i64 1073741828 to i32*)"),
+            "expected base+offset address; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s4_register_block_no_state_struct_emitted() {
+        // Register-block automatons don't get a state struct or
+        // global; their fields live at MMIO addresses, not in
+        // process memory.
+        let src = "#automaton Mmio { #address: 0x4000_0000; ctl: u32 #offset: 0x00; }\n";
+        let ir = lower_str(src).expect("lower bare mmio");
+        assert!(
+            !ir.contains("%struct.Mmio"),
+            "register-block should skip state struct; got:\n{ir}"
+        );
+        assert!(
+            !ir.contains("@Mmio.state"),
+            "register-block should skip global; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s4_register_block_compound_assign() {
+        // `Mmio.ctl |= 0x01u32;` → volatile load + or + volatile
+        // store, all at the absolute MMIO address.
+        let src = "\
+            #automaton Mmio { #address: 0x4000_0000; ctl: u32 #offset: 0x00; }\n\
+            #effect set_bit() #mutates: [Mmio] { Mmio.ctl |= 1u32; }\n\
+        ";
+        let ir = lower_str(src).expect("lower compound mmio");
+        assert!(
+            ir.contains("load volatile i32, i32* inttoptr (i64 1073741824 to i32*)"),
+            "expected volatile load; got:\n{ir}"
+        );
+        assert!(ir.contains("or i32"), "expected or for |=; got:\n{ir}");
+        assert!(
+            ir.contains("store volatile i32"),
+            "expected volatile store; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s4_register_block_mutate_block_form() {
+        // `#mutate Mmio { ctl = 1u32, status = 2u32 };` — each
+        // field lowers to its own volatile store at its own address.
+        let src = "\
+            #automaton Mmio {\n  \
+              #address: 0x4000_0000;\n  \
+              ctl: u32 #offset: 0x00;\n  \
+              status: u32 #offset: 0x04;\n\
+            }\n\
+            #effect setup() #mutates: [Mmio] { #mutate Mmio { ctl = 1u32, status = 2u32 }; }\n\
+        ";
+        let ir = lower_str(src).expect("lower mutate-block mmio");
+        assert!(
+            ir.contains("store volatile i32 1, i32* inttoptr (i64 1073741824 to i32*)"),
+            "expected store at base; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("store volatile i32 2, i32* inttoptr (i64 1073741828 to i32*)"),
+            "expected store at base+4; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s4_register_block_transition() {
+        // Slice 3 punted on register-block transitions; slice 4
+        // lowers them. The transition's mutation goes through
+        // volatile store.
+        let src = "\
+            #automaton Mmio {\n  \
+              #address: 0x4000_0000;\n  \
+              ctl: u32 #offset: 0x00;\n  \
+              #transition init { Mmio.ctl = 7u32; }\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower register-block transition");
+        assert!(
+            ir.contains("define void @Mmio_init()"),
+            "expected namespaced transition fn; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("store volatile i32 7, i32* inttoptr (i64 1073741824 to i32*)"),
+            "expected volatile store inside transition; got:\n{ir}"
+        );
+    }
+
+    // ─── Slice 4: interrupt section attribute ────────────────────────────
+
+    #[test]
+    fn s4_interrupt_has_section_interrupts() {
+        let src = "\
+            #automaton T { c: u32; }\n\
+            #interrupt SysTick() #mutates: [T] #priority: HIGH { return; }\n\
+        ";
+        let ir = lower_str(src).expect("lower interrupt");
+        assert!(
+            ir.contains("define void @SysTick() section \".interrupts\" {"),
+            "expected `section \".interrupts\"` on interrupt; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s4_effect_does_not_get_section_attribute() {
+        // Effects (non-interrupts) should NOT carry the
+        // `.interrupts` section.
+        let src = "\
+            #automaton T { c: u32; }\n\
+            #effect tick() #mutates: [T] { return; }\n\
+        ";
+        let ir = lower_str(src).expect("lower effect");
+        assert!(
+            !ir.contains("section \".interrupts\""),
+            "effect should not have interrupts section; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s4_interrupt_with_acquire_fence_combines_correctly() {
+        // Interrupt with both section attribute AND fence (Decision
+        // #22 combination). Both must coexist on the `define` line +
+        // body.
+        let src = "\
+            #automaton T { c: u32; }\n\
+            #interrupt UART1_IRQ() #mutates: [T] #priority: HIGH $ [Acquire] { return; }\n\
+        ";
+        let ir = lower_str(src).expect("lower interrupt+acquire");
+        assert!(
+            ir.contains("define void @UART1_IRQ() section \".interrupts\" {"),
+            "expected section attribute; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("entry:\n  fence acquire\n"),
+            "expected acquire fence in body; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s4_full_mmio_program_lowers_cleanly() {
+        // End-to-end smoke: register-block automaton + transition +
+        // interrupt that mutates the register block. All the slice-4
+        // pieces in one canonical program.
+        let src = "\
+            #automaton Uart {\n  \
+              #address: 0x4000_4000;\n  \
+              tx_data: u32 #offset: 0x00;\n  \
+              status: u32 #offset: 0x18;\n  \
+              #transition send { Uart.tx_data = 65u32; }\n\
+            }\n\
+            #interrupt USART1_IRQ() #mutates: [Uart] #priority: HIGH { #> send(); }\n\
+        ";
+        let ir = lower_str(src).expect("lower full mmio program");
+        for needle in [
+            // No state struct / global for the register-block.
+            // (Explicitly check absence below; for `for needle`-loop
+            // we just collect positives.)
+            "define void @Uart_send()",
+            "store volatile i32 65, i32* inttoptr (i64 1073758208 to i32*)",
+            "define void @USART1_IRQ() section \".interrupts\" {",
+            "call void @Uart_send()",
+        ] {
+            assert!(ir.contains(needle), "missing `{needle}` in IR; got:\n{ir}");
+        }
+        assert!(
+            !ir.contains("%struct.Uart"),
+            "register-block should not emit state struct; got:\n{ir}"
+        );
+    }
+
+    // ─── Slice 4: parse_address_literal helper ───────────────────────────
+
+    #[test]
+    fn s4_parse_address_literal_hex() {
+        assert_eq!(parse_address_literal("0x4000_0000"), Some(0x4000_0000));
+        assert_eq!(parse_address_literal("0xFF"), Some(255));
+        assert_eq!(parse_address_literal("0X1A"), Some(26)); // uppercase prefix
+    }
+
+    #[test]
+    fn s4_parse_address_literal_decimal() {
+        assert_eq!(parse_address_literal("42"), Some(42));
+        assert_eq!(parse_address_literal("1_000"), Some(1000));
+    }
+
+    #[test]
+    fn s4_parse_address_literal_binary() {
+        assert_eq!(parse_address_literal("0b1010"), Some(10));
+    }
+
+    #[test]
+    fn s4_parse_address_literal_malformed_returns_none() {
+        assert_eq!(parse_address_literal("0xZZ"), None);
+        assert_eq!(parse_address_literal("not_a_number"), None);
     }
 
     // ─── Decision #22 codegen: memory-ordering fences ────────────────────
