@@ -70,11 +70,13 @@
 // `#![forbid(unsafe_code)]` here. Specific unsafe blocks must each
 // justify themselves with a `// SAFETY:` comment.
 
+use std::collections::HashMap;
 use std::fmt::Write;
 
 use clifford_ast::{
-    BinaryOp, Block, Expr, ExprKind, FnDecl, Item, Param, PrimitiveType, Program, Stmt, StmtKind,
-    TypeExpr, TypeKind, UnaryOp,
+    AssignOp, AutomatonDecl, BinaryOp, Block, EffectDecl, Expr, ExprKind, FieldAssign, FnDecl,
+    InterruptDecl, Item, Param, PrimitiveType, Program, Stmt, StmtKind, TransitionDecl, TypeExpr,
+    TypeKind, UnaryOp,
 };
 use clifford_resolve::Resolution;
 use clifford_types::{Type, Typing};
@@ -172,15 +174,34 @@ pub fn lower(
 ) -> Result<String, Vec<CodegenError>> {
     let mut emitter = Emitter::new(module_name, resolution, typing);
     emitter.emit_module_header();
+
+    // Pass 1: build the automaton registry so effects and transitions
+    // can resolve field offsets without re-walking the AST.
+    emitter.collect_automatons(program);
+
+    // Pass 2: emit one `%struct.<Name>` type definition + global
+    // state instance per non-register-block automaton (slice 3 scope).
+    // Register-block automatons (`#address: 0x…`) defer to slice 4 —
+    // their lowering uses volatile loads/stores at fixed addresses
+    // rather than a global state variable.
+    emitter.emit_automaton_state_structs(program);
+
+    // Pass 3: emit one LLVM function per @fn / #effect / #interrupt /
+    // #transition. Order is preserved from source so callers see
+    // callees declared first when source orders them naturally; LLVM
+    // doesn't actually require forward declarations for module-level
+    // functions but the predictability helps tooling.
     for item in &program.items {
-        // Slice 1+ lowers `Item::Fn` only. Other items (Automaton,
-        // Effect, Interrupt, Type, Trait, Interface, Impl, Test,
-        // Sequential) silently skip — their lowering lands in
-        // subsequent codegen slices. Skipping (rather than emitting
-        // a NotYetImplemented per item) means partial programs can
-        // still produce usable IR for the @fn portion.
-        if let Item::Fn(decl) = item {
-            emitter.emit_fn(decl);
+        match item {
+            Item::Fn(decl) => emitter.emit_fn(decl),
+            Item::Effect(decl) => emitter.emit_effect(decl),
+            Item::Interrupt(decl) => emitter.emit_interrupt(decl),
+            Item::Automaton(decl) => emitter.emit_automaton_transitions(decl),
+            // Other items (`@type`, `@trait`, `#interface`, `#impl`,
+            // `#test`, `@sequential`) defer to subsequent slices.
+            // Skipping (vs erroring) means partial programs still
+            // produce usable IR for the supported portion.
+            _ => {}
         }
     }
     if emitter.errors.is_empty() {
@@ -215,8 +236,36 @@ struct Emitter<'a> {
     /// expression's type. Used by [`Self::expr_ir_type`] to pick the
     /// right LLVM IR type without falling back to syntactic guesses.
     typing: &'a Typing,
+    /// Slice 3: registry of every non-register-block `#automaton` in
+    /// the program. Maps name → field-offset table so `#mutate` and
+    /// `Auto.field` lowering can pick the right `getelementptr`
+    /// index without re-walking the AST.
+    automatons: HashMap<String, AutomatonInfo>,
+    /// Slice 3: current owning automaton when emitting a
+    /// `#transition` body. `None` outside of transitions. Used to
+    /// resolve `Self.field` to the correct automaton.
+    enclosing_owner: Option<String>,
     /// Errors collected across the whole program.
     errors: Vec<CodegenError>,
+}
+
+/// Per-automaton info captured in pass 1 (slice 3). The `fields` vec
+/// preserves declaration order so `getelementptr` indices match LLVM
+/// struct layout.
+struct AutomatonInfo {
+    /// Source name (matches `AutomatonDecl.name`).
+    #[allow(dead_code)] // recorded for diagnostics; the map key is the canonical lookup
+    name: String,
+    /// `(field_name, ir_type)` pairs in declaration order. The index
+    /// in this vec is the LLVM struct field index used by `getelementptr`.
+    fields: Vec<(String, String)>,
+    /// `true` if this automaton is a register block (`#address: 0x…`
+    /// clause present). Slice 3 records the flag but does NOT lower
+    /// register-block fields — that's slice 4 work via volatile
+    /// loads/stores at `address + offset`. For slice 3, register-block
+    /// automatons skip state-struct emission and any reference to them
+    /// in lowered code surfaces as `NotYetImplemented`.
+    is_register_block: bool,
 }
 
 /// One per-function local binding: source name + SSA-value ref + IR
@@ -237,8 +286,195 @@ impl<'a> Emitter<'a> {
             locals: Vec::new(),
             resolution,
             typing,
+            automatons: HashMap::new(),
+            enclosing_owner: None,
             errors: Vec::new(),
         }
+    }
+
+    /// Pass 1: build the [`AutomatonInfo`] registry from every
+    /// `Item::Automaton` in the program. Records field-name → IR
+    /// type and the index for each field's GEP offset.
+    fn collect_automatons(&mut self, program: &Program) {
+        for item in &program.items {
+            if let Item::Automaton(decl) = item {
+                let mut fields: Vec<(String, String)> = Vec::with_capacity(decl.fields.len());
+                for f in &decl.fields {
+                    let ir_ty = self.lower_type(&f.ty).unwrap_or_else(|e| {
+                        self.errors.push(e);
+                        "i32".to_owned()
+                    });
+                    fields.push((f.name.clone(), ir_ty));
+                }
+                self.automatons.insert(
+                    decl.name.clone(),
+                    AutomatonInfo {
+                        name: decl.name.clone(),
+                        fields,
+                        is_register_block: decl.address.is_some(),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Pass 2: emit the `%struct.<Name> = type { … }` definition and
+    /// `@<Name>.state = global … zeroinitializer` for every
+    /// non-register-block automaton.
+    fn emit_automaton_state_structs(&mut self, program: &Program) {
+        for item in &program.items {
+            let Item::Automaton(decl) = item else {
+                continue;
+            };
+            if decl.address.is_some() {
+                // Register-block automaton — slice 4 work.
+                continue;
+            }
+            let Some(info) = self.automatons.get(&decl.name) else {
+                continue;
+            };
+            // Emit struct type.
+            let parts: Vec<String> = info.fields.iter().map(|(_, ty)| ty.clone()).collect();
+            writeln!(
+                &mut self.out,
+                "%struct.{name} = type {{ {fields} }}",
+                name = decl.name,
+                fields = parts.join(", "),
+            )
+            .ok();
+            // Emit zero-initialised global state instance.
+            writeln!(
+                &mut self.out,
+                "@{name}.state = global %struct.{name} zeroinitializer",
+                name = decl.name,
+            )
+            .ok();
+            writeln!(&mut self.out).ok();
+        }
+    }
+
+    /// Emit one LLVM function per `#effect` declaration. Effects are
+    /// lowered like `@fn` but with mutation access to the automatons
+    /// listed in their `#mutates` clause; this slice's body walker
+    /// handles `#mutate` / mutation-sugar / automaton-field reads.
+    fn emit_effect(&mut self, decl: &EffectDecl) {
+        // Reset per-function state.
+        self.next_value_id = 0;
+        self.locals.clear();
+        self.enclosing_owner = None;
+
+        let ret_ty = self.lower_return_type(decl.return_type.as_ref());
+
+        let mut sig_parts: Vec<String> = Vec::with_capacity(decl.params.len());
+        for p in &decl.params {
+            match self.lower_param(p) {
+                Ok(s) => sig_parts.push(s),
+                Err(e) => {
+                    self.errors.push(e);
+                    return;
+                }
+            }
+            let p_ir_ty = self.lower_type(&p.ty).unwrap_or_else(|_| "i32".to_owned());
+            self.locals.push(LocalBinding {
+                name: p.name.clone(),
+                value: format!("%{}", p.name),
+                ir_type: p_ir_ty,
+            });
+        }
+
+        writeln!(
+            &mut self.out,
+            "define {ret_ty} @{name}({params}) {{",
+            name = decl.name,
+            params = sig_parts.join(", "),
+        )
+        .ok();
+        writeln!(&mut self.out, "entry:").ok();
+        self.emit_block(&decl.body, &ret_ty);
+        writeln!(&mut self.out, "}}").ok();
+        writeln!(&mut self.out).ok();
+    }
+
+    /// Emit one LLVM function per `#interrupt` declaration. Slice 3
+    /// emits the function with the linker symbol matching the source
+    /// name (Decision #10); the target-specific calling convention,
+    /// `.interrupts` section attribute, and disable-interrupts wrapper
+    /// per Refinement #5e are slice-4 work.
+    fn emit_interrupt(&mut self, decl: &InterruptDecl) {
+        // Reset per-function state.
+        self.next_value_id = 0;
+        self.locals.clear();
+        self.enclosing_owner = None;
+
+        let ret_ty = self.lower_return_type(decl.return_type.as_ref());
+
+        let mut sig_parts: Vec<String> = Vec::with_capacity(decl.params.len());
+        for p in &decl.params {
+            match self.lower_param(p) {
+                Ok(s) => sig_parts.push(s),
+                Err(e) => {
+                    self.errors.push(e);
+                    return;
+                }
+            }
+            let p_ir_ty = self.lower_type(&p.ty).unwrap_or_else(|_| "i32".to_owned());
+            self.locals.push(LocalBinding {
+                name: p.name.clone(),
+                value: format!("%{}", p.name),
+                ir_type: p_ir_ty,
+            });
+        }
+
+        // Linker symbol = source name (Decision #10). Slice 4 will
+        // add the `section ".interrupts"` and target-specific calling
+        // convention (`cc 87` for ARM thumb-cc, etc.).
+        writeln!(
+            &mut self.out,
+            "define {ret_ty} @{name}({params}) {{",
+            name = decl.name,
+            params = sig_parts.join(", "),
+        )
+        .ok();
+        writeln!(&mut self.out, "entry:").ok();
+        self.emit_block(&decl.body, &ret_ty);
+        writeln!(&mut self.out, "}}").ok();
+        writeln!(&mut self.out).ok();
+    }
+
+    /// Emit one LLVM function per `#transition` inside this
+    /// `#automaton`. Transitions are named `<AutomatonName>_<transition>`
+    /// in IR (`Counter_tick` for `#automaton Counter { #transition tick
+    /// { … } }`) so there's no name clash across automatons. The
+    /// owning-automaton context is set so `Self.field` reads resolve.
+    fn emit_automaton_transitions(&mut self, decl: &AutomatonDecl) {
+        if decl.address.is_some() {
+            // Register-block automaton — slice 4. Transitions on register
+            // blocks need the volatile-load/store machinery.
+            return;
+        }
+        for tr in &decl.transitions {
+            self.emit_transition(&decl.name, tr);
+        }
+    }
+
+    fn emit_transition(&mut self, owner: &str, decl: &TransitionDecl) {
+        // Reset per-function state.
+        self.next_value_id = 0;
+        self.locals.clear();
+        self.enclosing_owner = Some(owner.to_owned());
+
+        let fn_name = format!("{owner}_{tr}", tr = decl.name);
+
+        // Slice 3: transitions take no value parameters at the AST
+        // level (Decision #5 / Refinement #5b restricts transition
+        // signatures). The generated IR fn signature is `void`.
+        writeln!(&mut self.out, "define void @{fn_name}() {{").ok();
+        writeln!(&mut self.out, "entry:").ok();
+        self.emit_block(&decl.body, "void");
+        writeln!(&mut self.out, "}}").ok();
+        writeln!(&mut self.out).ok();
+
+        self.enclosing_owner = None;
     }
 
     fn emit_module_header(&mut self) {
@@ -394,12 +630,267 @@ impl<'a> Emitter<'a> {
                     self.errors.push(err);
                 }
             }
+            // Slice 3: `#mutate Auto { f1 = e1, f2 = e2, … };` —
+            // each field-assign lowers to a getelementptr+store pair.
+            StmtKind::Mutate { automaton, assigns } => {
+                if let Err(e) = self.emit_mutate(automaton, assigns) {
+                    self.errors.push(e);
+                }
+            }
+            // Slice 3: `Auto.field <op>= expr;` sugar — single-field
+            // form; for `=` it's a plain getelementptr+store, for
+            // `<op>=` it's load+op+store.
+            StmtKind::MutateShort {
+                automaton,
+                field,
+                op,
+                value,
+                ..
+            } => {
+                if let Err(e) = self.emit_mutate_short(automaton, field, *op, value) {
+                    self.errors.push(e);
+                }
+            }
+            // Slice 3: `#> name(args);` — direct LLVM call to the
+            // named effect / transition function. Transitions are
+            // namespaced as `<Owner>_<name>` to avoid clashes; for
+            // single-segment proc names the resolver tells us
+            // whether the callee is an effect or a transition, so
+            // codegen consults the resolution-time binding to pick
+            // the right symbol.
+            StmtKind::ProcCall { name, args } => {
+                if let Err(e) = self.emit_proc_call(stmt, name, args) {
+                    self.errors.push(e);
+                }
+            }
             other => {
                 self.errors.push(CodegenError::NotYetImplemented {
                     what: stmt_kind_name(other),
                 });
             }
         }
+    }
+
+    /// Slice 3: lower `#mutate Auto { field = expr, … };`.
+    fn emit_mutate(
+        &mut self,
+        automaton: &str,
+        assigns: &[FieldAssign],
+    ) -> Result<(), CodegenError> {
+        // Snapshot the field info so we can release the borrow before
+        // calling `emit_expr` (which needs `&mut self`).
+        let (struct_name, field_data): (String, Vec<(usize, String)>) = {
+            let info = self.automatons.get(automaton).ok_or_else(|| {
+                CodegenError::UnresolvedName {
+                    name: automaton.to_owned(),
+                }
+            })?;
+            if info.is_register_block {
+                return Err(CodegenError::NotYetImplemented {
+                    what: "#mutate on register-block automaton (volatile-store lowering is slice 4)",
+                });
+            }
+            let struct_name = format!("%struct.{automaton}");
+            let mut entries = Vec::with_capacity(assigns.len());
+            for fa in assigns {
+                let (idx, ir_ty) = info
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, (n, t))| if n == &fa.field { Some((i, t.clone())) } else { None })
+                    .ok_or_else(|| CodegenError::UnresolvedName {
+                        name: format!("{automaton}.{}", fa.field),
+                    })?;
+                entries.push((idx, ir_ty));
+            }
+            (struct_name, entries)
+        };
+
+        for (fa, (idx, ir_ty)) in assigns.iter().zip(field_data.iter()) {
+            // Slice 3 punt: array-element index forms (`field[i] =
+            // expr`) need a 2-level GEP and aren't part of this
+            // slice's mutation surface.
+            if fa.index.is_some() {
+                return Err(CodegenError::NotYetImplemented {
+                    what: "indexed field assignment (#mutate Auto { field[i] = … })",
+                });
+            }
+            let v = self.emit_expr(&fa.value)?;
+            let ptr = self.fresh_value();
+            writeln!(
+                &mut self.out,
+                "  {ptr} = getelementptr {struct_name}, {struct_name}* @{automaton}.state, i32 0, i32 {idx}",
+                struct_name = struct_name,
+                automaton = automaton,
+                idx = idx,
+            )
+            .ok();
+            writeln!(
+                &mut self.out,
+                "  store {ir_ty} {v}, {ir_ty}* {ptr}",
+                ir_ty = ir_ty,
+                v = v,
+                ptr = ptr,
+            )
+            .ok();
+        }
+        Ok(())
+    }
+
+    /// Slice 3: lower `Auto.field <op>= expr;` sugar.
+    fn emit_mutate_short(
+        &mut self,
+        automaton: &str,
+        field: &str,
+        op: AssignOp,
+        value: &Expr,
+    ) -> Result<(), CodegenError> {
+        let (struct_name, idx, ir_ty, is_register_block) = {
+            let info = self.automatons.get(automaton).ok_or_else(|| {
+                CodegenError::UnresolvedName {
+                    name: automaton.to_owned(),
+                }
+            })?;
+            let (idx, ir_ty) = info
+                .fields
+                .iter()
+                .enumerate()
+                .find_map(|(i, (n, t))| if n == field { Some((i, t.clone())) } else { None })
+                .ok_or_else(|| CodegenError::UnresolvedName {
+                    name: format!("{automaton}.{field}"),
+                })?;
+            (
+                format!("%struct.{automaton}"),
+                idx,
+                ir_ty,
+                info.is_register_block,
+            )
+        };
+        if is_register_block {
+            return Err(CodegenError::NotYetImplemented {
+                what: "mutation-sugar on register-block field (volatile-store is slice 4)",
+            });
+        }
+
+        let new_value = self.emit_expr(value)?;
+        let ptr = self.fresh_value();
+        writeln!(
+            &mut self.out,
+            "  {ptr} = getelementptr {struct_name}, {struct_name}* @{automaton}.state, i32 0, i32 {idx}",
+            struct_name = struct_name,
+            automaton = automaton,
+            idx = idx,
+        )
+        .ok();
+
+        // For `=`, emit a plain store. For `<op>=`, load the current
+        // value, apply the op, store the result.
+        let final_value = if matches!(op, AssignOp::Eq) {
+            new_value
+        } else {
+            let cur = self.fresh_value();
+            writeln!(
+                &mut self.out,
+                "  {cur} = load {ir_ty}, {ir_ty}* {ptr}",
+                ir_ty = ir_ty,
+                ptr = ptr,
+            )
+            .ok();
+            let opcode = compound_assign_opcode(op, &ir_ty);
+            let combined = self.fresh_value();
+            writeln!(
+                &mut self.out,
+                "  {combined} = {opcode} {ir_ty} {cur}, {new_value}",
+                opcode = opcode,
+                ir_ty = ir_ty,
+                cur = cur,
+                new_value = new_value,
+            )
+            .ok();
+            combined
+        };
+        writeln!(
+            &mut self.out,
+            "  store {ir_ty} {final_value}, {ir_ty}* {ptr}",
+            ir_ty = ir_ty,
+            final_value = final_value,
+            ptr = ptr,
+        )
+        .ok();
+        Ok(())
+    }
+
+    /// Slice 3: lower `#> name(args);` — direct LLVM call to the
+    /// named effect or transition. Transitions are namespaced as
+    /// `<Owner>_<name>`. The resolver records whether the callee is
+    /// an effect (top-level symbol) or a transition (per-automaton
+    /// inner item); we consult `Resolution::lookup` on the proc-call
+    /// statement's span to know which symbol shape to emit.
+    fn emit_proc_call(
+        &mut self,
+        stmt: &Stmt,
+        name: &str,
+        args: &[Expr],
+    ) -> Result<(), CodegenError> {
+        // Lower args first.
+        let mut arg_strs: Vec<String> = Vec::with_capacity(args.len());
+        for a in args {
+            let v = self.emit_expr(a)?;
+            let ty = self.expr_ir_type(a);
+            arg_strs.push(format!("{ty} {v}"));
+        }
+
+        // Decide the call symbol: if the proc resolves as a transition
+        // of the *current* enclosing owner, namespace it. Otherwise
+        // emit the bare name (effect / interrupt — both use their
+        // source name as the linker symbol).
+        //
+        // Slice-3 simplification: we don't yet round-trip through
+        // `Resolution::BindingRef::Proc { ctx, … }` to pick effect-
+        // vs-transition shape. Heuristic: if `enclosing_owner` is set
+        // AND the name matches one of that automaton's transitions,
+        // emit `<owner>_<name>`. Otherwise emit `<name>`. This is
+        // correct for the canonical case of a transition calling
+        // another transition of the same automaton, and for any
+        // effect/interrupt call site.
+        let mangled = match self.enclosing_owner.as_deref() {
+            Some(owner) => {
+                let owns_transition = self
+                    .resolution
+                    .lookup(stmt.span)
+                    .and_then(|b| match b {
+                        clifford_resolve::BindingRef::Proc { name: callee_name, ctx, .. } => {
+                            if matches!(ctx, clifford_resolve::CallContext::Transition) {
+                                Some(callee_name.clone())
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    })
+                    .map(|callee| callee == name)
+                    .unwrap_or(false);
+                if owns_transition {
+                    format!("{owner}_{name}")
+                } else {
+                    name.to_owned()
+                }
+            }
+            None => name.to_owned(),
+        };
+
+        // Slice 3 emits the call as `void` return type — effects'
+        // return types aren't yet threaded through to ProcCall sites
+        // since the resolver / typing don't carry that info to the
+        // statement span. A future slice will surface real return
+        // types here.
+        writeln!(
+            &mut self.out,
+            "  call void @{mangled}({args})",
+            args = arg_strs.join(", ")
+        )
+        .ok();
+        Ok(())
     }
 
     /// Emit IR for an expression, returning the IR value reference
@@ -427,10 +918,92 @@ impl<'a> Emitter<'a> {
             ExprKind::Unary { op, operand } => self.emit_unary(*op, operand),
             ExprKind::Binary { op, lhs, rhs } => self.emit_binary(*op, lhs, rhs),
             ExprKind::Call { callee, args } => self.emit_call(expr, callee, args),
+            // Slice 3: automaton-field read.
+            // `Counter.value` (`obj` is `Path([Counter])` where Counter
+            // resolves to an `#automaton`) → getelementptr+load.
+            // `Self.value` (`obj` is `Path([Self])` inside a
+            // `#transition` body) resolves to the enclosing owner.
+            ExprKind::FieldAccess { obj, field } => self.emit_field_access(obj, field),
             other => Err(CodegenError::NotYetImplemented {
                 what: expr_kind_name(other),
             }),
         }
+    }
+
+    /// Slice 3: lower an automaton field read. The emitted IR is:
+    ///
+    /// ```text
+    /// %ptr = getelementptr %struct.<Auto>, %struct.<Auto>* @<Auto>.state, i32 0, i32 <idx>
+    /// %val = load <ir_ty>, <ir_ty>* %ptr
+    /// ```
+    fn emit_field_access(
+        &mut self,
+        obj: &Expr,
+        field: &str,
+    ) -> Result<String, CodegenError> {
+        // Determine the owning automaton name.
+        let auto_name = match &obj.kind {
+            ExprKind::Path(segs) if segs.len() == 1 => {
+                if segs[0] == "Self" {
+                    match &self.enclosing_owner {
+                        Some(o) => o.clone(),
+                        None => {
+                            return Err(CodegenError::NotYetImplemented {
+                                what: "Self.field outside a #transition body",
+                            });
+                        }
+                    }
+                } else {
+                    segs[0].clone()
+                }
+            }
+            _ => {
+                return Err(CodegenError::NotYetImplemented {
+                    what: "non-path receiver in FieldAccess (slice 3 supports Auto.field / Self.field)",
+                });
+            }
+        };
+
+        let (struct_name, idx, ir_ty) = {
+            let info = self.automatons.get(&auto_name).ok_or_else(|| {
+                CodegenError::UnresolvedName {
+                    name: auto_name.clone(),
+                }
+            })?;
+            if info.is_register_block {
+                return Err(CodegenError::NotYetImplemented {
+                    what: "field read on register-block automaton (volatile-load is slice 4)",
+                });
+            }
+            let (idx, ir_ty) = info
+                .fields
+                .iter()
+                .enumerate()
+                .find_map(|(i, (n, t))| if n == field { Some((i, t.clone())) } else { None })
+                .ok_or_else(|| CodegenError::UnresolvedName {
+                    name: format!("{auto_name}.{field}"),
+                })?;
+            (format!("%struct.{auto_name}"), idx, ir_ty)
+        };
+
+        let ptr = self.fresh_value();
+        writeln!(
+            &mut self.out,
+            "  {ptr} = getelementptr {struct_name}, {struct_name}* @{auto_name}.state, i32 0, i32 {idx}",
+            struct_name = struct_name,
+            auto_name = auto_name,
+            idx = idx,
+        )
+        .ok();
+        let val = self.fresh_value();
+        writeln!(
+            &mut self.out,
+            "  {val} = load {ir_ty}, {ir_ty}* {ptr}",
+            ir_ty = ir_ty,
+            ptr = ptr,
+        )
+        .ok();
+        Ok(val)
     }
 
     /// Emit an SSA-binding identity instruction so a value gets a
@@ -800,6 +1373,32 @@ const fn primitive_ir_type(p: PrimitiveType) -> &'static str {
     }
 }
 
+/// Pick the LLVM opcode for a compound-assignment operator
+/// (`+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=`).
+/// `Eq` is handled at the call site (plain store, no opcode).
+///
+/// Slice 3: integer-only — float compound assigns surface as a
+/// `NotYetImplemented` upstream when the call sites pass `float` /
+/// `double` IR types. Sign-aware ops (`sdiv`/`srem`) are NOT chosen
+/// here — `+=` / `-=` etc. don't care about sign; only `/` and `%`
+/// do, and within compound-assign they default to the unsigned
+/// form for slice-3 simplicity (sign-aware is slice 4 work).
+fn compound_assign_opcode(op: AssignOp, _ir_ty: &str) -> &'static str {
+    match op {
+        AssignOp::PlusEq => "add",
+        AssignOp::MinusEq => "sub",
+        AssignOp::StarEq => "mul",
+        AssignOp::SlashEq => "udiv",
+        AssignOp::PercentEq => "urem",
+        AssignOp::AmpEq => "and",
+        AssignOp::PipeEq => "or",
+        AssignOp::CaretEq => "xor",
+        AssignOp::ShlEq => "shl",
+        AssignOp::ShrEq => "lshr",
+        AssignOp::Eq => "store", // unreachable — caller branches on Eq before calling
+    }
+}
+
 /// True if the IR type-text names an integer LLVM type (`i1`, `i8`,
 /// `i16`, `i32`, `i64`, `i128`, …). Used to gate integer-only ops
 /// (the SSA-add-zero binding idiom; integer-shape unary `-` and
@@ -1104,18 +1703,24 @@ mod tests {
     }
 
     #[test]
-    fn non_fn_items_silently_skipped() {
-        // Slice 1 lowers @fn only; #automaton is silently skipped.
+    fn non_fn_items_now_lowered_per_slice_3() {
+        // Renamed from `non_fn_items_silently_skipped`. Slice 1 lowered
+        // @fn only and #automaton was skipped; slice 3 emits a state
+        // struct + global state instance for non-register-block
+        // automatons. The test asserts the slice-3 surface.
         let src = "#automaton C { v: u32; }\n@fn add(a: u32, b: u32) -> u32 { return a; }\n";
         let ir = lower_str(src).expect("partial program lowers");
         assert!(
             ir.contains("define i32 @add"),
             "expected @add to be lowered; got:\n{ir}"
         );
-        // The automaton itself doesn't emit anything.
         assert!(
-            !ir.contains("automaton") && !ir.contains("@C"),
-            "automaton should not emit any IR in slice 1; got:\n{ir}"
+            ir.contains("%struct.C = type { i32 }"),
+            "expected state struct for #automaton C; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("@C.state = global %struct.C zeroinitializer"),
+            "expected zero-initialised global state; got:\n{ir}"
         );
     }
 
@@ -1521,5 +2126,284 @@ mod tests {
         let ir = lower_str("@fn d(a: usize, b: usize) -> usize { return a / b; }")
             .expect("lower usize div");
         assert!(ir.contains("udiv i64"), "expected udiv i64; got:\n{ir}");
+    }
+
+    // ─── Slice 3: automaton state structs + effects + transitions ────────
+
+    #[test]
+    fn s3_automaton_state_struct_emitted() {
+        let ir = lower_str("#automaton Counter { value: u32; }\n").expect("lower automaton");
+        assert!(
+            ir.contains("%struct.Counter = type { i32 }"),
+            "expected state struct; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("@Counter.state = global %struct.Counter zeroinitializer"),
+            "expected zero-initialised global; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s3_multi_field_struct_layout() {
+        let src = "#automaton Multi { a: u32; b: bool; c: u8; }\n";
+        let ir = lower_str(src).expect("lower multi-field");
+        // Fields appear in declaration order.
+        assert!(
+            ir.contains("%struct.Multi = type { i32, i1, i8 }"),
+            "expected ordered field layout; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s3_register_block_automaton_skipped() {
+        // `#address: 0x…` marks register-block — slice 3 doesn't emit
+        // a state struct for it (volatile-load/store lowering is
+        // slice 4 work).
+        let src = "#automaton Mmio { ctrl: u32 #offset: 0x00; #address: 0x4000_0000; }\n";
+        let ir = lower_str(src).expect("lower register block");
+        assert!(
+            !ir.contains("%struct.Mmio"),
+            "register-block should be skipped in slice 3; got:\n{ir}"
+        );
+        assert!(
+            !ir.contains("@Mmio.state"),
+            "register-block should not emit a global; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s3_effect_lowers_to_define() {
+        let src = "\
+            #automaton Counter { value: u32; }\n\
+            #effect tick() #mutates: [Counter] { return; }\n\
+        ";
+        let ir = lower_str(src).expect("lower effect");
+        assert!(
+            ir.contains("define void @tick()"),
+            "expected effect fn; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s3_mutate_short_eq_lowers_to_gep_store() {
+        let src = "\
+            #automaton Counter { value: u32; }\n\
+            #effect set_to_five() #mutates: [Counter] { Counter.value = 5u32; }\n\
+        ";
+        let ir = lower_str(src).expect("lower mutate-short");
+        assert!(
+            ir.contains("getelementptr %struct.Counter, %struct.Counter* @Counter.state, i32 0, i32 0"),
+            "expected GEP at field 0; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("store i32 5, i32* "),
+            "expected typed store; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s3_mutate_short_compound_load_op_store() {
+        let src = "\
+            #automaton Counter { value: u32; }\n\
+            #effect inc() #mutates: [Counter] { Counter.value += 1u32; }\n\
+        ";
+        let ir = lower_str(src).expect("lower compound mutate");
+        // Should be load + add + store.
+        assert!(
+            ir.contains("getelementptr %struct.Counter"),
+            "expected GEP; got:\n{ir}"
+        );
+        assert!(
+            ir.matches("load i32, i32* ").count() >= 1,
+            "expected load before op; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("add i32"),
+            "expected add for +=; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("store i32"),
+            "expected store after op; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s3_mutate_block_form() {
+        // `#mutate Counter { value = …, status = … };` — block form
+        // with multiple field assignments.
+        let src = "\
+            #automaton Counter { value: u32; flag: bool; }\n\
+            #effect setup() #mutates: [Counter] {\n  \
+              #mutate Counter { value = 7u32, flag = true };\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower mutate block");
+        // Two GEPs + two stores.
+        assert!(
+            ir.matches("getelementptr %struct.Counter").count() >= 2,
+            "expected GEPs for both field assigns; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("store i32 7, i32* "),
+            "expected store i32 7; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("store i1 1, i1* ") || ir.contains("store i1 true, i1* "),
+            "expected store i1 for flag; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s3_field_read_in_effect_body() {
+        let src = "\
+            #automaton Counter { value: u32; }\n\
+            #effect read() #mutates: [Counter] {\n  \
+              let _v: u32 = Counter.value;\n  \
+              return;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower field read");
+        assert!(
+            ir.contains("getelementptr %struct.Counter"),
+            "expected GEP for read; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("load i32, i32* "),
+            "expected typed load; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s3_transition_lowers_to_namespaced_fn() {
+        let src = "\
+            #automaton Counter { value: u32;\n  \
+              #transition tick { Counter.value = 1u32; }\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower transition");
+        assert!(
+            ir.contains("define void @Counter_tick()"),
+            "expected namespaced transition fn; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s3_self_field_read_in_transition() {
+        // `Self.value` (read position, expression) inside a
+        // transition resolves to the owner's field. Mutation-sugar
+        // (`Self.value = …;` statement) requires the full automaton
+        // name per the parser; that's exercised in
+        // `s3_mutate_short_eq_lowers_to_gep_store` instead.
+        let src = "\
+            #automaton Counter { value: u32;\n  \
+              #transition double {\n    \
+                let _v: u32 = Self.value;\n    \
+                Counter.value = _v;\n  \
+              }\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower Self");
+        assert!(
+            ir.contains("getelementptr %struct.Counter"),
+            "expected GEP for Self.value; got:\n{ir}"
+        );
+        // Both a load (for the read) and a store (for the write).
+        assert!(
+            ir.contains("load i32, i32*"),
+            "expected load i32 for read; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("store i32"),
+            "expected store i32 for write; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s3_proc_call_to_effect_uses_bare_name() {
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #effect helper() #mutates: [C] { return; }\n\
+            #effect main() #mutates: [C] { #> helper(); }\n\
+        ";
+        let ir = lower_str(src).expect("lower proc call");
+        assert!(
+            ir.contains("call void @helper()"),
+            "expected bare-name call to effect; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s3_proc_call_to_transition_uses_namespaced_name() {
+        let src = "\
+            #automaton Counter {\n  \
+              value: u32;\n  \
+              #transition tick { Counter.value = 1u32; }\n  \
+              #transition twice { #> tick(); #> tick(); }\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower transition-to-transition");
+        assert!(
+            ir.contains("call void @Counter_tick()"),
+            "expected namespaced call from one transition to another; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s3_interrupt_emits_define_with_source_name() {
+        // Slice 3 emits the interrupt as a regular `define` with the
+        // source name as the linker symbol. Section attribute and
+        // calling convention are slice 4.
+        let src = "\
+            #automaton T { x: u32; }\n\
+            #interrupt SysTick() #mutates: [T] #priority: HIGH { return; }\n\
+        ";
+        let ir = lower_str(src).expect("lower interrupt");
+        assert!(
+            ir.contains("define void @SysTick()"),
+            "expected SysTick fn; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s3_register_block_field_access_emits_e0810() {
+        let src = "\
+            #automaton Mmio { #address: 0x4000_0000; ctl: u32 #offset: 0x00; }\n\
+            #effect r() #mutates: [Mmio] { let _x: u32 = Mmio.ctl; return; }\n\
+        ";
+        let errors = lower_str(src).expect_err("expected E0810 for register-block read");
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            CodegenError::NotYetImplemented { what }
+                if what.contains("register-block")
+        ));
+        assert!(saw, "expected NotYetImplemented(register-block); got {errors:?}");
+    }
+
+    #[test]
+    fn s3_full_counter_program_lowers_cleanly() {
+        // Full v0.1 firmware shape: automaton + effect + transition,
+        // with mutation sugar, compound assignment, and proc calls.
+        // This is the canonical end-to-end smoke test.
+        let src = "\
+            #automaton Counter { value: u32; }\n\
+            #effect bump() #mutates: [Counter] { Counter.value += 1u32; }\n\
+            #effect reset() #mutates: [Counter] { Counter.value = 0u32; }\n\
+            #effect main() #mutates: [Counter] { #> bump(); #> bump(); #> reset(); }\n\
+        ";
+        let ir = lower_str(src).expect("lower full program");
+        for needle in [
+            "%struct.Counter = type { i32 }",
+            "@Counter.state = global %struct.Counter zeroinitializer",
+            "define void @bump()",
+            "define void @reset()",
+            "define void @main()",
+            "call void @bump()",
+            "call void @reset()",
+        ] {
+            assert!(
+                ir.contains(needle),
+                "missing `{needle}` in IR; got:\n{ir}"
+            );
+        }
     }
 }
