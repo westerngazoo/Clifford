@@ -7,6 +7,176 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Codegen slice 9: multi-state automatons (Decision #5 categorical) (2026-05-12)
+
+The biggest single firmware-relevant piece left for v0.1: multi-
+state automatons. Closes the codegen story for Decision #5
+(categorical automatons), Refinement #5b (`-> Dest` transition
+destinations), and Refinement #5d (`Auto@state` state-tag reads).
+Unlocks the canonical firmware shape — UART `Idle` → `Sending` →
+`Done`, lock state machines, polling FSMs, init sequencers — for
+v0.1.
+
+**The headline shape — multi-state automatons now lower:**
+
+```clifford
+#automaton Counter {
+  #states: [Idle, Counting, Done];
+  count: u32;
+  #transition start  -> Counting { Counter.count = 0u32; }
+  #transition tick                { Counter.count += 1u32; }
+  #transition finish -> Done      { return; }
+}
+
+#effect peek() -> u32 #mutates: [Counter] {
+  return Counter@state;
+}
+```
+
+→
+
+```llvm
+%struct.Counter = type { i32, i32 }   ; field 0 = state tag, field 1 = count
+@Counter.state = global %struct.Counter zeroinitializer   ; tag=0 (Idle), count=0
+
+define void @Counter_start() {
+entry:
+  %0 = getelementptr %struct.Counter, %struct.Counter* @Counter.state, i32 0, i32 1
+  store i32 0, i32* %0
+  ; pending tag write before ret:
+  %1 = getelementptr %struct.Counter, %struct.Counter* @Counter.state, i32 0, i32 0
+  store i32 1, i32* %1                ; Counting = tag 1
+  ret void
+}
+
+define void @Counter_tick() { … no tag write …  ret void }
+
+define void @Counter_finish() {
+entry:
+  %0 = getelementptr %struct.Counter, %struct.Counter* @Counter.state, i32 0, i32 0
+  store i32 2, i32* %0                ; Done = tag 2
+  ret void
+}
+
+define i32 @peek() {
+entry:
+  %0 = getelementptr %struct.Counter, %struct.Counter* @Counter.state, i32 0, i32 0
+  %1 = load i32, i32* %0
+  ret i32 %1
+}
+```
+
+**Implementation (`crates/codegen/src/lib.rs`):**
+
+- `AutomatonInfo` gained `state_tags: Vec<(String, u32)>` and three
+  helpers:
+  - `is_multi_state()` — `true` iff `state_tags` is non-empty.
+  - `llvm_field_index(user_idx)` — shifts user field indices up by
+    one for multi-state automatons (the i32 tag occupies LLVM
+    struct index 0).
+  - `state_tag(name)` — looks up a state's integer tag.
+- `collect_automatons` populates `state_tags` from
+  `AutomatonDecl.states`. The first listed state always gets tag 0
+  so the global's `zeroinitializer` correctly represents the
+  initial state — no special-case emission needed.
+- `emit_automaton_state_structs` prepends an `i32` field to the
+  struct layout for multi-state automatons. Monoid automatons
+  keep the slice-3 layout exactly.
+- All five `getelementptr` sites that compute a user-field index
+  now route through `info.llvm_field_index(idx)` so the +1 shift
+  is applied uniformly. Monoid automatons hit the `idx → idx`
+  identity branch; existing tests are unchanged.
+- New `Emitter` field `pending_transition_tag_write:
+  Option<(String, u32)>` mirrors `pending_exit_fence`. Set in
+  `emit_transition` when the transition has a `-> Dest` target on
+  a multi-state automaton; consumed by `emit_exit_fence_if_pending`
+  before every `ret` site.
+- New `Emitter::emit_state_read(automaton)` lowers
+  `ExprKind::StateRead`. Emits a GEP at LLVM struct index 0 plus
+  a `load i32`. Surfaces structured `NotYetImplemented` for
+  monoid automatons (no tag exists) and register-block automatons
+  (no defined MMIO offset for the tag yet).
+- `emit_expr` dispatch grew a `StateRead(name)` arm.
+
+**Order of writes at exit:** when a transition has both `-> Dest`
+and `$ [Release]` / `$ [SeqCst]`, the order at every `ret` is:
+1. State-tag write (the new state lands in memory)
+2. Release / SeqCst fence (makes the new state visible to other
+   agents)
+3. `ret void`
+
+This is the contract Decision #22 implies — a release fence
+publishes everything that came before it, and the state tag is
+exactly the kind of write that needs publishing on a state
+change.
+
+**Initial state convention:** the first state in `#states: [...]`
+is the initial state (per spec convention). It gets tag 0, which
+matches LLVM's `zeroinitializer`. Users who want a different
+initial state must reorder their `#states: [...]` list — there's
+no separate `#initial_state:` knob.
+
+**Transitions without destinations:** `#transition tick { … }` (no
+`->`) emits no tag write — the state stays the same. The
+`pending_transition_tag_write` is left `None` for the duration of
+that transition's body. Verified by
+`s9_transition_without_destination_emits_no_tag_write`.
+
+**Deferred to later slices:**
+
+- Register-block multi-state combos. The spec doesn't yet pin down
+  which MMIO offset stores the tag for `#address: 0x… #states:
+  [...]` automatons. Surfaces as `NotYetImplemented` until a
+  spec slice resolves the question.
+- State-tagged data (per-state field subsets). Per Decision #5,
+  fields can be associated with specific states (`#in: [Counting]`
+  on a field). The codegen for that is a future slice — today
+  every user field lives at the same offset for every state.
+- `match Auto@state { Idle => …, Counting => … }` style dispatch.
+  The AST has no `Match` node yet; sigma loops + match arrive
+  together with the §5.8 control-flow slice.
+- Tag-width packing. We use `i32` for every tag today; once
+  state counts cross 256, a future slice can switch to `i64` (or
+  pick the smallest int that fits) and update the layout helper.
+
+**Tests added (`crates/codegen/src/lib.rs::tests`):** 13 new
+tests, organised in three groups.
+
+*Layout / structural sanity:*
+- `s9_monoid_struct_unchanged` — monoid struct keeps `{ <user
+  fields> }` — no `i32` tag prepended.
+- `s9_multi_state_struct_prepends_i32_tag` — multi-state struct is
+  `{ i32, <user fields> }` and the global is still
+  `zeroinitializer` (Idle = tag 0).
+- `s9_user_field_index_shifts_for_multi_state` — `Counter.count
+  += 1u32;` GEPs at LLVM idx 1 (user idx 0 + tag offset).
+- `s9_helper_llvm_field_index_monoid` /
+  `s9_helper_llvm_field_index_multi_state` — direct unit tests on
+  the helpers.
+
+*StateRead lowering:*
+- `s9_state_read_emits_gep_load_at_index_0` — `Counter@state` →
+  GEP idx 0 + `load i32`.
+- `s9_state_read_on_monoid_returns_e0810` — monoid Auto@state
+  rejected with structured `NotYetImplemented`.
+- `s9_state_read_on_register_block_returns_e0810` — register-
+  block Auto@state rejected.
+
+*Transition destination handling:*
+- `s9_transition_with_destination_writes_tag_before_ret` — `start
+  -> Counting` writes tag 1 before `ret void`.
+- `s9_transition_without_destination_emits_no_tag_write` —
+  destination-less transition emits no tag GEP at all.
+- `s9_transition_destination_uses_correct_tag_for_third_state` —
+  `finish -> Done` writes tag 2.
+- `s9_destination_tag_write_combines_with_release_fence` — order
+  at exit: tag write < release fence < ret.
+- `s9_full_three_state_program_lowers_cleanly` — end-to-end smoke
+  on a 3-state, 2-transition, state-reading program.
+
+Total codegen tests: **130** (117 pre-slice-9 + 13 new). All
+green; clippy clean across the workspace.
+
 ### Added — Codegen slice 8: Decision #17 / #19 unsafe primitives (2026-05-11)
 
 Closes the codegen story for the spec's six narrow-unsafe escape
