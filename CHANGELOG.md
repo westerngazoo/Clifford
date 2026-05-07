@@ -7,6 +7,48 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Fixed — Codegen: multi-state automaton field reads used unshifted index (2026-05-13)
+
+Slice 9 prepended an `i32` state-tag at LLVM struct index 0 for
+multi-state automatons and shifted every user-field GEP index up
+by one — but only on the **write paths** (`emit_mutate`,
+`emit_mutate_short`, `emit_index_expr`'s indexed write helper).
+The read path `emit_field_access` continued to use the bare user
+index, so any `Auto.field` read on a multi-state automaton with
+multiple user fields produced a GEP at the wrong LLVM struct
+index, returning the value of an adjacent field.
+
+The bug was hidden by the existing
+`s9_user_field_index_shifts_for_multi_state` test because it
+only exercised the write path (`+= 1u32`) and only had a single
+user field, where the slice-9 shift coincidentally lined up.
+
+The bug was found while writing
+`examples/dual_uart_telemetry.cl` for ergonomics review: the
+generated IR for `drain_total() -> u32 { return Telemetry.bytes_total; }`
+read LLVM idx 2 (`bytes_uart2`) instead of idx 3 (`bytes_total`).
+
+**Fix:** `emit_field_access`'s non-register-block branch now
+applies `info.llvm_field_index(idx)` exactly the way the write
+paths do, so reads and writes share the same shift policy.
+
+**Regression test:**
+`s9_field_read_on_multi_state_uses_shifted_index` reads the second
+user field on a 2-field multi-state automaton and asserts both
+the correct GEP (idx 2) and the absence of the unshifted GEP
+(idx 1) so any future regression of this exact shape is caught.
+
+Total codegen tests: **131** (130 pre-fix + 1 regression). All
+green; clippy clean across the workspace.
+
+Plus `examples/dual_uart_telemetry.cl` is checked in — a 100-line
+multi-producer telemetry sample that exercises every codegen
+slice (register-block volatile MMIO + multi-state automaton +
+state-tag dispatch + Acquire/Release fences + interrupt section
+attributes + integer cast + cross-callable transition mangling)
+and serves as the canonical "what does idiomatic Clifford
+firmware look like" reference for the v0.1 surface.
+
 ### Added — CLI slice 10: `cliffordc compile` driver (2026-05-13)
 
 The thin CLI bridge from a `.cl` source file on disk to a `.ll` LLVM

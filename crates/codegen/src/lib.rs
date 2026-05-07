@@ -1950,7 +1950,11 @@ impl<'a> Emitter<'a> {
                 let abs = info.base_address + offset.unwrap_or(0);
                 (true, abs, ir_ty)
             } else {
-                (false, idx as u64, ir_ty)
+                // Slice 9: shift user-field index by the state-tag
+                // slot for multi-state automatons (LLVM idx 0 is
+                // reserved for the i32 tag; user fields start at 1).
+                // This mirrors the write-path shift in emit_mutate.
+                (false, info.llvm_field_index(idx) as u64, ir_ty)
             }
         };
 
@@ -4771,6 +4775,48 @@ mod tests {
         assert!(
             tag_pos < fence_pos && fence_pos < ret_pos,
             "expected order: tag write < fence < ret; got positions {tag_pos} / {fence_pos} / {ret_pos} in:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s9_field_read_on_multi_state_uses_shifted_index() {
+        // Regression test for the bug found by examples/dual_uart_telemetry.cl:
+        // emit_field_access (read path) was using the user-field
+        // index without applying the slice-9 +1 tag shift, so reads
+        // of any user field on a multi-state automaton produced a
+        // GEP at the wrong LLVM index. The bug was hidden by
+        // s9_user_field_index_shifts_for_multi_state because that
+        // test only exercised the WRITE path (`+= 1u32`) and only
+        // had a single user field.
+        //
+        // This test reads the SECOND user field (`bytes_total`,
+        // user idx 1, LLVM idx 2) on a multi-state automaton.
+        // Pre-fix the IR contained `i32 0, i32 1` (reading bytes_uart1
+        // instead of bytes_total). Post-fix: `i32 0, i32 2`.
+        let src = "\
+            #automaton T {\n  \
+              #states: [Empty, NonEmpty];\n  \
+              bytes_uart1: u32;\n  \
+              bytes_total: u32;\n\
+            }\n\
+            #effect drain_total() -> u32 #mutates: [T] {\n  \
+              return T.bytes_total;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower multi-state read");
+        // bytes_total is the SECOND user field (user idx 1) on a
+        // multi-state automaton; LLVM idx must be 1 + 1 = 2 (state
+        // tag occupies idx 0).
+        assert!(
+            ir.contains("getelementptr %struct.T, %struct.T* @T.state, i32 0, i32 2"),
+            "expected read of bytes_total at LLVM idx 2; got:\n{ir}"
+        );
+        // Critical: the IR must NOT GEP at LLVM idx 1 (that would
+        // be reading bytes_uart1 — the slice-9 bug was emitting
+        // exactly this).
+        assert!(
+            !ir.contains("getelementptr %struct.T, %struct.T* @T.state, i32 0, i32 1"),
+            "regression: read path must not use unshifted user index; got:\n{ir}"
         );
     }
 
