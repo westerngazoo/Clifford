@@ -7,6 +7,148 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — CLI slice 10: `cliffordc compile` driver (2026-05-13)
+
+The thin CLI bridge from a `.cl` source file on disk to a `.ll` LLVM
+IR file on disk. Wires the `lex → parse → resolve → types → codegen`
+pipeline behind one subcommand and ships the first invocable
+`cliffordc` binary that does real work.
+
+**Usage:**
+
+```text
+cliffordc compile <input.cl> [-o <output.ll>] [--module-name <name>]
+cliffordc --version | -V
+cliffordc --help    | -h
+```
+
+Defaults:
+- `-o` defaults to the input path with the extension swapped to
+  `.ll` (`uart_fsm.cl` → `uart_fsm.ll` next to the source).
+- `--module-name` defaults to the input file's stem (basename
+  without extension) so the IR's `ModuleID` and `source_filename`
+  match the project's expectation.
+
+**Exit codes:**
+- `0` — success
+- `1` — compilation error (any of lex / parse / resolve / type /
+  codegen surfaces a structured error)
+- `2` — usage error (bad arguments)
+- `3` — I/O error (input unreadable, output unwritable)
+
+**Implementation (`crates/cli/src/main.rs`):**
+
+- Hand-rolled argv parser. No `clap` dependency: the surface is
+  small and stable enough that a 50-line dispatch is cheaper than
+  the new dep + macro hygiene burden. The parser returns a
+  `Cli` enum (`Compile`, `Version`, `Help`, `Unknown`), and `main`
+  routes it to the matching handler.
+- `compile_source(source, module_name)` is the pure-function
+  pipeline core: takes a source string + module name, returns the
+  IR text or a structured `CompileError`. Reused by tests so the
+  pipeline is exercisable without touching the filesystem.
+- `run_compile(input, output, module_name)` is the I/O wrapper:
+  reads the source file, calls `compile_source`, and writes the
+  IR to disk. Handles default-output-path computation
+  (`default_output_path`) and default-module-name computation
+  (`default_module_name`).
+- Errors are pre-formatted with a phase prefix (`error[parse]:
+  ...`) inside the lib so `main` can `eprintln!` them verbatim.
+  Multi-error phases (resolve, types, codegen) are joined with
+  newlines via `format_phase_errors`.
+
+**End-to-end smoke verified on a real firmware shape**
+(`examples/uart_fsm.cl`):
+
+```clifford
+#automaton Uart {
+  #address: 0x4000_4000;
+  tx_data: u32 #offset: 0x00;
+  status:  u32 #offset: 0x18;
+  #transition send { Uart.tx_data = 65u32; }
+}
+
+#automaton TxFsm {
+  #states: [Idle, Sending, Done];
+  bytes_sent: u32;
+  #transition start  -> Sending { TxFsm.bytes_sent = 0u32; }
+  #transition tick               { TxFsm.bytes_sent += 1u32; }
+  #transition finish -> Done    $ [Release] { return; }
+}
+
+#effect peek_state() -> u32 #mutates: [TxFsm] { return TxFsm@state; }
+#interrupt USART1_IRQ() #mutates: [Uart] #priority: HIGH { #> send(); }
+```
+
+`cliffordc compile examples/uart_fsm.cl` produces a 1571-byte IR
+module containing every slice's contribution: register-block
+volatile MMIO writes (slice 4), the `.interrupts` section
+attribute (slice 4), multi-state struct layout `{ i32, i32 }`
+(slice 9), state-tag writes at transition exits (slice 9), the
+exit-fence ordering (Decision #22 + slice 9: tag write < release
+fence < ret), state-tag reads (slice 9), and cross-callable
+mangled transition calls (slice 4).
+
+**Why this is the right v0.1 milestone:** with this slice the
+compiler is invocable as a standalone binary by anyone with a
+Rust toolchain. The output is real LLVM IR that `clang` or `llc`
+can pipe into a Cortex-M ELF — the end-to-end firmware path is
+unblocked. What's left for the v0.1 release is the QEMU
+integration test (slice 11) plus any control-flow surface the
+Appendix A examples need.
+
+**Deferred to later slices:**
+
+- The `test`, `lint`, `audit`, `inspect` subcommands sketched in
+  the rustdoc top-of-file are still future-only. They land when
+  there's a concrete user need.
+- `clifford-check` / `clifford-effect` / `clifford-ortho` aren't
+  yet wired into the pipeline. They surface enforcement gates
+  (mutation-set checks, reachability, GA orthogonality) that
+  v0.1 codegen doesn't depend on; integrating them is a separate
+  slice with its own test matrix.
+- Span → `(line, column)` conversion for nicer error messages
+  (today every error reports a byte offset). The
+  `codespan-reporting` crate is wired as a dependency for this;
+  the integration is a slice 11+ piece.
+- `--target <triple>` / `--verbose-basis` / other flags listed
+  in the rustdoc usage block.
+
+**Tests added (`crates/cli/src/main.rs::tests`):** 17 new tests.
+
+*Argv parsing:*
+- `empty_argv_prints_help`, `dash_h_and_long_help_are_help`,
+  `version_flags`, `unknown_top_level_arg_is_unknown`.
+- `compile_minimum_args`, `compile_with_output_flag`,
+  `compile_with_module_name`, `compile_with_output_before_input`.
+- `compile_missing_input_is_unknown`,
+  `compile_missing_output_value_is_unknown`,
+  `compile_unrecognised_flag_is_unknown`.
+
+*Default-path helpers:*
+- `default_output_path_swaps_extension` — `.cl` → `.ll`,
+  no-extension → append `.ll`, subdirs preserved.
+- `default_module_name_uses_stem` — `path/to/uart.cl` → `"uart"`.
+
+*Pipeline smoke:*
+- `compile_source_lowers_minimal_program` — empty program → IR
+  module header.
+- `compile_source_lowers_real_firmware_shape` — multi-state
+  automaton + transition + effect lowers cleanly via the public
+  pipeline function.
+- `compile_source_surfaces_parse_error_with_prefix` — garbled
+  source produces an `error[parse]: ...`-prefixed message.
+- `format_phase_errors_joins_multiple_with_newlines` — multi-
+  error phase output formatting.
+
+Plus the `examples/uart_fsm.cl` example file is checked in as a
+canonical end-to-end smoke target. Generated `.ll` artifacts are
+gitignored.
+
+Total tests this session: **130** codegen + **17** CLI = **147**
+new-or-extended tests across slices 5–10. All green; clippy
+clean across the workspace.
+
 ### Added — Codegen slice 9: multi-state automatons (Decision #5 categorical) (2026-05-12)
 
 The biggest single firmware-relevant piece left for v0.1: multi-
