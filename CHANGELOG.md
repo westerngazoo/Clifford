@@ -7,6 +7,115 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Decision #22 codegen: LLVM memory-ordering fences for `Acquire` / `Release` / `SeqCst` (2026-05-07)
+
+Closes the codegen gap from Decision #22 / ADR 0003. The earlier
+trait-validation slice (E0541 / E0544) ensures predeclared trait
+names are recognised on the right layer; this slice makes `Acquire`
+/ `Release` / `SeqCst` actually *do something* — emit LLVM `fence`
+instructions at the right points in the function body.
+
+**The headline shape:**
+
+```clifford
+#effect strict_publish() #mutates: [Counter] $ [SeqCst] {
+  Counter.value = 1u32;
+}
+```
+
+→
+
+```llvm
+define void @strict_publish() {
+entry:
+  fence seq_cst
+  %tmp.0 = getelementptr %struct.Counter, %struct.Counter* @Counter.state, i32 0, i32 0
+  store i32 1, i32* %tmp.0
+  fence seq_cst
+  ret void
+}
+```
+
+**Implementation (`crates/codegen/src/lib.rs`):**
+
+- New `MemoryOrdering { entry, exit }` struct holding optional LLVM
+  ordering keywords for the entry fence and the per-`ret` exit
+  fence.
+- New `memory_ordering_from_traits(trait_list)` free helper:
+  - `SeqCst` present (alone or with others) → entry + exit both
+    `seq_cst` (supersedes `Acquire` / `Release`).
+  - `Acquire` only → entry `acquire`, no exit fence.
+  - `Release` only → exit `release`, no entry fence.
+  - `Acquire` + `Release` → both, with respective orderings.
+  - No ordering trait → no fences.
+- `Emitter` gains `pending_exit_fence: Option<&'static str>` field
+  set per-callable so every `ret` site can emit the configured
+  fence before the actual `ret`.
+- New `Emitter::emit_exit_fence_if_pending` helper called at every
+  `ret` emission point (explicit `Return(Some)` / `Return(None)`
+  in `emit_stmt`, and the implicit-`ret void` path in `emit_block`).
+- `emit_effect` / `emit_interrupt` / `emit_transition` each:
+  1. Compute `MemoryOrdering` from the callable's `trait_list`.
+  2. Set `self.pending_exit_fence = ordering.exit`.
+  3. After emitting the `entry:` label, emit the entry fence if
+     `ordering.entry.is_some()`.
+  4. Reset `pending_exit_fence` to `None` at the end of the
+     callable's emission (defensive cleanup).
+
+**LLVM ordering selection:**
+
+The `fence <ordering>` IR instruction is target-abstract; the
+backend selects target-appropriate instructions:
+- `dmb ish` on ARM for `seq_cst`
+- `dmb ishld` on ARM for `acquire`
+- `dmb ishst` on ARM for `release`
+- `mfence` / `lfence` / `sfence` on x86 as appropriate
+- `fence` (RISC-V) with appropriate `pred,succ` masks
+
+This abstraction is exactly what Decision #22 wants: source-level
+`$ [Acquire]` / `$ [Release]` / `$ [SeqCst]` is portable; the
+target-specific instruction selection is LLVM's job.
+
+**What this slice deliberately does NOT do:**
+
+- **Per-operation ordering on individual loads/stores.** Today the
+  fence is a *function-level* annotation (entry / exit). Future work
+  could extend `Acquire` / `Release` / `SeqCst` to apply to specific
+  `#shared` field accesses (Decision #21 territory) by attaching
+  ordering to individual `load` / `store` instructions instead of
+  separate `fence` instructions.
+- **Atomic operations (`atomicrmw`, `cmpxchg`).** These are needed
+  for the rotor-lock acquire / release primitives (ADR 0005 /
+  Decision #26) and the `#shared` field with `LockingDiscipline`.
+  Future slice when Decision #21 / #26 implementation lands.
+- **Cross-function ordering inference.** A `@fn` calling a
+  `$ [Acquire]` `#effect` doesn't currently inherit any ordering;
+  ADR 0003 Q2's row-direction discussion is the right model when
+  `@fn` lowering needs ordering.
+
+**Tests (10 new fence tests, codegen crate now 61 total, was 51):**
+
+- `Acquire` → entry fence (no exit).
+- `Release` → exit fence before `ret` (no entry).
+- `Acquire` + `Release` → both ends fenced.
+- `SeqCst` → both ends `seq_cst`.
+- `SeqCst` supersedes `Acquire` / `Release` (no double-fences).
+- No ordering trait → no fences emitted.
+- `Acquire` on `#interrupt` works the same as on `#effect`.
+- `Release` on `#transition` works the same.
+- Explicit `return expr;` (not just falling through) — exit fence
+  still goes before the `ret <ty> <val>`.
+- `Hardware` / `Realtime` / `LockingDiscipline` / `PureState` /
+  `Encapsulated` traits emit no fences — declarative-only consumers.
+
+Workspace remains green; clippy clean.
+
+This closes the v0.1 codegen surface for the locked Decision #22
+imperative-side traits. The remaining unimplemented codegen
+consumer is `LockingDiscipline` (gated to v0.7+ alongside Decision
+#21 / #26 implementation — needs the rotor-lock runtime
+infrastructure).
+
 ### Added — Codegen slice 3: §8.4 automaton state + effects + transitions + `#mutate` (2026-05-07)
 
 The substantive v0.1 firmware piece. Slice 1 lowered `@fn` bodies;
