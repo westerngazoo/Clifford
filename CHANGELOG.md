@@ -7,6 +7,113 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Type Checker — Slice T4e: compound-position generic unification for variant calls (2026-05-07)
+
+Fifth slice of type-checker path-resolution work. T4d added variant-
+call typing with leaf-only generic-param pinning; T4e walks compound
+positions (`(T, T)`, `&T`, `[T; N]`, `Pair<T>`) so generic params pin
+through nested structure too.
+
+**The headline gap T4d left:**
+
+```clifford
+@type Pair<T> = | Both((T, T));      // declared arg = (T, T)
+
+@fn make() -> Pair<u32> {
+  return Pair::Both((5u32, 6u32));   // T4d: T not pinned → result Pair<Unknown>
+                                     // T4e: T = u32 pinned via tuple unification
+}
+```
+
+**Implementation (`crates/types/src/lib.rs`):**
+
+- New `unify_pin(declared, actual, params, bindings, registry)` free
+  function. Recursively walks `declared` and `actual` in parallel:
+  - Leaf generic-param reference (`Nominal{path:[name], args:[]}`
+    where `name ∈ params`) — pins or checks the binding.
+  - Matching compound shapes (`Tuple ↔ Tuple` of same arity, `Ref ↔
+    Ref` of same mutability, `Array ↔ Array` of same size, `Slice ↔
+    Slice`, `Range ↔ Range` of same inclusivity, `Nominal ↔ Nominal`
+    of same path + arity) — recurses through corresponding positions.
+  - Fallback: substitute current bindings into `declared` and run
+    `types_compatible` for structural+alias-following equality.
+  - Returns `Result<(), ()>` — caller diagnoses on `Err`.
+- Permissive on `Type::Unknown` on either side (matches
+  `types_compatible` behaviour; avoids cascading errors when one
+  position is upstream-unresolved).
+- `variant_call_type` rewritten to call `unify_pin` per arg. The
+  diagnostic surface is unchanged (E0522 with `displayed_expected`
+  showing the substituted form so users see `u32`, not `T`, after
+  partial inference).
+
+**Semantics enforced:**
+
+- `Pair<T> = | Both((T, T));` + `Pair::Both((5u32, 6u32))` → pins
+  `T = u32`; result is `Pair<u32>`.
+- `Pair<T> = | Both((T, T));` + `Pair::Both((5u32, true))` → first
+  position pins `T = u32`; second position conflicts → E0522.
+- `Boxed<T> = | Wrap(&T);` + `Boxed::Wrap(&x)` (where `x: u32`) →
+  pins `T = u32` through the `Ref`.
+- `Buf<T> = | Of([T; 4]);` + `Buf::Of([1u32, 2u32, 3u32, 4u32])` →
+  pins `T = u32` through the `Array`.
+- `Both<A, B> = | Pair((A, B));` + `Both::Pair((5u32, true))` →
+  pins `A = u32`, `B = bool` independently from tuple positions.
+- `W<T> = | M(&(T, T));` (doubly nested) → walks Ref then Tuple.
+- Shape mismatch (`(T, T)` declared, `u32` actual) → E0522.
+- E0522 diagnostic uses `displayed_expected` with substitution
+  applied: in `Both<A, B> = | Pair(A, B, A);` calling
+  `Both::Pair(1u32, true, false)`, the third arg's expected type
+  shows as `u32` (substituted from A's pin), not the raw `A`.
+- `@type Count = u32;` + `W<T> = | Wrap(T);` + `W::Wrap(n)` (where
+  `n: Count`) → unify_pin's structural fallback unaliases Count to
+  u32 before pinning T.
+
+**What T4e deliberately defers:**
+
+- Trait-bound satisfaction on generic params (`@type Vec<T: Copy>`).
+  The bound list is parsed and stored on `GenericParam.bounds`; a
+  future slice will check that pinned type arguments satisfy those
+  bounds. Today bounds are silent.
+- Inference from let-annotations *back* to variant constructors
+  (`let x: Result<u32, bool> = Ok(5u32);` would benefit from
+  bidirectional flow that uses `bool` to pin `E` via the
+  annotation). v0.4+ HM-extension work.
+- Where-clause-style constraints, higher-kinded params, associated
+  types — full HM territory; out of scope.
+
+**Tests (11 new T4e tests, types crate now 176 total, was 165):**
+
+- Tuple position pins T (multi-arg variant `Both(T, T)`).
+- Tuple *inside* one arg pins T (single arg `(T, T)`) — the T4d gap.
+- Tuple-inside-arg conflict → E0522.
+- Ref position pins T (`&T`).
+- Array position pins T (`[T; 4]`).
+- Two-param tuple pins independently (A, B from same tuple).
+- Nested compound (`&(T, T)`).
+- Shape mismatch (tuple-vs-non-tuple) → E0522.
+- Partial-pin substituted in diagnostic (E0522 expected shows
+  `u32`, not `A`).
+- Alias unfolds during unification (`Count = u32` then `W::Wrap(n)`
+  with `n: Count` pins `T = u32` via structural fallback's
+  `types_compatible`).
+- Baseline two-param flat case (sanity).
+
+Workspace remains green; clippy clean.
+
+The T4 series — path resolution surface for the type checker — is
+now substantively complete:
+
+- T4a: `Type::Nominal` AST + simple `Path → Nominal` translation.
+- T4b: `@type` alias following + ADT terminal markers.
+- T4c: generic alias substitution + path validation (E0518/E0519).
+- T4d: ADT variant resolution + variant-call typing (E0521/E0522).
+- T4e: compound-position generic unification for variant calls.
+
+What's left in the T4 line: trait-bound satisfaction (T4f? — folded
+into a future HM slice), module-qualified paths (T4g+ — needs a
+module system), inference flow from annotations to constructors
+(v0.4+ HM extension).
+
 ### Type Checker — Slice T4d: ADT variant resolution + variant-call typing (2026-05-07)
 
 Fourth slice of type-checker path-resolution work. T4a-T4c covered
