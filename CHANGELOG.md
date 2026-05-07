@@ -7,6 +7,114 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Type Checker — Slice T4d: ADT variant resolution + variant-call typing (2026-05-07)
+
+Fourth slice of type-checker path-resolution work. T4a-T4c covered
+type-position paths (alias following, generic substitution, path
+validation). T4d covers **expression-position multi-segment paths
+that resolve to ADT variants**: `Color::Red`, `Maybe::Some(5u32)`,
+`Result::Ok(5u32)`, etc.
+
+**Implementation (`crates/types/src/lib.rs`):**
+
+- `NominalDecl::Adt` extended with `variants: Vec<VariantInfo>` —
+  each variant carries its name and arg-type list (with generic-
+  parameter references surviving as `Type::Nominal { path: [param],
+  args: [] }` leaves, same shape as alias targets).
+- New `VariantInfo { name, args }` struct.
+- `build_type_registry` now populates the variants from the AST.
+  `VariantData::Tuple(types)` and `VariantData::Struct(fields)`
+  both flatten to positional args (T4d treats struct-style
+  variants positionally; named-field semantics is post-T4d).
+- New `TypeRegistry::lookup_variant(path) -> Option<(adt_name,
+  params, &VariantInfo)>` for two-segment paths where segment[0]
+  is a registered ADT and segment[1] matches one of its variants.
+- `Inferer::infer_expr` for `ExprKind::Path(segments)` extended:
+  multi-segment path that resolves to a unit-like variant of a
+  non-generic ADT yields the ADT directly (`Color::Red` → `Color`).
+  Data-carrying or generic-ADT variants referenced bare (without
+  a Call) yield `Type::Unknown` — call-site typing fills them in.
+- `Inferer::call_type` extended: when callee is a multi-segment
+  path resolving to a variant, dispatches to the new
+  `variant_call_type` helper.
+- New `Inferer::variant_call_type` performs:
+  - Arity check on variant args → `E0521 VariantArityMismatch` on
+    fail; returns a best-effort `Nominal { adt_name, args:
+    [Unknown; param_arity] }`.
+  - Per-arg type check. When the declared arg is a leaf
+    generic-param reference (`T` for `@type Result<T, E>` —
+    declared as `Nominal{path:[T]}`), the actual arg's type pins
+    `T`'s instantiation. First occurrence binds; subsequent
+    occurrences must match (else `E0522 VariantArgMismatch`). Non-
+    generic-leaf declared types use plain `types_compatible`.
+  - Builds the result `Nominal { adt_name, args: [...] }` from
+    the bindings; uninferred params become `Type::Unknown`.
+
+**Two new error variants:**
+
+- `E0521 VariantArityMismatch { adt_name, variant_name, expected,
+  actual, at }` — diagnostic shows `Maybe::Some` (qualified form)
+  so users see exactly which variant.
+- `E0522 VariantArgMismatch { adt_name, variant_name, arg,
+  expected, actual, at }` — same qualified-name format; `arg` is
+  1-based.
+
+**Semantics:**
+
+- `@type Color = | Red | Green | Blue;` + `Color::Red` →
+  `Type::Nominal { path: ["Color"], args: [] }`.
+- `@type Maybe = | None | Some(u32);` + `Maybe::Some(5u32)` →
+  `Type::Nominal { path: ["Maybe"], args: [] }`.
+- `@type Result<T, E> = | Ok(T) | Err(E);` + `Result::Ok(5u32)`
+  → `Type::Nominal { path: ["Result"], args: [Primitive(U32),
+  Unknown] }`. The let-annotation `Result<u32, bool>` is
+  structurally compatible because `Unknown` short-circuits in
+  `types_compatible`.
+- `Maybe::Some(true)` → E0522 (declared `u32`, got `bool`).
+- `Maybe::Some(5u32, 6u32)` → E0521 (arity 1 vs 2).
+- Struct-style `@type Shape = | Circle { r: f32 };` flattens to
+  positional: `Shape::Circle(1.0f32)` works; named-field syntax
+  (`Shape::Circle { r: 1.0f32 }`) is post-T4d work.
+
+**What T4d deliberately defers:**
+
+- Bidirectional inference for non-leaf generic positions (e.g. a
+  variant with arg type `(T, T)` — T4d's pin-on-leaf doesn't reach
+  through compounds).
+- Named-field syntax for struct-style variant constructors —
+  positional only in T4d.
+- Single-segment unqualified variant references (`Red` without
+  `Color::` prefix). Today these go through the local-lookup arm
+  and return Unknown if not declared as locals; future slice could
+  add scope-based variant lookup.
+- Unknown-variant diagnostic in the type checker — falls through
+  to the resolver's existing surface; type checker just doesn't
+  crash.
+- Multi-segment paths in *type position* (`let _: Result::Ok = …`)
+  — semantically nonsensical without a module system; T4d does
+  not enable them.
+
+**Tests (11 new T4d tests, types crate now 165 total, was 154):**
+
+- Unit variant bare path → ADT type.
+- Unit variant in let annotation typechecks.
+- Data-carrying variant constructor call typechecks.
+- Variant arg type mismatch → E0522.
+- Variant arity mismatch (too many args) → E0521.
+- Variant arity mismatch (too few args) → E0521.
+- Generic ADT: arg pins first param (`Result::Ok(5u32)`).
+- Generic ADT: arg pins second param (`Result::Err(true)`).
+- Unknown variant doesn't crash the type checker.
+- Non-ADT first segment (`MyAlias::Foo`) doesn't crash.
+- Struct-style variant flattens positionally.
+
+Workspace remains green; clippy clean.
+
+This closes the T4d sub-slice. T4e remains: bound-aware trait
+satisfaction on generic params; full HM unification for non-leaf
+generic-arg positions. T4f / module work would handle
+multi-segment paths beyond ADT variants.
+
 ### Added — Decision #22: layer-aware trait validation (E0544 TraitLayerMismatch) (2026-05-05)
 
 Closes the layer-direction gap from the earlier Decision #22

@@ -247,6 +247,50 @@ pub enum TypeError {
         decl_at: usize,
     },
 
+    /// An ADT variant constructor was called with the wrong number of
+    /// arguments. T4d: `Some(5u32, true)` for `@type Maybe = | None |
+    /// Some(u32);` is `E0521`.
+    ///
+    /// The diagnostic carries the ADT name, the variant name (so
+    /// users see `Maybe::Some` not just `Some`), the expected and
+    /// actual arg counts, and the call-site byte offset.
+    #[error("E0521: ADT variant `{adt_name}::{variant_name}` takes {expected} argument(s) but {actual} were supplied (at byte {at})")]
+    VariantArityMismatch {
+        /// Parent ADT name.
+        adt_name: String,
+        /// Variant name.
+        variant_name: String,
+        /// Expected number of args (the variant's declared arity).
+        expected: usize,
+        /// Number of args supplied at the call site.
+        actual: usize,
+        /// Byte offset of the call expression.
+        at: usize,
+    },
+
+    /// An ADT variant constructor was called with an argument whose
+    /// type doesn't match the variant's declared arg type.
+    /// `Some(true)` for `@type Maybe = | Some(u32) | None;` is
+    /// `E0522`. For generic ADTs the arg type drives substitution
+    /// (T4d: arg types of the *first* generic param-occurrence fix
+    /// the param's instantiation; subsequent occurrences must match).
+    #[error("E0522: ADT variant `{adt_name}::{variant_name}` argument #{arg} expected {expected}, got {actual} (at byte {at})")]
+    VariantArgMismatch {
+        /// Parent ADT name.
+        adt_name: String,
+        /// Variant name.
+        variant_name: String,
+        /// 1-based argument position.
+        arg: usize,
+        /// Display name of the expected variant arg type (after
+        /// generic substitution where applicable).
+        expected: String,
+        /// Display name of the actual argument type.
+        actual: String,
+        /// Byte offset of the call expression.
+        at: usize,
+    },
+
     /// A predeclared trait was used on a callable in the *wrong* sigil
     /// layer. Decision #22 / ADR 0003 partition the predeclared traits
     /// into:
@@ -757,20 +801,44 @@ enum NominalDecl {
     /// `@type Result<T, E> = | Ok(T) | Err(E);` — ADT: nominal,
     /// terminal, does not unfold. Two ADT nominals are equal iff their
     /// names + args match (per Decision #19). T4c records `params` for
-    /// arity validation; variant-position resolution (`Result::Ok`)
-    /// remains T4d+ work.
+    /// arity validation; T4d adds variant-position resolution
+    /// (`Result::Ok`) via `variants`.
     Adt {
         /// Generic parameter names in declaration order. Empty for
         /// non-generic ADTs.
         params: Vec<String>,
+        /// Variant info per ADT variant (T4d): name → arg types
+        /// (with generic-parameter names appearing as
+        /// `Type::Nominal { path: [name], args: [] }` leaves, same
+        /// shape as alias targets). Used by `Type::substitute` when
+        /// the user instantiates a generic ADT and refers to its
+        /// variants. Order of declaration is preserved.
+        variants: Vec<VariantInfo>,
     },
+}
+
+/// One variant of an ADT (T4d). `@type Color = | Red | Green | Blue;`
+/// gives three `VariantInfo`s with empty `args`. `@type Maybe = | None
+/// | Some(u32);` gives `None` (empty args) and `Some` (one-arg).
+/// Struct-style variants (`Name { f: T }`) are flattened into the
+/// `args` vec in field order; named-field access semantics is post-T4d
+/// work.
+#[derive(Debug, Clone)]
+struct VariantInfo {
+    /// Variant name (the `Ok` in `Result::Ok`).
+    name: String,
+    /// Arg types for this variant. Empty for unit-like variants.
+    /// Generic-parameter references survive as
+    /// `Type::Nominal { path: [param_name], args: [] }` leaves; the
+    /// parent ADT's `params` list is the substitution domain.
+    args: Vec<Type>,
 }
 
 impl NominalDecl {
     /// Number of generic parameters this declaration takes.
     fn arity(&self) -> usize {
         match self {
-            Self::Alias { params, .. } | Self::Adt { params } => params.len(),
+            Self::Alias { params, .. } | Self::Adt { params, .. } => params.len(),
         }
     }
 }
@@ -812,6 +880,27 @@ impl TypeRegistry {
             return None;
         }
         self.decls.get(&path[0])
+    }
+
+    /// T4d: resolve a multi-segment path like `Result::Ok` to an ADT
+    /// variant. Returns `Some((adt_name, params, variant))` if
+    /// `path[0]` is a registered ADT and `path[1]` matches one of its
+    /// variants. Returns `None` for: single-segment paths, unknown
+    /// first-segment names, alias first segments (aliases don't have
+    /// variants), and paths whose second segment doesn't match any
+    /// variant of the ADT.
+    fn lookup_variant<'a>(
+        &'a self,
+        path: &'a [String],
+    ) -> Option<(&'a str, &'a [String], &'a VariantInfo)> {
+        if path.len() != 2 {
+            return None;
+        }
+        let NominalDecl::Adt { params, variants } = self.decls.get(&path[0])? else {
+            return None;
+        };
+        let variant = variants.iter().find(|v| v.name == path[1])?;
+        Some((path[0].as_str(), params.as_slice(), variant))
     }
 
     /// If `t` is a single-segment `Type::Nominal` whose path names a
@@ -1558,11 +1647,13 @@ impl SnapshotFinder {
 /// instantiation time.
 ///
 /// ADTs (`@type Result<T, E> = | Ok(T) | Err(E);`) register as
-/// terminal nominal markers carrying their generic-param arity; their
-/// variant data is not captured (variant-position resolution like
-/// `Result::Ok` is T4d+ work).
+/// terminal nominal markers carrying their generic-param arity *and*
+/// their variant info (T4d): name + arg-type list per variant.
+/// Generic-parameter references in variant args survive as
+/// `Type::Nominal { path: [param_name], args: [] }` leaves so
+/// `Type::substitute` can swap them at instantiation.
 fn build_type_registry(program: &Program) -> TypeRegistry {
-    use clifford_ast::TypeBody;
+    use clifford_ast::{TypeBody, VariantData};
     let mut decls: HashMap<String, NominalDecl> = HashMap::new();
     for item in &program.items {
         if let Item::Type(td) = item {
@@ -1572,7 +1663,27 @@ fn build_type_registry(program: &Program) -> TypeRegistry {
                     params,
                     target: type_from_type_expr(te),
                 },
-                TypeBody::Adt(_) => NominalDecl::Adt { params },
+                TypeBody::Adt(variants) => {
+                    let variants: Vec<VariantInfo> = variants
+                        .iter()
+                        .map(|v| {
+                            let args = match &v.data {
+                                VariantData::None => Vec::new(),
+                                VariantData::Tuple(types) => {
+                                    types.iter().map(type_from_type_expr).collect()
+                                }
+                                VariantData::Struct(fields) => {
+                                    fields.iter().map(|f| type_from_type_expr(&f.ty)).collect()
+                                }
+                            };
+                            VariantInfo {
+                                name: v.name.clone(),
+                                args,
+                            }
+                        })
+                        .collect();
+                    NominalDecl::Adt { params, variants }
+                }
             };
             // First-wins on duplicate names. Resolver E0401 already reports
             // the duplicate; we just don't overwrite the registration.
@@ -1764,8 +1875,8 @@ impl<'a> Inferer<'a> {
 
             // Path: look up the resolved binding's type. Locals come from
             // our scope chain (we tracked their types as we declared them).
-            // Top-level symbols don't have a useful expression-level type
-            // in slice 1 (calling functions is slice 2 work).
+            // Multi-segment paths may resolve to ADT variant constructors
+            // (Slice T4d): `Color::Red` for `@type Color = | Red | …;`.
             ExprKind::Path(segments) => {
                 if segments.len() == 1 {
                     self.lookup_local(&segments[0])
@@ -1773,8 +1884,40 @@ impl<'a> Inferer<'a> {
                         .unwrap_or(Type::Unknown(
                             "name does not resolve to a local; top-level typing is slice T2 work",
                         ))
+                } else if let Some((adt_name, params, variant)) =
+                    self.type_registry.lookup_variant(segments)
+                {
+                    // T4d: typing a *bare* multi-segment variant path
+                    // (no Call wrapper, no args supplied at the path
+                    // site).
+                    //
+                    // - Unit-like variant (`Color::Red` for `@type Color
+                    //   = | Red | …`) and the ADT is non-generic →
+                    //   yields an instance of the ADT directly.
+                    // - Tuple/struct variant referenced bare (i.e.
+                    //   without an enclosing call) → for now we surface
+                    //   it as a Nominal of the ADT name with the args
+                    //   left to the call-site arm to disambiguate. This
+                    //   is the conservative choice; a richer "constructor
+                    //   function pointer" type comes when we have HM
+                    //   inference.
+                    if variant.args.is_empty() && params.is_empty() {
+                        Type::Nominal {
+                            path: vec![adt_name.to_owned()],
+                            args: vec![],
+                        }
+                    } else {
+                        // Bare reference to a data-carrying variant or
+                        // a generic-ADT variant → Unknown until the
+                        // call-site arm fills in the args (T4d slice
+                        // doesn't synthesise a constructor function
+                        // type; that lands with HM unification).
+                        Type::Unknown(
+                            "bare reference to data-carrying or generic ADT variant; typing comes via the call-site arm",
+                        )
+                    }
                 } else {
-                    Type::Unknown("multi-segment path typing is slice T2+ work")
+                    Type::Unknown("multi-segment path typing is slice T4d+ work")
                 }
             }
 
@@ -1971,8 +2114,152 @@ impl<'a> Inferer<'a> {
     /// type-checked against its parameter (E0513). Argument count
     /// mismatches don't suppress per-argument type errors for the
     /// arguments that *do* exist — both classes accumulate.
+    /// T4d: type a call expression whose callee is an ADT variant
+    /// constructor (`Result::Ok(5u32)`).
+    ///
+    /// Behaviour:
+    /// - **Non-generic ADT.** Variant args are checked structurally
+    ///   against the declared variant arg types; result type is the
+    ///   ADT (`Maybe::Some(5u32)` for `@type Maybe = | None |
+    ///   Some(u32);` yields `Maybe`).
+    /// - **Generic ADT, all params inferable from args.** The first
+    ///   occurrence of each generic param in the variant's arg-type
+    ///   list pins it to the matching arg's actual type; subsequent
+    ///   occurrences must match (any non-match fires E0522). Result
+    ///   type is the ADT with the inferred type args
+    ///   (`Result::Ok(5u32)` yields `Result<u32, Unknown>` since `E`
+    ///   has no constraint at this call site — the caller must
+    ///   provide it via context, which is HM unification work and
+    ///   stays deferred).
+    /// - **Generic ADT, params not inferable.** Uninferred params
+    ///   become `Type::Unknown` in the result; the wider expression
+    ///   may still typecheck if downstream context constrains them.
+    fn variant_call_type(
+        &mut self,
+        adt_name: &str,
+        params: &[String],
+        variant: &VariantInfo,
+        arg_types: &[Type],
+        at: Span,
+    ) -> Type {
+        // Arity check first.
+        if variant.args.len() != arg_types.len() {
+            self.errors.push(TypeError::VariantArityMismatch {
+                adt_name: adt_name.to_owned(),
+                variant_name: variant.name.clone(),
+                expected: variant.args.len(),
+                actual: arg_types.len(),
+                at: at.start,
+            });
+            // Return a best-effort Nominal so downstream code has
+            // *something* to chew on.
+            return Type::Nominal {
+                path: vec![adt_name.to_owned()],
+                args: params
+                    .iter()
+                    .map(|_| Type::Unknown("variant arity mismatch (E0521)"))
+                    .collect(),
+            };
+        }
+
+        // For each variant arg, check the actual type against the
+        // declared one. When the declared type is a leaf
+        // `Nominal{path:[param]}` (a generic-param reference), pin
+        // the param to the actual type for the result instantiation.
+        let mut bindings: HashMap<&str, Type> = HashMap::new();
+        let limit = variant.args.len().min(arg_types.len());
+        for (i, actual) in arg_types.iter().take(limit).enumerate() {
+            let declared = &variant.args[i];
+            // Try to bind a generic param if `declared` is a leaf
+            // param reference.
+            if let Type::Nominal { path, args } = declared {
+                if path.len() == 1 && args.is_empty() && params.iter().any(|p| p == &path[0]) {
+                    let pname = path[0].as_str();
+                    match bindings.get(pname) {
+                        None => {
+                            bindings.insert(pname, actual.clone());
+                            continue;
+                        }
+                        Some(prev) => {
+                            // Subsequent occurrence — must match.
+                            if !actual.is_unknown()
+                                && !prev.is_unknown()
+                                && !types_compatible(prev, actual, self.type_registry)
+                            {
+                                self.errors.push(TypeError::VariantArgMismatch {
+                                    adt_name: adt_name.to_owned(),
+                                    variant_name: variant.name.clone(),
+                                    arg: i + 1,
+                                    expected: prev.display(),
+                                    actual: actual.display(),
+                                    at: at.start,
+                                });
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+            // Non-generic-leaf declared type: structural compare.
+            // (For composite generic-arg types like `(T, T)` we'd
+            // need more sophisticated bidirectional unification; T4d
+            // punts on those — they fall through to a structural
+            // compare which works when the user provided the right
+            // shape and produces a noisy error otherwise.)
+            if !declared.is_unknown()
+                && !actual.is_unknown()
+                && !types_compatible(declared, actual, self.type_registry)
+            {
+                self.errors.push(TypeError::VariantArgMismatch {
+                    adt_name: adt_name.to_owned(),
+                    variant_name: variant.name.clone(),
+                    arg: i + 1,
+                    expected: declared.display(),
+                    actual: actual.display(),
+                    at: at.start,
+                });
+            }
+        }
+
+        // Build the result Nominal. Unknown for uninferred params.
+        let result_args: Vec<Type> = params
+            .iter()
+            .map(|p| {
+                bindings
+                    .get(p.as_str())
+                    .cloned()
+                    .unwrap_or(Type::Unknown(
+                        "generic ADT param not inferable from variant args (T4d)",
+                    ))
+            })
+            .collect();
+
+        Type::Nominal {
+            path: vec![adt_name.to_owned()],
+            args: result_args,
+        }
+    }
+
     fn call_type(&mut self, callee: &Expr, args: &[Expr], at: Span) -> Type {
         let arg_types: Vec<Type> = args.iter().map(|a| self.infer_expr(a)).collect();
+
+        // T4d: multi-segment path callee may be an ADT variant
+        // constructor (`Result::Ok(5u32)`). We type it as the parent
+        // ADT, with generic-param substitution from the arg types when
+        // the ADT is generic and the arg count matches.
+        if let ExprKind::Path(segs) = &callee.kind {
+            if let Some((adt_name, params, variant)) =
+                self.type_registry.lookup_variant(segs)
+            {
+                return self.variant_call_type(
+                    adt_name,
+                    params,
+                    variant,
+                    &arg_types,
+                    at,
+                );
+            }
+        }
 
         // Resolve the callee to a top-level signature. We accept only
         // single-segment `Path([X])` callees in slice 2; everything else
@@ -4578,5 +4865,169 @@ mod tests {
                 "predeclared imperative trait `{name}` should validate on #effect"
             );
         }
+    }
+
+    // ─── Slice T4d: ADT variant resolution + variant-call typing ─────────
+
+    #[test]
+    fn t4d_unit_variant_bare_path_yields_adt() {
+        // `Color::Red` for `@type Color = | Red | Green | Blue;` is a
+        // bare unit-variant reference — yields `Color`.
+        let src = "\
+            @type Color = | Red | Green | Blue;\n\
+            @fn pick() -> Color { return Color::Red; }\n\
+        ";
+        let res = infer_str(src);
+        assert!(res.is_ok(), "expected Color::Red to type as Color; got {res:?}");
+    }
+
+    #[test]
+    fn t4d_unit_variant_in_let_annotation() {
+        let src = "\
+            @type Color = | Red | Green | Blue;\n\
+            @fn f() { let _c: Color = Color::Green; return; }\n\
+        ";
+        let res = infer_str(src);
+        assert!(res.is_ok(), "expected Color::Green to typecheck in let; got {res:?}");
+    }
+
+    #[test]
+    fn t4d_data_carrying_variant_constructor_call() {
+        // `Maybe::Some(5u32)` for `@type Maybe = | None | Some(u32);`
+        // — variant call yields Maybe; arg type checked against u32.
+        let src = "\
+            @type Maybe = | None | Some(u32);\n\
+            @fn make() -> Maybe { return Maybe::Some(5u32); }\n\
+        ";
+        let res = infer_str(src);
+        assert!(
+            res.is_ok(),
+            "expected Maybe::Some(5u32) to type as Maybe; got {res:?}"
+        );
+    }
+
+    #[test]
+    fn t4d_variant_arg_type_mismatch_emits_e0522() {
+        // `Maybe::Some(true)` where Some takes u32 — E0522.
+        let src = "\
+            @type Maybe = | None | Some(u32);\n\
+            @fn bad() -> Maybe { return Maybe::Some(true); }\n\
+        ";
+        let errors = infer_str(src).expect_err("expected E0522");
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            TypeError::VariantArgMismatch { adt_name, variant_name, expected, actual, .. }
+                if adt_name == "Maybe" && variant_name == "Some"
+                    && expected == "u32" && actual == "bool"
+        ));
+        assert!(saw, "expected E0522 for Some(true); got {errors:?}");
+    }
+
+    #[test]
+    fn t4d_variant_arity_mismatch_too_many_emits_e0521() {
+        let src = "\
+            @type Maybe = | None | Some(u32);\n\
+            @fn bad() -> Maybe { return Maybe::Some(5u32, 6u32); }\n\
+        ";
+        let errors = infer_str(src).expect_err("expected E0521");
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            TypeError::VariantArityMismatch { adt_name, variant_name, expected, actual, .. }
+                if adt_name == "Maybe" && variant_name == "Some"
+                    && *expected == 1 && *actual == 2
+        ));
+        assert!(saw, "expected E0521 for Some(5,6); got {errors:?}");
+    }
+
+    #[test]
+    fn t4d_variant_arity_mismatch_too_few_emits_e0521() {
+        let src = "\
+            @type Pair = | Both(u32, bool);\n\
+            @fn bad() -> Pair { return Pair::Both(5u32); }\n\
+        ";
+        let errors = infer_str(src).expect_err("expected E0521");
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            TypeError::VariantArityMismatch { variant_name, expected, actual, .. }
+                if variant_name == "Both" && *expected == 2 && *actual == 1
+        ));
+        assert!(saw, "expected E0521 for Both(5); got {errors:?}");
+    }
+
+    #[test]
+    fn t4d_generic_adt_variant_pins_param() {
+        // `Result::Ok(5u32)` for `@type Result<T, E> = | Ok(T) |
+        // Err(E);` — the arg pins T to u32; E is uninferred (Unknown).
+        // The result is `Result<u32, Unknown>`. The let-annotation
+        // `Result<u32, bool>` is structurally compatible because
+        // Unknown matches anything per types_compatible's short-circuit.
+        let src = "\
+            @type Result<T, E> = | Ok(T) | Err(E);\n\
+            @fn make() -> Result<u32, bool> { return Result::Ok(5u32); }\n\
+        ";
+        let res = infer_str(src);
+        assert!(
+            res.is_ok(),
+            "expected Result::Ok(5u32) to typecheck against Result<u32, bool>; got {res:?}"
+        );
+    }
+
+    #[test]
+    fn t4d_generic_adt_variant_pins_other_param() {
+        let src = "\
+            @type Result<T, E> = | Ok(T) | Err(E);\n\
+            @fn make() -> Result<u32, bool> { return Result::Err(true); }\n\
+        ";
+        let res = infer_str(src);
+        assert!(
+            res.is_ok(),
+            "expected Result::Err(true) to typecheck; got {res:?}"
+        );
+    }
+
+    #[test]
+    fn t4d_unknown_variant_silent_in_types_resolver_handles() {
+        // `Color::NotARealVariant` — the type checker's variant lookup
+        // returns None, so the call falls through to the regular
+        // call-typing path (which then sees an unresolvable callee and
+        // returns Unknown). The diagnostic surface for unknown
+        // variants is the resolver's job; T4d in clifford-types just
+        // doesn't crash.
+        let src = "\
+            @type Color = | Red;\n\
+            @fn f() -> Color { return Color::NotReal; }\n\
+        ";
+        // We expect *some* error (probably from the resolver), but
+        // not a panic from the type checker.
+        let _ = infer_str(src);
+    }
+
+    #[test]
+    fn t4d_non_adt_first_segment_not_variant() {
+        // `MyAlias::Something` where MyAlias is a `@type` *alias*
+        // (not an ADT) — the lookup returns None; falls through to
+        // generic Path arm.
+        let src = "\
+            @type MyAlias = u32;\n\
+            @fn f() { let _x := MyAlias::Foo; return; }\n\
+        ";
+        // Should not crash; the type checker leaves it as Unknown.
+        let _ = infer_str(src);
+    }
+
+    #[test]
+    fn t4d_struct_style_variant_args_treated_as_positional() {
+        // `@type Shape = | Circle { r: f32 } | Square { side: f32 };`
+        // — struct-style variants flatten to positional args in T4d.
+        // `Shape::Circle(1.0f32)` works, treating r as positional.
+        let src = "\
+            @type Shape = | Circle { r: f32 } | Square { side: f32 };\n\
+            @fn make() -> Shape { return Shape::Circle(1.0f32); }\n\
+        ";
+        let res = infer_str(src);
+        assert!(
+            res.is_ok(),
+            "struct-style variants positional-T4d; got {res:?}"
+        );
     }
 }
