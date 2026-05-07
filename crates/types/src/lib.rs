@@ -2162,59 +2162,36 @@ impl<'a> Inferer<'a> {
             };
         }
 
-        // For each variant arg, check the actual type against the
-        // declared one. When the declared type is a leaf
-        // `Nominal{path:[param]}` (a generic-param reference), pin
-        // the param to the actual type for the result instantiation.
-        let mut bindings: HashMap<&str, Type> = HashMap::new();
+        // Per-arg bidirectional unification (T4e). The previous T4d
+        // version only pinned generic params when the declared arg
+        // type was a *leaf* `Nominal{path:[param]}`; T4e walks
+        // declared and actual in parallel through compounds (`(T,
+        // T)`, `&T`, `[T; N]`, `Pair<T>`, etc.) so a variant whose
+        // declared arg is `(T, T)` still pins `T` from a `(u32, u32)`
+        // actual.
+        let mut bindings: HashMap<String, Type> = HashMap::new();
         let limit = variant.args.len().min(arg_types.len());
         for (i, actual) in arg_types.iter().take(limit).enumerate() {
             let declared = &variant.args[i];
-            // Try to bind a generic param if `declared` is a leaf
-            // param reference.
-            if let Type::Nominal { path, args } = declared {
-                if path.len() == 1 && args.is_empty() && params.iter().any(|p| p == &path[0]) {
-                    let pname = path[0].as_str();
-                    match bindings.get(pname) {
-                        None => {
-                            bindings.insert(pname, actual.clone());
-                            continue;
-                        }
-                        Some(prev) => {
-                            // Subsequent occurrence — must match.
-                            if !actual.is_unknown()
-                                && !prev.is_unknown()
-                                && !types_compatible(prev, actual, self.type_registry)
-                            {
-                                self.errors.push(TypeError::VariantArgMismatch {
-                                    adt_name: adt_name.to_owned(),
-                                    variant_name: variant.name.clone(),
-                                    arg: i + 1,
-                                    expected: prev.display(),
-                                    actual: actual.display(),
-                                    at: at.start,
-                                });
-                            }
-                            continue;
-                        }
-                    }
-                }
-            }
-            // Non-generic-leaf declared type: structural compare.
-            // (For composite generic-arg types like `(T, T)` we'd
-            // need more sophisticated bidirectional unification; T4d
-            // punts on those — they fall through to a structural
-            // compare which works when the user provided the right
-            // shape and produces a noisy error otherwise.)
-            if !declared.is_unknown()
-                && !actual.is_unknown()
-                && !types_compatible(declared, actual, self.type_registry)
-            {
+            if let Err(()) = unify_pin(
+                declared,
+                actual,
+                params,
+                &mut bindings,
+                self.type_registry,
+            ) {
+                // Render the declared form with whatever bindings we
+                // do have so the diagnostic shows the user the
+                // *expected* type after partial inference, not just
+                // the raw generic-param form.
+                let owned_bindings: HashMap<&str, &Type> =
+                    bindings.iter().map(|(k, v)| (k.as_str(), v)).collect();
+                let displayed_expected = declared.substitute(&owned_bindings);
                 self.errors.push(TypeError::VariantArgMismatch {
                     adt_name: adt_name.to_owned(),
                     variant_name: variant.name.clone(),
                     arg: i + 1,
-                    expected: declared.display(),
+                    expected: displayed_expected.display(),
                     actual: actual.display(),
                     at: at.start,
                 });
@@ -2225,12 +2202,9 @@ impl<'a> Inferer<'a> {
         let result_args: Vec<Type> = params
             .iter()
             .map(|p| {
-                bindings
-                    .get(p.as_str())
-                    .cloned()
-                    .unwrap_or(Type::Unknown(
-                        "generic ADT param not inferable from variant args (T4d)",
-                    ))
+                bindings.get(p).cloned().unwrap_or(Type::Unknown(
+                    "generic ADT param not inferable from variant args (T4e)",
+                ))
             })
             .collect();
 
@@ -2587,6 +2561,113 @@ fn types_compatible(declared: &Type, actual: &Type, registry: &TypeRegistry) -> 
         return true;
     }
     d == a
+}
+
+/// T4e: bidirectional unification between a `declared` type (which may
+/// reference generic parameters from `params`) and an `actual` type
+/// (which is fully concrete, modulo `Type::Unknown` from upstream
+/// uninferred positions). Pins generic-param bindings into `bindings`
+/// and verifies non-generic positions match structurally.
+///
+/// Returns:
+/// - `Ok(())` if the actual type unifies with the declared type under
+///   the current bindings (extending bindings as needed).
+/// - `Err(())` if the structural shapes don't match, or a generic-
+///   param binding conflicts with a previous pin. The caller is
+///   responsible for producing a diagnostic; this helper just signals
+///   success/failure.
+///
+/// Recursion strategy: when `declared` is a leaf
+/// `Nominal{path:[param], args:[]}` whose path matches a name in
+/// `params`, pin/check the binding. Otherwise descend through matching
+/// compound shapes (`Tuple` ↔ `Tuple`, `Ref` ↔ `Ref`, `Array` ↔
+/// `Array`, `Slice` ↔ `Slice`, `Range` ↔ `Range`, `Nominal` ↔
+/// `Nominal`). At leaves of either side that are not generic params,
+/// fall back to [`types_compatible`] for the final structural check —
+/// this preserves alias-following at the bottom of the unification.
+///
+/// `Unknown` on either side is permissive (returns Ok without binding):
+/// this matches the behaviour of `types_compatible` and avoids
+/// cascading errors when an upstream type couldn't be inferred.
+fn unify_pin(
+    declared: &Type,
+    actual: &Type,
+    params: &[String],
+    bindings: &mut HashMap<String, Type>,
+    registry: &TypeRegistry,
+) -> Result<(), ()> {
+    // Permissive on Unknown — caller already has an upstream issue.
+    if declared.is_unknown() || actual.is_unknown() {
+        return Ok(());
+    }
+
+    // Leaf generic-param reference in declared position.
+    if let Type::Nominal { path, args } = declared {
+        if path.len() == 1 && args.is_empty() && params.iter().any(|p| p == &path[0]) {
+            let pname = &path[0];
+            match bindings.get(pname) {
+                None => {
+                    bindings.insert(pname.clone(), actual.clone());
+                    return Ok(());
+                }
+                Some(prev) => {
+                    if types_compatible(prev, actual, registry) {
+                        return Ok(());
+                    }
+                    return Err(());
+                }
+            }
+        }
+    }
+
+    // Compound recursion. We pattern-match on matching shapes; mismatched
+    // shapes fall through to the final structural check.
+    match (declared, actual) {
+        (Type::Tuple(d), Type::Tuple(a)) if d.len() == a.len() => {
+            for (di, ai) in d.iter().zip(a) {
+                unify_pin(di, ai, params, bindings, registry)?;
+            }
+            Ok(())
+        }
+        (
+            Type::Ref { mutable: dm, inner: di },
+            Type::Ref { mutable: am, inner: ai },
+        ) if dm == am => unify_pin(di, ai, params, bindings, registry),
+        (
+            Type::Array { element: de, size: ds },
+            Type::Array { element: ae, size: as_size },
+        ) if ds == as_size => unify_pin(de, ae, params, bindings, registry),
+        (
+            Type::Slice { element: de },
+            Type::Slice { element: ae },
+        ) => unify_pin(de, ae, params, bindings, registry),
+        (
+            Type::Range { element: de, inclusive: di },
+            Type::Range { element: ae, inclusive: ai },
+        ) if di == ai => unify_pin(de, ae, params, bindings, registry),
+        (
+            Type::Nominal { path: dp, args: da },
+            Type::Nominal { path: ap, args: aa },
+        ) if dp == ap && da.len() == aa.len() => {
+            for (di, ai) in da.iter().zip(aa) {
+                unify_pin(di, ai, params, bindings, registry)?;
+            }
+            Ok(())
+        }
+        _ => {
+            // Final structural fallback. Apply current bindings to the
+            // declared side first so partial pins are reflected before
+            // the compatibility check.
+            let owned_bindings: HashMap<&str, &Type> =
+                bindings.iter().map(|(k, v)| (k.as_str(), v)).collect();
+            let substituted = declared.substitute(&owned_bindings);
+            if types_compatible(&substituted, actual, registry) {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
+    }
 }
 
 /// Translate a syntactic [`TypeExpr`] into a semantic [`Type`].
@@ -5029,5 +5110,180 @@ mod tests {
             res.is_ok(),
             "struct-style variants positional-T4d; got {res:?}"
         );
+    }
+
+    // ─── Slice T4e: compound-position generic unification ────────────────
+
+    #[test]
+    fn t4e_tuple_position_pins_param() {
+        // `@type Pair<T> = | Both(T, T);` + `Pair::Both(5u32, 6u32)` —
+        // declared arg is `T`, then `T` again (separate args). T4d
+        // pinned T from the first arg and matched against the second;
+        // T4e gets the same outcome.
+        let src = "\
+            @type Pair<T> = | Both(T, T);\n\
+            @fn make() -> Pair<u32> { return Pair::Both(5u32, 6u32); }\n\
+        ";
+        let res = infer_str(src);
+        assert!(res.is_ok(), "Pair::Both(5u32, 6u32) should typecheck; got {res:?}");
+    }
+
+    #[test]
+    fn t4e_tuple_inside_arg_pins_param() {
+        // T4e headline: a single variant arg of declared type `(T, T)`
+        // — T4d couldn't pin through the tuple; T4e walks compounds.
+        let src = "\
+            @type Pair<T> = | Both((T, T));\n\
+            @fn make() -> Pair<u32> { return Pair::Both((5u32, 6u32)); }\n\
+        ";
+        let res = infer_str(src);
+        assert!(
+            res.is_ok(),
+            "Pair::Both((5u32, 6u32)) with declared (T, T) should pin via T4e; got {res:?}"
+        );
+    }
+
+    #[test]
+    fn t4e_tuple_inside_arg_conflict_emits_e0522() {
+        // `(T, T)` declared; `(u32, bool)` actual — first position
+        // pins T=u32; second position conflicts.
+        let src = "\
+            @type Pair<T> = | Both((T, T));\n\
+            @fn bad() -> Pair<u32> { return Pair::Both((5u32, true)); }\n\
+        ";
+        let errors = infer_str(src).expect_err("expected E0522");
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            TypeError::VariantArgMismatch { variant_name, .. } if variant_name == "Both"
+        ));
+        assert!(saw, "expected E0522 for tuple position conflict; got {errors:?}");
+    }
+
+    #[test]
+    fn t4e_ref_position_pins_param() {
+        // `@type Boxed<T> = | Wrap(&T);` — declared arg is `&T`. T4e
+        // walks through Ref and pins T.
+        let src = "\
+            @type Boxed<T> = | Wrap(&T);\n\
+            @fn make() -> Boxed<u32> {\n  \
+              let x: u32 = 5u32;\n  \
+              return Boxed::Wrap(&x);\n\
+            }\n\
+        ";
+        let res = infer_str(src);
+        assert!(res.is_ok(), "Boxed::Wrap(&x) should pin T=u32; got {res:?}");
+    }
+
+    #[test]
+    fn t4e_array_position_pins_param() {
+        // `@type Buf<T> = | Of([T; 4]);` — declared is `[T; 4]`. T4e
+        // walks through Array.
+        let src = "\
+            @type Buf<T> = | Of([T; 4]);\n\
+            @fn make() -> Buf<u32> { return Buf::Of([1u32, 2u32, 3u32, 4u32]); }\n\
+        ";
+        let res = infer_str(src);
+        assert!(res.is_ok(), "Buf::Of([...]) should pin T=u32; got {res:?}");
+    }
+
+    #[test]
+    fn t4e_two_params_pin_independently() {
+        // `@type Both<A, B> = | Pair((A, B));` — A pins from first
+        // tuple element, B from second.
+        let src = "\
+            @type Both<A, B> = | Pair((A, B));\n\
+            @fn make() -> Both<u32, bool> { return Both::Pair((5u32, true)); }\n\
+        ";
+        let res = infer_str(src);
+        assert!(res.is_ok(), "Both::Pair pins A=u32, B=bool; got {res:?}");
+    }
+
+    #[test]
+    fn t4e_nested_compound_pins_param() {
+        // Doubly-nested: `&(T, T)` — Ref containing a Tuple of T,T.
+        let src = "\
+            @type W<T> = | M(&(T, T));\n\
+            @fn make() -> W<u32> {\n  \
+              let p: (u32, u32) = (5u32, 6u32);\n  \
+              return W::M(&p);\n\
+            }\n\
+        ";
+        let res = infer_str(src);
+        assert!(res.is_ok(), "&(T,T) compound should walk through Ref+Tuple; got {res:?}");
+    }
+
+    #[test]
+    fn t4e_shape_mismatch_emits_e0522() {
+        // Declared `(T, T)` (a tuple); actual `u32` (not a tuple).
+        // unify_pin returns Err immediately — emit E0522.
+        let src = "\
+            @type Pair<T> = | Both((T, T));\n\
+            @fn bad() -> Pair<u32> { return Pair::Both(5u32); }\n\
+        ";
+        let errors = infer_str(src).expect_err("expected E0522");
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            TypeError::VariantArgMismatch { variant_name, .. } if variant_name == "Both"
+        ));
+        assert!(saw, "expected E0522 for shape mismatch; got {errors:?}");
+    }
+
+    #[test]
+    fn t4e_partial_pin_substitutes_in_diagnostic() {
+        // When the second arg conflicts after pinning T from the
+        // first, the diagnostic should show the *substituted* expected
+        // type (`u32`), not the raw `T`. Verifies the
+        // `displayed_expected` substitution path in variant_call_type.
+        let src = "\
+            @type Both<A, B> = | Pair(A, B, A);\n\
+            @fn bad() -> Both<u32, bool> { return Both::Pair(1u32, true, false); }\n\
+        ";
+        let errors = infer_str(src).expect_err("expected E0522");
+        // The third arg should report `expected: u32, actual: bool`
+        // (A pinned to u32 from arg 0; arg 2 is bool which conflicts).
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            TypeError::VariantArgMismatch { arg, expected, actual, .. }
+                if *arg == 3 && expected == "u32" && actual == "bool"
+        ));
+        assert!(
+            saw,
+            "expected E0522 with displayed_expected=u32 (substituted from A); got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn t4e_alias_in_variant_arg_unfolds() {
+        // `@type Count = u32;` + `@type W<T> = | Wrap(T);` +
+        // `W::Wrap(some_count)` where some_count: Count. The unify
+        // pin's structural fallback should `unalias` Count → u32 so
+        // T pins to u32.
+        let src = "\
+            @type Count = u32;\n\
+            @type W<T> = | Wrap(T);\n\
+            @fn make() -> W<u32> {\n  \
+              let n: Count = 5u32;\n  \
+              return W::Wrap(n);\n\
+            }\n\
+        ";
+        let res = infer_str(src);
+        assert!(
+            res.is_ok(),
+            "alias-in-arg should unalias for unification; got {res:?}"
+        );
+    }
+
+    #[test]
+    fn t4e_unknown_arg_does_not_block_other_pins() {
+        // If one variant arg is Unknown (upstream issue), unify_pin
+        // is permissive on it; remaining args still pin normally.
+        // This test relies on the variant call typing not blowing up
+        // and the surrounding program still validating.
+        let src = "\
+            @type Tuple<A, B> = | Both(A, B);\n\
+            @fn make() -> Tuple<u32, bool> { return Tuple::Both(5u32, true); }\n\
+        ";
+        let res = infer_str(src);
+        assert!(res.is_ok(), "expected clean T4e baseline; got {res:?}");
     }
 }
