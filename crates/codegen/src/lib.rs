@@ -1192,6 +1192,17 @@ impl<'a> Emitter<'a> {
             ExprKind::ArrayRepeat { value, count } => {
                 self.emit_array_repeat_expr(expr, value, count)
             }
+            // Slice 7: integer casts (`expr as Type`).
+            //
+            // Source / dest IR types determine the LLVM opcode:
+            //   - same type / same bit-width int → noop
+            //   - dest narrower → `trunc`
+            //   - dest wider, source signed   → `sext`
+            //   - dest wider, source unsigned → `zext`
+            //
+            // Float casts and pointer-int casts are deferred —
+            // the firmware tier doesn't need either yet.
+            ExprKind::Cast { value, ty } => self.emit_cast_expr(value, ty),
             other => Err(CodegenError::NotYetImplemented {
                 what: expr_kind_name(other),
             }),
@@ -1441,6 +1452,63 @@ impl<'a> Emitter<'a> {
             current = next;
         }
         Ok(current)
+    }
+
+    /// Slice 7: lower `value as Type` for integer-to-integer casts.
+    ///
+    /// Today this handler accepts:
+    ///   - identical IR types (no-op, return the source value)
+    ///   - integer source + integer dest of different bit widths:
+    ///     `trunc` for narrowing, `sext`/`zext` for widening
+    ///     (sign-extend if the source's primitive type is signed)
+    ///
+    /// Float casts (`fptrunc` / `fpext` / `fptoui` / `sitofp` etc.)
+    /// and pointer ↔ int casts are out of scope for v0.1 firmware
+    /// and surface as `NotYetImplemented`.
+    fn emit_cast_expr(
+        &mut self,
+        value: &Expr,
+        ty: &TypeExpr,
+    ) -> Result<String, CodegenError> {
+        let src_ir_ty = self.expr_ir_type(value);
+        let dst_ir_ty = self.lower_type(ty)?;
+        let src_value = self.emit_expr(value)?;
+
+        // Same IR type → no instruction needed; just thread the
+        // value through. This handles `5u32 as u32` and other
+        // syntactically-redundant casts the user may have written
+        // for documentation purposes.
+        if src_ir_ty == dst_ir_ty {
+            return Ok(src_value);
+        }
+
+        // Integer-to-integer cast — pick the opcode by bit width.
+        let src_bits = int_bits(&src_ir_ty);
+        let dst_bits = int_bits(&dst_ir_ty);
+        if let (Some(s), Some(d)) = (src_bits, dst_bits) {
+            let opcode = if d < s {
+                "trunc"
+            } else if self.expr_is_signed_int(value) {
+                "sext"
+            } else {
+                "zext"
+            };
+            let result = self.fresh_value();
+            writeln!(
+                &mut self.out,
+                "  {result} = {opcode} {src_ir_ty} {src_value} to {dst_ir_ty}",
+            )
+            .ok();
+            return Ok(result);
+        }
+
+        // Non-integer cast (float ↔ int, ptr ↔ int, struct casts) —
+        // surface as NotYetImplemented so the user gets a useful
+        // error and we know to extend this when the firmware tier
+        // grows a use case.
+        Err(CodegenError::NotYetImplemented {
+            what: "non-integer cast (float / pointer / aggregate)",
+        })
     }
 
     /// Slice 3: lower an automaton field read. The emitted IR is:
@@ -2048,6 +2116,24 @@ fn array_element_ir_type(ir_ty: &str) -> Option<String> {
     // types containing spaces (e.g. `[4 x [4 x i8]]`) survive intact.
     let (_n, t) = body.split_once(" x ")?;
     Some(t.trim().to_owned())
+}
+
+/// Slice 7: bit width for an integer LLVM IR type-text.
+///
+/// Returns `Some(n)` for `i1` / `i8` / `i16` / `i32` / `i64` / `i128`
+/// (the integer types Clifford lowers to today). Returns `None` for
+/// anything else (`void`, `i32*`, `[N x T]`, `{T1, T2}`, `float`, …)
+/// so the caller can dispatch to a different code path.
+fn int_bits(ir_ty: &str) -> Option<u32> {
+    match ir_ty {
+        "i1" => Some(1),
+        "i8" => Some(8),
+        "i16" => Some(16),
+        "i32" => Some(32),
+        "i64" => Some(64),
+        "i128" => Some(128),
+        _ => None,
+    }
 }
 
 /// Slice 6: extract a const integer count from an AST expression
@@ -3692,6 +3778,155 @@ mod tests {
             ir.matches("insertvalue {i32, i32}").count(),
             4,
             "expected 4 inner tuple insertvalues; got:\n{ir}"
+        );
+    }
+
+    // ─── Slice 7: integer cast expressions (trunc / sext / zext) ─────────
+
+    #[test]
+    fn s7_int_bits_table() {
+        assert_eq!(int_bits("i1"), Some(1));
+        assert_eq!(int_bits("i8"), Some(8));
+        assert_eq!(int_bits("i16"), Some(16));
+        assert_eq!(int_bits("i32"), Some(32));
+        assert_eq!(int_bits("i64"), Some(64));
+        assert_eq!(int_bits("i128"), Some(128));
+    }
+
+    #[test]
+    fn s7_int_bits_none_for_non_integer() {
+        assert_eq!(int_bits("void"), None);
+        assert_eq!(int_bits("i32*"), None);
+        assert_eq!(int_bits("[8 x i8]"), None);
+        assert_eq!(int_bits("{i32, i1}"), None);
+        assert_eq!(int_bits("float"), None);
+        assert_eq!(int_bits(""), None);
+    }
+
+    #[test]
+    fn s7_widening_unsigned_emits_zext() {
+        // `5u8 as u32` — zero-extend i8 → i32.
+        let src = "@fn w() -> u32 { return 5u8 as u32; }";
+        let ir = lower_str(src).expect("lower zext widen");
+        assert!(
+            ir.contains("zext i8 5 to i32"),
+            "expected zext i8 -> i32; got:\n{ir}"
+        );
+        // No sext should appear for an unsigned source.
+        assert!(
+            !ir.contains("sext i8"),
+            "unsigned source must not use sext; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s7_widening_signed_emits_sext() {
+        // `-3i8 as i32` — sign-extend i8 → i32. We need an i8 SSA
+        // value so the unary minus runs first; then the cast applies.
+        let src = "@fn w() -> i32 { let v: i8 = -3i8; return v as i32; }";
+        let ir = lower_str(src).expect("lower sext widen");
+        assert!(
+            ir.contains("sext i8"),
+            "expected sext for signed source; got:\n{ir}"
+        );
+        assert!(
+            ir.contains(" to i32"),
+            "expected widening to i32; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s7_narrowing_emits_trunc() {
+        // `5u32 as u8` — truncate i32 → i8. Narrowing is unsigned/signed
+        // agnostic at the IR opcode level (always `trunc`).
+        let src = "@fn n() -> u8 { return 5u32 as u8; }";
+        let ir = lower_str(src).expect("lower trunc");
+        assert!(
+            ir.contains("trunc i32 5 to i8"),
+            "expected trunc i32 -> i8; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s7_same_type_cast_is_noop() {
+        // `5u32 as u32` — no instruction emitted; the SSA value is
+        // returned as-is.
+        let src = "@fn s() -> u32 { return 5u32 as u32; }";
+        let ir = lower_str(src).expect("lower noop cast");
+        assert!(
+            !ir.contains("zext"),
+            "same-type cast should not emit zext; got:\n{ir}"
+        );
+        assert!(
+            !ir.contains("sext"),
+            "same-type cast should not emit sext; got:\n{ir}"
+        );
+        assert!(
+            !ir.contains("trunc"),
+            "same-type cast should not emit trunc; got:\n{ir}"
+        );
+        // The literal `5` is returned directly.
+        assert!(
+            ir.contains("ret i32 5"),
+            "expected direct return of 5; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s7_bool_to_int_emits_zext() {
+        // `true as u32` — zext i1 → i32; bool is always treated as
+        // unsigned for widening.
+        let src = "@fn b() -> u32 { return true as u32; }";
+        let ir = lower_str(src).expect("lower bool widen");
+        assert!(
+            ir.contains("zext i1 1 to i32"),
+            "expected zext i1 (true) -> i32; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s7_chained_cast_widening_then_narrowing() {
+        // `(5u8 as u32) as u16` — zext then trunc.
+        let src = "@fn c() -> u16 { return (5u8 as u32) as u16; }";
+        let ir = lower_str(src).expect("lower chained cast");
+        assert!(ir.contains("zext i8 5 to i32"), "expected zext; got:\n{ir}");
+        assert!(
+            ir.contains(" to i16"),
+            "expected trunc to i16; got:\n{ir}"
+        );
+        assert_eq!(
+            ir.matches("trunc").count(),
+            1,
+            "expected exactly one trunc; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s7_cast_used_inside_larger_expression() {
+        // The cast result feeds a binary op, exercising the SSA-name
+        // threading.
+        let src = "@fn x() -> u32 { return (5u8 as u32) + 1u32; }";
+        let ir = lower_str(src).expect("lower cast in binary");
+        assert!(ir.contains("zext i8 5 to i32"), "expected zext; got:\n{ir}");
+        assert!(
+            ir.contains("add i32"),
+            "expected add i32 using cast result; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s7_signed_narrowing_uses_trunc_not_sext() {
+        // `-1i32 as i8` — narrowing is `trunc` regardless of source
+        // sign; the bits flow through unchanged.
+        let src = "@fn n() -> i8 { let v: i32 = -1i32; return v as i8; }";
+        let ir = lower_str(src).expect("lower signed narrow");
+        assert!(
+            ir.contains("trunc i32"),
+            "expected trunc on signed narrow; got:\n{ir}"
+        );
+        assert!(
+            ir.contains(" to i8"),
+            "expected narrowing to i8; got:\n{ir}"
         );
     }
 
