@@ -7,6 +7,139 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Codegen slice 6: tuple / array / array-repeat literals as values (2026-05-09)
+
+Lowers the three remaining aggregate-literal expression shapes that
+slice 1 stubbed as `NotYetImplemented`. Tuples, array literals, and
+array-repeat literals can now appear anywhere a value is expected
+— `let` initialisers, function arguments, return values, automaton
+field reads.
+
+**The headline shape — aggregate literals lower as SSA values:**
+
+```clifford
+@fn build() {
+  let triple: (u32, bool, u8) = (5u32, true, 7u8);
+  let row:    [u32; 3]        = [10u32, 20u32, 30u32];
+  let buf:    [u8; 64]        = [0u8; 64];
+  return;
+}
+```
+
+→
+
+```llvm
+; tuple
+%1 = insertvalue {i32, i1, i8} undef, i32 5, 0
+%2 = insertvalue {i32, i1, i8} %1, i1 1, 1
+%3 = insertvalue {i32, i1, i8} %2, i8 7, 2
+
+; array literal
+%4 = insertvalue [3 x i32] undef, i32 10, 0
+%5 = insertvalue [3 x i32] %4, i32 20, 1
+%6 = insertvalue [3 x i32] %5, i32 30, 2
+
+; array repeat
+%7  = insertvalue [64 x i8] undef, i8 0, 0
+%8  = insertvalue [64 x i8] %7, i8 0, 1
+…
+%70 = insertvalue [64 x i8] %69, i8 0, 63
+```
+
+LLVM's `insertvalue` instruction is uniform across struct and array
+aggregates, so the chain shape is identical for tuples and arrays;
+the only difference is the aggregate type-text on each line.
+
+**Implementation (`crates/codegen/src/lib.rs`):**
+
+- New `Emitter::emit_tuple_expr(expr, elems)` lowers
+  `ExprKind::Tuple(elems)`. Pulls the aggregate IR type from
+  `expr_ir_type` (typing-driven when typing has the record, syntactic
+  fallback otherwise) and threads each element value into an
+  `insertvalue` chain on `undef`.
+- New `Emitter::emit_array_expr(expr, elems)` lowers
+  `ExprKind::Array(elems)`. Same shape as tuples; rejects empty
+  array literals (`[]`) with a structured `NotYetImplemented` since
+  the type-checker rarely produces a usable element type for them.
+- New `Emitter::emit_array_repeat_expr(expr, value, count)` lowers
+  `ExprKind::ArrayRepeat`. Requires the count to be a const integer
+  literal (decimal / hex / binary, possibly parenthesised). The
+  value is emitted **once** and re-used in every `insertvalue` —
+  preserves "the same value at every index" semantics without
+  re-evaluating side-effecting expressions.
+- New `Emitter::emit_aggregate_insertvalue_chain(agg_ty, elems)`
+  shared core: walks `elems`, emits each element, captures
+  `(ir_type, ssa_value)` pairs, then writes the chain. Used by the
+  tuple and array entry points; the repeat path inlines its own
+  loop because it doesn't need per-element typing.
+- New `const_int_count(expr)` free helper extracts a `usize` count
+  from `IntLit` / `HexLit` / `BinLit` (and their `Paren` wrappers).
+  Returns `None` for any other shape; callers surface that as
+  `NotYetImplemented`.
+- `emit_expr` dispatch grew three arms: `Tuple`, `Array`,
+  `ArrayRepeat`. The fall-through `NotYetImplemented` arm only
+  catches the remaining unimplemented variants.
+
+**Empty edge cases:**
+
+- `[T; 0]` (zero-count repeat) emits a chain of zero `insertvalue`
+  ops; the helper returns `"undef"` directly. The type-checker
+  permits this even though it's rarely useful.
+- `()` (unit) is `TypeKind::Unit` and is not produced by the parser
+  as a tuple expression — it's a separate shape.
+- Single-element tuple syntax `(x,)` isn't part of the v0.1 surface;
+  the parser treats `(x)` as a `Paren` expression.
+
+**Deferred to later slices:**
+
+- Non-const array-repeat counts (`[v; n]` where `n` is a runtime
+  value) — needs a runtime memset / loop. Surfaces as
+  `NotYetImplemented` today.
+- Constant-folding of pure-constant aggregates into LLVM's inline
+  constant-aggregate form (`{i32, i1} {i32 5, i1 true}`) — pure
+  optimization; LLVM's mem2reg + SROA already collapse the
+  `insertvalue` chain into the same code, so deferring this costs
+  nothing at `-O1`+.
+- String literals (`"hello"`) — separate slice; lowers to a global
+  byte array plus a fat pointer.
+- Struct-literal expressions for nominal types — needs ADT
+  lowering support upstream.
+
+**Tests added (`crates/codegen/src/lib.rs::tests`):**
+
+- `s6_const_int_count_parses_decimal_hex_binary` — direct unit
+  test on the helper covering all three integer-literal forms.
+- `s6_const_int_count_returns_none_for_non_literal` — path
+  expressions and other shapes return `None`.
+- `s6_tuple_literal_lowers_to_insertvalue_chain` — 3-tuple of
+  `(u32, bool, u8)`; verifies all three indices.
+- `s6_two_tuple_with_different_element_types` — `(u32, bool)`;
+  smaller smoke.
+- `s6_array_literal_lowers_to_insertvalue_chain` — 3-element u32
+  array.
+- `s6_array_repeat_literal_const_count` — `[0u8; 4]` produces
+  exactly 4 `insertvalue` ops on `[4 x i8]`.
+- `s6_array_repeat_with_non_constant_value_emits_value_once` —
+  `[v; 3]` where `v` is a binary-op SSA name; verifies 3
+  `insertvalue` ops appear (the value is re-used, not
+  re-evaluated).
+- `s6_array_repeat_zero_count_emits_nothing` — `[0u8; 0]` emits
+  zero `insertvalue` ops.
+- `s6_array_repeat_non_const_count_returns_e0810` — `[0u8; n]`
+  where `n` is a runtime variable surfaces
+  `NotYetImplemented`.
+- `s6_nested_tuple_in_array_literal` —
+  `[(1u32, 2u32), (3u32, 4u32)]`; verifies 2 outer + 4 inner
+  `insertvalue` ops.
+
+Plus the existing `unsupported_expression_emits_e0810` test is
+renamed to `tuple_expression_now_lowered_per_slice_6` per the
+project's behavioural-change convention; the assertion flips to
+verify the slice-6 lowering instead of the slice-1 stub error.
+
+Total codegen tests: **95** (85 pre-slice-6 + 10 new). All green;
+clippy clean across the workspace.
+
 ### Added — Codegen slice 5: indexed field operations (2026-05-08)
 
 Closes the slice-3 deferral on indexed-field assignment and adds
