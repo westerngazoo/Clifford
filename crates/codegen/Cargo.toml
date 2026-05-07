@@ -13,8 +13,11 @@ description = "LLVM IR code generation for the Clifford compiler. Implements §8
 
 [dependencies]
 clifford-ast.workspace = true
+clifford-lexer.workspace = true
 clifford-effect.workspace = true
 clifford-ortho.workspace = true
+clifford-resolve.workspace = true
+clifford-types.workspace = true
 thiserror.workspace = true
 
 # Text-form LLVM IR emission in v0.1 (no native LLVM linkage). The
@@ -26,5 +29,4 @@ thiserror.workspace = true
 [dev-dependencies]
 # Tests parse + resolve real Clifford source to exercise lowering
 # end-to-end without re-implementing the upstream phases.
-clifford-lexer.workspace = true
 clifford-parser.workspace = true

@@ -74,8 +74,10 @@ use std::fmt::Write;
 
 use clifford_ast::{
     BinaryOp, Block, Expr, ExprKind, FnDecl, Item, Param, PrimitiveType, Program, Stmt, StmtKind,
-    TypeExpr, TypeKind,
+    TypeExpr, TypeKind, UnaryOp,
 };
+use clifford_resolve::Resolution;
+use clifford_types::{Type, Typing};
 use thiserror::Error;
 
 /// Errors produced during code generation.
@@ -125,11 +127,18 @@ pub enum CodegenError {
 /// Lower a fully-typechecked [`Program`] to text-form LLVM IR.
 ///
 /// The returned string is the contents of a `.ll` file the user can
-/// pipe to `llc` / `clang` for object code. Slice 1 emits a minimal
-/// module containing one LLVM function per `@fn` declaration in the
-/// program; other top-level items (`#automaton`, `#effect`,
-/// `#interrupt`, `@type`, `@trait`, `#interface`, `#impl`, `#test`,
-/// `@sequential`) are silently skipped — they lower in later slices.
+/// pipe to `llc` / `clang` for object code. Slice 1+ emits a module
+/// containing one LLVM function per `@fn` declaration; other top-level
+/// items (`#automaton`, `#effect`, `#interrupt`, `@type`, `@trait`,
+/// `#interface`, `#impl`, `#test`, `@sequential`) are silently skipped
+/// — they lower in later slices.
+///
+/// `resolution` and `typing` come from the upstream `clifford-resolve`
+/// and `clifford-types` phases; the emitter consults them for
+/// authoritative type info on every expression (path lookups, call
+/// return types, signed-vs-unsigned op selection). Slice 1 ran with a
+/// syntactic-guess fallback; slice 2 replaces that with `Typing`-driven
+/// lookup.
 ///
 /// `module_name` ends up in the `; ModuleID = '<name>'` header and the
 /// `source_filename` line; pick something deterministic per source file
@@ -140,23 +149,31 @@ pub enum CodegenError {
 /// Returns `Err(Vec<CodegenError>)` when one or more `@fn` bodies
 /// contain expression / statement shapes this slice can't lower. The
 /// vector accumulates errors across the whole program in source order
-/// (matching the upstream phase convention) so a single pass surfaces
-/// every unhandled construct.
+/// so a single pass surfaces every unhandled construct.
 ///
 /// # Examples
 ///
 /// ```
 /// use clifford_codegen::lower;
 /// use clifford_ast::Program;
+/// use clifford_resolve::Resolution;
+/// use clifford_types::Typing;
 /// let p = Program::default();
-/// let ir = lower(&p, "empty").expect("empty program lowers cleanly");
+/// let r = Resolution::default();
+/// let t = Typing::default();
+/// let ir = lower(&p, &r, &t, "empty").expect("empty program lowers cleanly");
 /// assert!(ir.contains("ModuleID = 'empty'"));
 /// ```
-pub fn lower(program: &Program, module_name: &str) -> Result<String, Vec<CodegenError>> {
-    let mut emitter = Emitter::new(module_name);
+pub fn lower(
+    program: &Program,
+    resolution: &Resolution,
+    typing: &Typing,
+    module_name: &str,
+) -> Result<String, Vec<CodegenError>> {
+    let mut emitter = Emitter::new(module_name, resolution, typing);
     emitter.emit_module_header();
     for item in &program.items {
-        // Slice 1 lowers `Item::Fn` only. Other items (Automaton,
+        // Slice 1+ lowers `Item::Fn` only. Other items (Automaton,
         // Effect, Interrupt, Type, Trait, Interface, Impl, Test,
         // Sequential) silently skip — their lowering lands in
         // subsequent codegen slices. Skipping (rather than emitting
@@ -176,29 +193,50 @@ pub fn lower(program: &Program, module_name: &str) -> Result<String, Vec<Codegen
 // ─── Internal emitter ──────────────────────────────────────────────────────
 
 /// LLVM IR text emitter for one module.
-struct Emitter {
+struct Emitter<'a> {
     /// Module name (goes in the IR header).
     module_name: String,
     /// Accumulating output.
     out: String,
     /// SSA value-ID counter; reset per function.
     next_value_id: u32,
-    /// Local binding map (per current function): source-name → SSA
-    /// value reference (e.g. `"%n"`, `"%add.3"`). Reset per function.
-    /// For function parameters, the value ref is `%<name>`; for `let`
-    /// bindings, an SSA temp like `%let.7`.
-    locals: Vec<(String, String)>,
+    /// Local binding map (per current function). Entries hold the
+    /// source-name, the SSA value reference (e.g. `"%n"` / `"%tmp.3"`),
+    /// and the recorded IR type so path-position references know what
+    /// type to emit alongside the value. Reset per function. For
+    /// function parameters, the value ref is `%<name>`; for `let`
+    /// bindings, an SSA temp like `%tmp.7`.
+    locals: Vec<LocalBinding>,
+    /// Resolution from `clifford-resolve` — used to look up bindings
+    /// when the typing path needs cross-referencing.
+    #[allow(dead_code)] // forward-compat for slice 3+ (cross-fn sig lookup)
+    resolution: &'a Resolution,
+    /// Typing from `clifford-types` — authoritative source for every
+    /// expression's type. Used by [`Self::expr_ir_type`] to pick the
+    /// right LLVM IR type without falling back to syntactic guesses.
+    typing: &'a Typing,
     /// Errors collected across the whole program.
     errors: Vec<CodegenError>,
 }
 
-impl Emitter {
-    fn new(module_name: &str) -> Self {
+/// One per-function local binding: source name + SSA-value ref + IR
+/// type. Slice 2 tracks the IR type alongside the value so path-
+/// position lookups don't need to re-walk the typing map.
+struct LocalBinding {
+    name: String,
+    value: String,
+    ir_type: String,
+}
+
+impl<'a> Emitter<'a> {
+    fn new(module_name: &str, resolution: &'a Resolution, typing: &'a Typing) -> Self {
         Self {
             module_name: module_name.to_owned(),
             out: String::new(),
             next_value_id: 0,
             locals: Vec::new(),
+            resolution,
+            typing,
             errors: Vec::new(),
         }
     }
@@ -224,7 +262,7 @@ impl Emitter {
         let ret_ty = self.lower_return_type(decl.return_type.as_ref());
 
         // Param list: each param's source name is also its IR value
-        // name (`%<name>`) for slice-1 simplicity. Future slice with
+        // name (`%<name>`) for slice-1+ simplicity. Future slice with
         // a richer name-resolution pass may rename to avoid clashes.
         let mut sig_parts: Vec<String> = Vec::with_capacity(decl.params.len());
         for p in &decl.params {
@@ -235,8 +273,14 @@ impl Emitter {
                     return;
                 }
             }
-            // Register the param as a local: name → `%<name>`.
-            self.locals.push((p.name.clone(), format!("%{}", p.name)));
+            // Register the param as a local: name → `%<name>`, with
+            // its IR type for later path-lookup typing (slice 2+).
+            let p_ir_ty = self.lower_type(&p.ty).unwrap_or_else(|_| "i32".to_owned());
+            self.locals.push(LocalBinding {
+                name: p.name.clone(),
+                value: format!("%{}", p.name),
+                ir_type: p_ir_ty,
+            });
         }
 
         writeln!(
@@ -299,7 +343,7 @@ impl Emitter {
             StmtKind::Return(Some(e)) => {
                 // Compute the return-value IR type *before* emit_expr
                 // takes a mutable borrow on self.
-                let ret_ty = self.infer_expr_ir_type(e);
+                let ret_ty = self.expr_ir_type(e);
                 match self.emit_expr(e) {
                     Ok(v) => {
                         writeln!(&mut self.out, "  ret {ret_ty} {v}").ok();
@@ -316,45 +360,30 @@ impl Emitter {
                         self.errors.push(e);
                         "i32".to_owned() // best-effort fallback
                     }),
-                    None => self.infer_expr_ir_type(value),
+                    None => self.expr_ir_type(value),
                 };
                 match self.emit_expr(value) {
                     Ok(v) => {
-                        // Allocate an SSA temp via `add 0, v` (cheap
-                        // identity that gives us a named local).
-                        // LLVM will optimise this away. Keeps the
-                        // emitter simple — no need to track whether
-                        // `v` is already an SSA name.
-                        let bind = self.fresh_value();
-                        if ir_ty.starts_with('i') || ir_ty == "i1" {
-                            writeln!(&mut self.out, "  {bind} = add {ir_ty} 0, {v}").ok();
-                        } else if ir_ty == "float" || ir_ty == "double" {
-                            writeln!(&mut self.out, "  {bind} = fadd {ir_ty} 0.0, {v}").ok();
-                        } else {
-                            // Fallback: register `v` directly as the
-                            // binding (no temp).
-                            self.locals.push((name.clone(), v.clone()));
-                            return;
-                        }
-                        self.locals.push((name.clone(), bind));
+                        let bind = self.bind_via_identity(&ir_ty, &v);
+                        self.locals.push(LocalBinding {
+                            name: name.clone(),
+                            value: bind,
+                            ir_type: ir_ty,
+                        });
                     }
                     Err(e) => self.errors.push(e),
                 }
             }
             StmtKind::LetShort { name, value, .. } => {
-                let ir_ty = self.infer_expr_ir_type(value);
+                let ir_ty = self.expr_ir_type(value);
                 match self.emit_expr(value) {
                     Ok(v) => {
-                        let bind = self.fresh_value();
-                        if ir_ty.starts_with('i') || ir_ty == "i1" {
-                            writeln!(&mut self.out, "  {bind} = add {ir_ty} 0, {v}").ok();
-                        } else if ir_ty == "float" || ir_ty == "double" {
-                            writeln!(&mut self.out, "  {bind} = fadd {ir_ty} 0.0, {v}").ok();
-                        } else {
-                            self.locals.push((name.clone(), v.clone()));
-                            return;
-                        }
-                        self.locals.push((name.clone(), bind));
+                        let bind = self.bind_via_identity(&ir_ty, &v);
+                        self.locals.push(LocalBinding {
+                            name: name.clone(),
+                            value: bind,
+                            ir_type: ir_ty,
+                        });
                     }
                     Err(e) => self.errors.push(e),
                 }
@@ -395,11 +424,93 @@ impl Emitter {
                 }
             }
             ExprKind::Paren(inner) => self.emit_expr(inner),
+            ExprKind::Unary { op, operand } => self.emit_unary(*op, operand),
             ExprKind::Binary { op, lhs, rhs } => self.emit_binary(*op, lhs, rhs),
-            ExprKind::Call { callee, args } => self.emit_call(callee, args),
+            ExprKind::Call { callee, args } => self.emit_call(expr, callee, args),
             other => Err(CodegenError::NotYetImplemented {
                 what: expr_kind_name(other),
             }),
+        }
+    }
+
+    /// Emit an SSA-binding identity instruction so a value gets a
+    /// stable name. For integer types we use `add ty 0, v`; for
+    /// floats `fadd ty 0.0, v`. LLVM's optimiser flattens these
+    /// trivially.
+    ///
+    /// For *non-scalar* types (Refs, structs, vectors), the identity
+    /// idiom doesn't apply directly. The caller falls back to using
+    /// the value reference as-is (no rebinding) — which is fine
+    /// because non-scalar `let` bindings already produce SSA names
+    /// at their producing instruction (e.g. `getelementptr`).
+    fn bind_via_identity(&mut self, ir_ty: &str, v: &str) -> String {
+        if is_integer_ir_type(ir_ty) {
+            let bind = self.fresh_value();
+            writeln!(&mut self.out, "  {bind} = add {ir_ty} 0, {v}").ok();
+            bind
+        } else if ir_ty == "float" || ir_ty == "double" {
+            let bind = self.fresh_value();
+            writeln!(&mut self.out, "  {bind} = fadd {ir_ty} 0.0, {v}").ok();
+            bind
+        } else {
+            // Non-scalar — pass through. The producing instruction
+            // already named the value.
+            v.to_owned()
+        }
+    }
+
+    fn emit_unary(&mut self, op: UnaryOp, operand: &Expr) -> Result<String, CodegenError> {
+        match op {
+            UnaryOp::Neg => {
+                let v = self.emit_expr(operand)?;
+                let ir_ty = self.expr_ir_type(operand);
+                let dst = self.fresh_value();
+                if is_integer_ir_type(&ir_ty) {
+                    // `-x` ≡ `0 - x`.
+                    writeln!(&mut self.out, "  {dst} = sub {ir_ty} 0, {v}").ok();
+                } else if ir_ty == "float" || ir_ty == "double" {
+                    writeln!(&mut self.out, "  {dst} = fneg {ir_ty} {v}").ok();
+                } else {
+                    return Err(CodegenError::NotYetImplemented {
+                        what: "unary `-` on non-scalar type",
+                    });
+                }
+                Ok(dst)
+            }
+            UnaryOp::Not => {
+                // Logical NOT on `bool` (i1): `xor i1 v, true`.
+                let v = self.emit_expr(operand)?;
+                let dst = self.fresh_value();
+                writeln!(&mut self.out, "  {dst} = xor i1 {v}, true").ok();
+                Ok(dst)
+            }
+            UnaryOp::BitNot => {
+                let v = self.emit_expr(operand)?;
+                let ir_ty = self.expr_ir_type(operand);
+                if !is_integer_ir_type(&ir_ty) {
+                    return Err(CodegenError::NotYetImplemented {
+                        what: "bitwise `~` on non-integer type",
+                    });
+                }
+                let dst = self.fresh_value();
+                // `~x` ≡ `xor x, -1` (LLVM accepts -1 as all-ones).
+                writeln!(&mut self.out, "  {dst} = xor {ir_ty} {v}, -1").ok();
+                Ok(dst)
+            }
+            UnaryOp::Deref => {
+                // `*r` on `r: &T` lowers to `load T, T* %r`. We need
+                // the pointee type — peek at the operand's recorded
+                // type (which should be a Ref) and unwrap one layer.
+                let v = self.emit_expr(operand)?;
+                let pointee_ir_ty = self.expr_pointee_ir_type(operand)?;
+                let dst = self.fresh_value();
+                writeln!(
+                    &mut self.out,
+                    "  {dst} = load {pointee_ir_ty}, {pointee_ir_ty}* {v}"
+                )
+                .ok();
+                Ok(dst)
+            }
         }
     }
 
@@ -411,20 +522,31 @@ impl Emitter {
     ) -> Result<String, CodegenError> {
         let l = self.emit_expr(lhs)?;
         let r = self.emit_expr(rhs)?;
-        let ir_ty = self.infer_expr_ir_type(lhs);
+        let ir_ty = self.expr_ir_type(lhs);
+        // Slice 2: signed-vs-unsigned division/remainder driven by
+        // the operand's recorded type. `udiv`/`urem` for unsigned
+        // primitives (u8/u16/u32/u64/usize), `sdiv`/`srem` for
+        // signed (i8/i16/i32/i64/isize). Float div/rem will land
+        // alongside float-arithmetic support in a later slice.
+        let signed = self.expr_is_signed_int(lhs);
         let opcode = match op {
             BinaryOp::Add => "add",
             BinaryOp::Sub => "sub",
             BinaryOp::Mul => "mul",
-            // Integer division and remainder use signed/unsigned
-            // variants. Slice 1 picks `udiv`/`urem` for unsigned and
-            // `sdiv`/`srem` for signed; the fn's return type would
-            // tell us which to use, but for slice-1 simplicity we
-            // pick the unsigned form (matches `u32` etc., which is
-            // the most common in firmware). Signed-integer support
-            // lands in slice 2.
-            BinaryOp::Div => "udiv",
-            BinaryOp::Rem => "urem",
+            BinaryOp::Div => {
+                if signed {
+                    "sdiv"
+                } else {
+                    "udiv"
+                }
+            }
+            BinaryOp::Rem => {
+                if signed {
+                    "srem"
+                } else {
+                    "urem"
+                }
+            }
             other => {
                 return Err(CodegenError::NotYetImplemented {
                     what: binary_op_name(other),
@@ -436,8 +558,13 @@ impl Emitter {
         Ok(dst)
     }
 
-    fn emit_call(&mut self, callee: &Expr, args: &[Expr]) -> Result<String, CodegenError> {
-        // Slice 1: only single-segment Path callees are supported.
+    fn emit_call(
+        &mut self,
+        call_expr: &Expr,
+        callee: &Expr,
+        args: &[Expr],
+    ) -> Result<String, CodegenError> {
+        // Slice 1+: only single-segment Path callees are supported.
         let name = match &callee.kind {
             ExprKind::Path(segs) if segs.len() == 1 => segs[0].clone(),
             _ => {
@@ -449,13 +576,15 @@ impl Emitter {
         let mut arg_strs: Vec<String> = Vec::with_capacity(args.len());
         for a in args {
             let v = self.emit_expr(a)?;
-            let ty = self.infer_expr_ir_type(a);
+            let ty = self.expr_ir_type(a);
             arg_strs.push(format!("{ty} {v}"));
         }
-        // Return type — slice 1 doesn't have access to the typed AST,
-        // so we infer from context. For the smoke surface we punt to
-        // i32 if we can't tell. Future slice will pass `Typing` in.
-        let ret_ty = "i32";
+        // Return type via Typing (slice 2). The type checker records
+        // the call's *result* type under the outer call expression's
+        // span (`call_expr.span`), not the callee identifier's span,
+        // so we look up there. Fallback to i32 if typing has nothing
+        // (partial / failed typing).
+        let ret_ty = self.expr_ir_type(call_expr);
         let dst = self.fresh_value();
         writeln!(
             &mut self.out,
@@ -466,36 +595,71 @@ impl Emitter {
         Ok(dst)
     }
 
-    /// Best-effort guess at an expression's IR type without consulting
-    /// the typed AST. Slice 1 doesn't take `Typing` as input, so this
-    /// uses syntactic clues only:
+    /// Slice 2 typing-aware IR-type lookup. Consults `Typing` first
+    /// for the expression's recorded `Type`; falls back to syntactic
+    /// clues only when typing has nothing for the span (which can
+    /// happen on partial/unknown typings).
     ///
-    /// - Integer literals with a suffix → that suffix's IR type.
-    /// - Boolean literals → `i1`.
-    /// - Path expressions → the local's recorded type if present;
-    ///   otherwise `i32` as a default.
-    /// - Binary / Call / Paren → recurse into the dominant operand.
-    ///
-    /// A subsequent slice will take `&Typing` and replace this with
-    /// authoritative type info — `&self` is kept on the signature now
-    /// so call sites don't churn when the typing-aware version lands.
-    #[allow(clippy::only_used_in_recursion)] // forward-compat; see doc above
-    fn infer_expr_ir_type(&self, expr: &Expr) -> String {
+    /// Path expressions: when typing is silent, the local-binding
+    /// table's recorded `ir_type` is the next authority — a let
+    /// binding registered its IR type at declaration and we honor it.
+    fn expr_ir_type(&self, expr: &Expr) -> String {
+        if let Some(ty) = self.typing.lookup(expr.span) {
+            return type_to_ir(ty);
+        }
+        // Fallback (typing has nothing for this expr): syntactic
+        // guess so partial inputs still produce SOME IR. Path
+        // expressions consult the local-binding table.
         match &expr.kind {
             ExprKind::IntLit(s) | ExprKind::HexLit(s) | ExprKind::BinLit(s) => {
                 int_literal_ir_type(s).to_owned()
             }
             ExprKind::BoolLit(_) => "i1".to_owned(),
-            ExprKind::Paren(inner) => self.infer_expr_ir_type(inner),
-            ExprKind::Binary { lhs, .. } => self.infer_expr_ir_type(lhs),
-            ExprKind::Path(_) => {
-                // No type-aware fallback yet; default i32. The future
-                // typed-AST slice replaces this with the recorded
-                // type.
-                "i32".to_owned()
-            }
-            ExprKind::Call { .. } => "i32".to_owned(),
+            ExprKind::Paren(inner) => self.expr_ir_type(inner),
+            ExprKind::Binary { lhs, .. } => self.expr_ir_type(lhs),
+            ExprKind::Path(segs) if segs.len() == 1 => self
+                .lookup_local_ir_type(&segs[0])
+                .unwrap_or_else(|| "i32".to_owned()),
             _ => "i32".to_owned(),
+        }
+    }
+
+    /// True if the expression's type is a signed integer primitive.
+    /// Used to pick `sdiv`/`srem` over `udiv`/`urem`.
+    fn expr_is_signed_int(&self, expr: &Expr) -> bool {
+        if let Some(ty) = self.typing.lookup(expr.span) {
+            return matches!(
+                ty,
+                Type::Primitive(
+                    PrimitiveType::I8
+                        | PrimitiveType::I16
+                        | PrimitiveType::I32
+                        | PrimitiveType::I64
+                        | PrimitiveType::Isize
+                )
+            );
+        }
+        // Syntactic fallback: integer literal suffixes.
+        match &expr.kind {
+            ExprKind::IntLit(s) | ExprKind::HexLit(s) | ExprKind::BinLit(s) => {
+                let suffix = literal_suffix(s);
+                matches!(suffix, "i8" | "i16" | "i32" | "i64" | "isize")
+            }
+            ExprKind::Paren(inner) => self.expr_is_signed_int(inner),
+            ExprKind::Binary { lhs, .. } => self.expr_is_signed_int(lhs),
+            _ => false, // default to unsigned (firmware-friendly)
+        }
+    }
+
+    /// Return the IR type of the *pointee* when the operand is a
+    /// reference. Used by `*r` deref lowering. Errors if the operand
+    /// isn't typed as a reference.
+    fn expr_pointee_ir_type(&self, operand: &Expr) -> Result<String, CodegenError> {
+        match self.typing.lookup(operand.span) {
+            Some(Type::Ref { inner, .. }) => Ok(type_to_ir(inner)),
+            _ => Err(CodegenError::NotYetImplemented {
+                what: "deref of non-reference operand (Typing didn't record a Ref type)",
+            }),
         }
     }
 
@@ -504,7 +668,14 @@ impl Emitter {
         self.locals
             .iter()
             .rev()
-            .find_map(|(n, v)| if n == name { Some(v.as_str()) } else { None })
+            .find_map(|b| if b.name == name { Some(b.value.as_str()) } else { None })
+    }
+
+    fn lookup_local_ir_type(&self, name: &str) -> Option<String> {
+        self.locals
+            .iter()
+            .rev()
+            .find_map(|b| if b.name == name { Some(b.ir_type.clone()) } else { None })
     }
 
     fn lower_return_type(&mut self, ret: Option<&TypeExpr>) -> String {
@@ -517,15 +688,92 @@ impl Emitter {
         }
     }
 
+    // `&mut self` is kept on lower_type for forward-compat: when ADT
+    // / nominal lowering lands (codegen slice 3+) it'll need to mutate
+    // emitter state (e.g. emit out-of-line struct type definitions
+    // for tagged-union ADT representations), and forcing call sites
+    // to thread `&mut` now is cheaper than churning later.
+    #[allow(clippy::only_used_in_recursion)]
     fn lower_type(&mut self, t: &TypeExpr) -> Result<String, CodegenError> {
         match &t.kind {
             TypeKind::Unit => Ok("void".to_owned()),
             TypeKind::Primitive(p) => Ok(primitive_ir_type(*p).to_owned()),
-            // Composite + nominal types lower in subsequent slices.
+            TypeKind::Ref(rt) => {
+                // `&T` / `&mut T` → `T*` per §8.3. Slice 2 doesn't yet
+                // emit `noalias` on `&mut` parameters at the IR-attribute
+                // level (param attributes go on the `define` line, not
+                // the type); a future slice will thread mutability
+                // through to attribute generation.
+                let inner = self.lower_type(&rt.inner)?;
+                Ok(format!("{inner}*"))
+            }
+            TypeKind::Array(at) => {
+                use clifford_ast::ArraySize;
+                let ArraySize::IntLiteral(size) = &at.size;
+                let elem = self.lower_type(&at.element)?;
+                // LLVM accepts a literal integer; strip underscores.
+                let n: String = size.chars().filter(|c| *c != '_').collect();
+                Ok(format!("[{n} x {elem}]"))
+            }
+            TypeKind::Slice(st) => {
+                // `[T]` is the standard fat-pointer (ptr + len) layout
+                // per §8.3. We emit `{T*, i64}`.
+                let elem = self.lower_type(&st.element)?;
+                Ok(format!("{{{elem}*, i64}}"))
+            }
+            TypeKind::Tuple(tt) => {
+                // `(T1, T2, …)` → LLVM struct.
+                let mut parts: Vec<String> = Vec::with_capacity(tt.elements.len());
+                for e in &tt.elements {
+                    parts.push(self.lower_type(e)?);
+                }
+                Ok(format!("{{{}}}", parts.join(", ")))
+            }
+            // `Path(...)` (nominal-type aliases / ADTs) and
+            // `Access(...)` and `Fn(...)` defer to subsequent slices.
+            // ADT lowering needs tagged-union representation; access
+            // pointer types follow the `&T` shape but with target-
+            // specific provenance (Decision #19); fn pointers need
+            // their full signature lowered.
             _ => Err(CodegenError::NotYetImplemented {
                 what: type_kind_name(&t.kind),
             }),
         }
+    }
+}
+
+/// Translate a `clifford_types::Type` to its LLVM IR type-text form.
+///
+/// Used by [`Emitter::expr_ir_type`] when typing has a recorded type
+/// for an expression. Mirrors [`Emitter::lower_type`] but operates on
+/// the semantic `Type` rather than the syntactic `TypeExpr`.
+fn type_to_ir(ty: &Type) -> String {
+    match ty {
+        Type::Unit => "void".to_owned(),
+        Type::Primitive(p) => primitive_ir_type(*p).to_owned(),
+        Type::Ref { inner, .. } => format!("{}*", type_to_ir(inner)),
+        Type::Array { element, size } => {
+            let n: String = size.chars().filter(|c| *c != '_').collect();
+            format!("[{n} x {}]", type_to_ir(element))
+        }
+        Type::Slice { element } => format!("{{{}*, i64}}", type_to_ir(element)),
+        Type::Tuple(elems) => {
+            let parts: Vec<String> = elems.iter().map(type_to_ir).collect();
+            format!("{{{}}}", parts.join(", "))
+        }
+        Type::Range { element, .. } => {
+            // Range value type — codegen for sigma loops will lower
+            // these explicitly. Outside of sigma context, treat as
+            // `{T, T}` (lo, hi pair).
+            let e = type_to_ir(element);
+            format!("{{{e}, {e}}}")
+        }
+        Type::StringSlice => "{i8*, i64}".to_owned(),
+        // Nominals (aliases / ADTs) and Unknown — slice-2 punt:
+        // aliases should have been unaliased upstream (T4b); ADTs
+        // need tagged-union lowering (codegen slice 3+); Unknown
+        // becomes `i32` as a conservative best-effort.
+        Type::Nominal { .. } | Type::Unknown(_) => "i32".to_owned(),
     }
 }
 
@@ -550,6 +798,26 @@ const fn primitive_ir_type(p: PrimitiveType) -> &'static str {
         PrimitiveType::F32 => "float",
         PrimitiveType::F64 => "double",
     }
+}
+
+/// True if the IR type-text names an integer LLVM type (`i1`, `i8`,
+/// `i16`, `i32`, `i64`, `i128`, …). Used to gate integer-only ops
+/// (the SSA-add-zero binding idiom; integer-shape unary `-` and
+/// `~`; integer-only div/rem).
+fn is_integer_ir_type(ir_ty: &str) -> bool {
+    if let Some(rest) = ir_ty.strip_prefix('i') {
+        rest.bytes().all(|b| b.is_ascii_digit()) && !rest.is_empty()
+    } else {
+        false
+    }
+}
+
+/// Extract the alphabetic suffix from an integer literal (after the
+/// digits / hex / binary body). Returns `""` for an unsuffixed
+/// literal; otherwise something like `"u32"` or `"isize"`.
+fn literal_suffix(literal: &str) -> &str {
+    let trimmed_len = literal.trim_end_matches(|c: char| c.is_ascii_alphabetic()).len();
+    &literal[trimmed_len..]
 }
 
 /// Pick an IR integer-type from an integer literal's source suffix.
@@ -808,11 +1076,19 @@ mod tests {
     use super::*;
     use clifford_lexer::tokenize;
     use clifford_parser::parse;
+    use clifford_resolve::resolve;
+    use clifford_types::infer;
 
     fn lower_str(src: &str) -> Result<String, Vec<CodegenError>> {
         let tokens = tokenize(src).expect("tokenize");
         let program = parse(&tokens).expect("parse");
-        lower(&program, "test")
+        let resolution = resolve(&program).expect("resolve");
+        // Allow typing failures: tests may exercise programs that
+        // have type errors but still want to verify codegen's
+        // syntactic-fallback behaviour. When typing fails we use
+        // a default empty Typing.
+        let typing = infer(&program, &resolution).unwrap_or_default();
+        lower(&program, &resolution, &typing, "test")
     }
 
     // ─── Module + empty-program shape ────────────────────────────────────
@@ -969,13 +1245,16 @@ mod tests {
 
     #[test]
     fn unsupported_type_emits_e0810() {
-        // Reference types don't lower in slice 1.
-        let src = "@fn r(x: &u32) -> u32 { return 0u32; }";
-        let errors = lower_str(src).expect_err("expected E0810 for ref");
+        // Slice 2 supports `&T` / `[T; N]` / `[T]` / `(T1, T2)`, but
+        // `access<T>` (Decision #19's nominal pointer) still defers
+        // to a later codegen slice — its lowering needs target-
+        // specific provenance handling.
+        let src = "@fn r(p: access<u32>) -> u32 { return 0u32; }";
+        let errors = lower_str(src).expect_err("expected E0810 for access<T>");
         let saw = errors
             .iter()
-            .any(|e| matches!(e, CodegenError::NotYetImplemented { what } if *what == "reference type"));
-        assert!(saw, "expected NotYetImplemented(reference); got {errors:?}");
+            .any(|e| matches!(e, CodegenError::NotYetImplemented { what } if *what == "access<T> type"));
+        assert!(saw, "expected NotYetImplemented(access); got {errors:?}");
     }
 
     // ─── Primitive type-mapping table ────────────────────────────────────
@@ -1085,5 +1364,162 @@ mod tests {
             double_tmp_zero >= 1,
             "expected %tmp.0 in at least one fn; got:\n{ir}"
         );
+    }
+
+    // ─── Slice 2: typing integration + sign-aware ops + composites ───────
+
+    #[test]
+    fn s2_signed_div_uses_sdiv() {
+        // i32 div should use `sdiv`, not `udiv` (the slice-1 default).
+        let ir = lower_str("@fn d(a: i32, b: i32) -> i32 { return a / b; }")
+            .expect("lower signed div");
+        assert!(ir.contains("sdiv i32"), "expected sdiv; got:\n{ir}");
+        assert!(!ir.contains("udiv i32"), "should not have udiv; got:\n{ir}");
+    }
+
+    #[test]
+    fn s2_signed_rem_uses_srem() {
+        let ir = lower_str("@fn r(a: i32, b: i32) -> i32 { return a % b; }")
+            .expect("lower signed rem");
+        assert!(ir.contains("srem i32"), "expected srem; got:\n{ir}");
+    }
+
+    #[test]
+    fn s2_unsigned_div_still_uses_udiv() {
+        // Sanity check: u32 still picks `udiv` post-T2.
+        let ir = lower_str("@fn d(a: u32, b: u32) -> u32 { return a / b; }")
+            .expect("lower unsigned div");
+        assert!(ir.contains("udiv i32"), "expected udiv; got:\n{ir}");
+    }
+
+    #[test]
+    fn s2_unary_neg_int() {
+        // `-x` for i32 lowers to `sub i32 0, x`.
+        let ir = lower_str("@fn n(x: i32) -> i32 { return -x; }").expect("lower neg");
+        assert!(ir.contains("sub i32 0, %x"), "expected sub 0,x; got:\n{ir}");
+    }
+
+    #[test]
+    fn s2_unary_not_bool() {
+        let ir = lower_str("@fn no(b: bool) -> bool { return !b; }").expect("lower not");
+        assert!(ir.contains("xor i1 %b, true"), "expected xor i1; got:\n{ir}");
+    }
+
+    #[test]
+    fn s2_unary_bitnot_int() {
+        let ir = lower_str("@fn bn(x: u32) -> u32 { return ~x; }").expect("lower bitnot");
+        assert!(ir.contains("xor i32 %x, -1"), "expected xor -1; got:\n{ir}");
+    }
+
+    #[test]
+    fn s2_ref_type_in_signature() {
+        // `&T` lowers as `T*`. Slice 2 supports this in the signature.
+        let ir = lower_str("@fn r(p: &u32) -> u32 { return 0u32; }")
+            .expect("lower ref signature");
+        assert!(
+            ir.contains("define i32 @r(i32* %p)"),
+            "expected i32* param; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s2_ref_mut_type_in_signature() {
+        // `&mut T` also lowers as `T*` (mutability-as-attribute is
+        // a future slice; the IR-type form is the same).
+        let ir = lower_str("@fn r(p: &mut u32) -> u32 { return 0u32; }")
+            .expect("lower &mut signature");
+        assert!(
+            ir.contains("define i32 @r(i32* %p)"),
+            "expected i32* (mut as attr later); got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s2_array_type_in_signature() {
+        let ir = lower_str("@fn a(buf: [u8; 64]) { return; }")
+            .expect("lower array signature");
+        assert!(
+            ir.contains("define void @a([64 x i8] %buf)"),
+            "expected [64 x i8] param; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s2_tuple_type_in_signature() {
+        let ir = lower_str("@fn t(p: (u32, bool)) { return; }")
+            .expect("lower tuple signature");
+        assert!(
+            ir.contains("define void @t({i32, i1} %p)"),
+            "expected {{i32, i1}} param; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s2_deref_loads_through_ref() {
+        // `*p` for `p: &u32` lowers to `load i32, i32* %p`.
+        let ir = lower_str("@fn d(p: &u32) -> u32 { return *p; }")
+            .expect("lower deref");
+        assert!(
+            ir.contains("load i32, i32* %p"),
+            "expected typed load; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s2_typing_path_lookup_uses_recorded_type() {
+        // A `let x: u8 = …` binding has IR type `i8`. When `x` is
+        // used in path position, slice 2's typing lookup picks `i8`
+        // (slice 1 would have defaulted to i32). Verify by checking
+        // that the SSA-bind add uses i8.
+        let ir = lower_str("@fn f(a: u8) -> u8 { let _x: u8 = a; return _x; }")
+            .expect("lower typed let");
+        assert!(
+            ir.contains("add i8 0, %a"),
+            "expected SSA-bind via add i8; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("ret i8 %tmp."),
+            "expected ret i8 of bound value; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s2_call_return_type_via_typing() {
+        // The callee returns `bool`. Slice 1 always picked `i32` for
+        // call return types; slice 2 reads the typing map and picks
+        // the right type.
+        let src = "\
+            @fn returns_bool() -> bool { return true; }\n\
+            @fn caller() -> bool { return returns_bool(); }\n\
+        ";
+        let ir = lower_str(src).expect("lower bool-returning call");
+        // Check the call site uses `i1` for the return.
+        assert!(
+            ir.contains("call i1 @returns_bool()"),
+            "expected `call i1` for bool-returning fn; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s2_signed_division_with_signed_param() {
+        // The lhs is i64; div should be sdiv.
+        let ir = lower_str("@fn d(a: i64, b: i64) -> i64 { return a / b; }")
+            .expect("lower i64 div");
+        assert!(ir.contains("sdiv i64"), "expected sdiv i64; got:\n{ir}");
+    }
+
+    #[test]
+    fn s2_isize_treated_as_signed() {
+        // isize lowers to i64 and is signed → sdiv.
+        let ir = lower_str("@fn d(a: isize, b: isize) -> isize { return a / b; }")
+            .expect("lower isize div");
+        assert!(ir.contains("sdiv i64"), "expected sdiv i64; got:\n{ir}");
+    }
+
+    #[test]
+    fn s2_usize_treated_as_unsigned() {
+        let ir = lower_str("@fn d(a: usize, b: usize) -> usize { return a / b; }")
+            .expect("lower usize div");
+        assert!(ir.contains("udiv i64"), "expected udiv i64; got:\n{ir}");
     }
 }
