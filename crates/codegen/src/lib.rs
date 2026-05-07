@@ -245,6 +245,13 @@ struct Emitter<'a> {
     /// `#transition` body. `None` outside of transitions. Used to
     /// resolve `Self.field` to the correct automaton.
     enclosing_owner: Option<String>,
+    /// Decision #22 codegen consumer: when the current callable is
+    /// marked `Release` / `SeqCst`, this carries the LLVM fence
+    /// ordering that must be emitted **before each `ret`**. `None`
+    /// means no exit fence. Set per-callable in
+    /// [`Self::emit_effect`] / [`Self::emit_interrupt`] /
+    /// [`Self::emit_transition`].
+    pending_exit_fence: Option<&'static str>,
     /// Errors collected across the whole program.
     errors: Vec<CodegenError>,
 }
@@ -288,6 +295,7 @@ impl<'a> Emitter<'a> {
             typing,
             automatons: HashMap::new(),
             enclosing_owner: None,
+            pending_exit_fence: None,
             errors: Vec::new(),
         }
     }
@@ -357,6 +365,11 @@ impl<'a> Emitter<'a> {
     /// lowered like `@fn` but with mutation access to the automatons
     /// listed in their `#mutates` clause; this slice's body walker
     /// handles `#mutate` / mutation-sugar / automaton-field reads.
+    ///
+    /// Decision #22 codegen consumer: if the trait list contains
+    /// `Acquire` / `Release` / `SeqCst`, an LLVM `fence` is emitted
+    /// at the function entry and/or before each `ret`. See
+    /// [`memory_ordering_from_traits`].
     fn emit_effect(&mut self, decl: &EffectDecl) {
         // Reset per-function state.
         self.next_value_id = 0;
@@ -382,6 +395,10 @@ impl<'a> Emitter<'a> {
             });
         }
 
+        // Decision #22 fence selection.
+        let ordering = memory_ordering_from_traits(&decl.trait_list);
+        self.pending_exit_fence = ordering.exit;
+
         writeln!(
             &mut self.out,
             "define {ret_ty} @{name}({params}) {{",
@@ -390,16 +407,22 @@ impl<'a> Emitter<'a> {
         )
         .ok();
         writeln!(&mut self.out, "entry:").ok();
+        if let Some(entry_fence) = ordering.entry {
+            writeln!(&mut self.out, "  fence {entry_fence}").ok();
+        }
         self.emit_block(&decl.body, &ret_ty);
         writeln!(&mut self.out, "}}").ok();
         writeln!(&mut self.out).ok();
+
+        self.pending_exit_fence = None;
     }
 
     /// Emit one LLVM function per `#interrupt` declaration. Slice 3
     /// emits the function with the linker symbol matching the source
     /// name (Decision #10); the target-specific calling convention,
     /// `.interrupts` section attribute, and disable-interrupts wrapper
-    /// per Refinement #5e are slice-4 work.
+    /// per Refinement #5e are slice-4 work. Decision #22 fence
+    /// emission is handled identically to effects.
     fn emit_interrupt(&mut self, decl: &InterruptDecl) {
         // Reset per-function state.
         self.next_value_id = 0;
@@ -425,6 +448,10 @@ impl<'a> Emitter<'a> {
             });
         }
 
+        // Decision #22 fence selection.
+        let ordering = memory_ordering_from_traits(&decl.trait_list);
+        self.pending_exit_fence = ordering.exit;
+
         // Linker symbol = source name (Decision #10). Slice 4 will
         // add the `section ".interrupts"` and target-specific calling
         // convention (`cc 87` for ARM thumb-cc, etc.).
@@ -436,9 +463,14 @@ impl<'a> Emitter<'a> {
         )
         .ok();
         writeln!(&mut self.out, "entry:").ok();
+        if let Some(entry_fence) = ordering.entry {
+            writeln!(&mut self.out, "  fence {entry_fence}").ok();
+        }
         self.emit_block(&decl.body, &ret_ty);
         writeln!(&mut self.out, "}}").ok();
         writeln!(&mut self.out).ok();
+
+        self.pending_exit_fence = None;
     }
 
     /// Emit one LLVM function per `#transition` inside this
@@ -465,16 +497,24 @@ impl<'a> Emitter<'a> {
 
         let fn_name = format!("{owner}_{tr}", tr = decl.name);
 
+        // Decision #22 fence selection.
+        let ordering = memory_ordering_from_traits(&decl.trait_list);
+        self.pending_exit_fence = ordering.exit;
+
         // Slice 3: transitions take no value parameters at the AST
         // level (Decision #5 / Refinement #5b restricts transition
         // signatures). The generated IR fn signature is `void`.
         writeln!(&mut self.out, "define void @{fn_name}() {{").ok();
         writeln!(&mut self.out, "entry:").ok();
+        if let Some(entry_fence) = ordering.entry {
+            writeln!(&mut self.out, "  fence {entry_fence}").ok();
+        }
         self.emit_block(&decl.body, "void");
         writeln!(&mut self.out, "}}").ok();
         writeln!(&mut self.out).ok();
 
         self.enclosing_owner = None;
+        self.pending_exit_fence = None;
     }
 
     fn emit_module_header(&mut self) {
@@ -564,6 +604,7 @@ impl<'a> Emitter<'a> {
             // surface a NotYetImplemented (since slice-1 doesn't
             // generate unit values from non-return paths yet).
             if ret_ty == "void" {
+                self.emit_exit_fence_if_pending();
                 writeln!(&mut self.out, "  ret void").ok();
             } else {
                 writeln!(&mut self.out, "  unreachable").ok();
@@ -571,6 +612,16 @@ impl<'a> Emitter<'a> {
                     what: "non-unit @fn body without an explicit `return` statement",
                 });
             }
+        }
+    }
+
+    /// Decision #22: emit the configured exit fence (if any) just
+    /// before a `ret` is written. Called from every site that emits
+    /// a `ret` so `Release` / `SeqCst` semantics are honoured at
+    /// every exit path.
+    fn emit_exit_fence_if_pending(&mut self) {
+        if let Some(ordering) = self.pending_exit_fence {
+            writeln!(&mut self.out, "  fence {ordering}").ok();
         }
     }
 
@@ -582,12 +633,17 @@ impl<'a> Emitter<'a> {
                 let ret_ty = self.expr_ir_type(e);
                 match self.emit_expr(e) {
                     Ok(v) => {
+                        // Decision #22: emit Release / SeqCst fence
+                        // before the ret if the enclosing callable
+                        // declared one.
+                        self.emit_exit_fence_if_pending();
                         writeln!(&mut self.out, "  ret {ret_ty} {v}").ok();
                     }
                     Err(err) => self.errors.push(err),
                 }
             }
             StmtKind::Return(None) => {
+                self.emit_exit_fence_if_pending();
                 writeln!(&mut self.out, "  ret void").ok();
             }
             StmtKind::Let { name, ty, value, .. } => {
@@ -1370,6 +1426,64 @@ const fn primitive_ir_type(p: PrimitiveType) -> &'static str {
         PrimitiveType::Usize | PrimitiveType::Isize => "i64",
         PrimitiveType::F32 => "float",
         PrimitiveType::F64 => "double",
+    }
+}
+
+/// Decision #22 codegen: memory-ordering fences derived from a
+/// callable's `$ [TraitList]`.
+///
+/// The pure-side `Acquire` / `Release` / `SeqCst` row labels (per
+/// ADR 0003 P2) and the imperative-side `Acquire` / `Release` /
+/// `SeqCst` traits (per Decision #22) share names because they
+/// share intent: they're memory-ordering markers consumed by codegen
+/// to emit appropriate fences.
+///
+/// **Mapping:**
+///
+/// - `Acquire` → entry fence `acquire`. Prevents loads/stores
+///   *after* the fence from being reordered before it. Pairs with
+///   a Release on the other side of the synchronisation.
+/// - `Release` → exit fence `release` (emitted before each `ret`).
+///   Prevents loads/stores *before* the fence from being reordered
+///   after it.
+/// - `SeqCst` → both entry and exit fences with `seq_cst` ordering.
+///   Sequential consistency is the strongest LLVM ordering;
+///   `seq_cst` operations participate in a single global total
+///   order. Supersedes `Acquire`/`Release` when present.
+///
+/// Combinations:
+/// - `[Acquire, Release]` → entry `acquire`, exit `release`.
+/// - `[SeqCst]` → entry `seq_cst`, exit `seq_cst`. (`SeqCst` alone
+///   is the canonical strongest form.)
+/// - `[SeqCst, Acquire]` / `[SeqCst, Release]` → `seq_cst` wins
+///   (no point downgrading; subsumes both).
+/// - Empty / no ordering trait → no fences.
+///
+/// LLVM's backend selects target-appropriate fence instructions
+/// (`dmb ish` on ARM, `mfence` on x86 for `seq_cst`, etc.) — we
+/// just emit the abstract `fence <ordering>` IR form.
+struct MemoryOrdering {
+    /// LLVM ordering keyword for the entry fence, or `None` if no
+    /// entry fence should be emitted.
+    entry: Option<&'static str>,
+    /// LLVM ordering keyword for the fence emitted before each `ret`,
+    /// or `None`.
+    exit: Option<&'static str>,
+}
+
+fn memory_ordering_from_traits(trait_list: &[clifford_ast::TraitRef]) -> MemoryOrdering {
+    let has_seqcst = trait_list.iter().any(|t| t.name == "SeqCst");
+    if has_seqcst {
+        return MemoryOrdering {
+            entry: Some("seq_cst"),
+            exit: Some("seq_cst"),
+        };
+    }
+    let has_acquire = trait_list.iter().any(|t| t.name == "Acquire");
+    let has_release = trait_list.iter().any(|t| t.name == "Release");
+    MemoryOrdering {
+        entry: if has_acquire { Some("acquire") } else { None },
+        exit: if has_release { Some("release") } else { None },
     }
 }
 
@@ -2377,6 +2491,203 @@ mod tests {
                 if what.contains("register-block")
         ));
         assert!(saw, "expected NotYetImplemented(register-block); got {errors:?}");
+    }
+
+    // ─── Decision #22 codegen: memory-ordering fences ────────────────────
+
+    #[test]
+    fn d22_acquire_emits_entry_fence() {
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #effect read() #mutates: [C] $ [Acquire] { return; }\n\
+        ";
+        let ir = lower_str(src).expect("lower acquire");
+        // Entry fence appears immediately after the entry: label.
+        assert!(
+            ir.contains("entry:\n  fence acquire\n"),
+            "expected entry fence acquire; got:\n{ir}"
+        );
+        // No exit fence — Acquire is entry-only.
+        assert!(
+            !ir.contains("fence release"),
+            "should not have release fence for $ [Acquire]; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn d22_release_emits_exit_fence_before_ret() {
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #effect commit() #mutates: [C] $ [Release] { return; }\n\
+        ";
+        let ir = lower_str(src).expect("lower release");
+        // Release fence appears before the explicit ret void.
+        assert!(
+            ir.contains("  fence release\n  ret void\n"),
+            "expected exit fence release before ret; got:\n{ir}"
+        );
+        // No `acquire` fence at all (Release is exit-only; the
+        // release fence will appear after entry: when the body is
+        // empty, but it's the exit fence). The test verifies
+        // there's no `acquire` ordering anywhere.
+        assert!(
+            !ir.contains("fence acquire"),
+            "should not have acquire fence for $ [Release]; got:\n{ir}"
+        );
+        // Verify there's exactly ONE fence (the exit one) — for an
+        // empty body, the entry fence (if any) and the exit fence
+        // would both be release-keyword if both were emitted.
+        assert_eq!(
+            ir.matches("fence release").count(),
+            1,
+            "expected exactly one release fence; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn d22_acquire_release_combo_emits_both() {
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #effect roundtrip() #mutates: [C] $ [Acquire, Release] { return; }\n\
+        ";
+        let ir = lower_str(src).expect("lower acq+rel");
+        assert!(
+            ir.contains("entry:\n  fence acquire\n"),
+            "expected entry acquire fence; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("  fence release\n  ret void\n"),
+            "expected exit release fence; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn d22_seqcst_uses_seqcst_at_both_ends() {
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #effect strict() #mutates: [C] $ [SeqCst] { return; }\n\
+        ";
+        let ir = lower_str(src).expect("lower seqcst");
+        assert!(
+            ir.contains("entry:\n  fence seq_cst\n"),
+            "expected entry seq_cst fence; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("  fence seq_cst\n  ret void\n"),
+            "expected exit seq_cst fence; got:\n{ir}"
+        );
+        // SeqCst supersedes — there should be NO `acquire` / `release`
+        // fences emitted (only `seq_cst`).
+        assert!(
+            !ir.contains("fence acquire") && !ir.contains("fence release"),
+            "SeqCst should subsume Acquire/Release; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn d22_seqcst_supersedes_acquire_release() {
+        // `$ [SeqCst, Acquire, Release]` — SeqCst is the strongest,
+        // so we emit `seq_cst` fences (not `acquire` / `release`).
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #effect strict() #mutates: [C] $ [SeqCst, Acquire, Release] { return; }\n\
+        ";
+        let ir = lower_str(src).expect("lower seqcst+ subsumed");
+        assert!(
+            ir.contains("entry:\n  fence seq_cst\n"),
+            "expected entry seq_cst (supersedes); got:\n{ir}"
+        );
+        assert!(
+            !ir.contains("fence acquire"),
+            "Acquire should be subsumed; got:\n{ir}"
+        );
+        assert!(
+            !ir.contains("fence release"),
+            "Release should be subsumed; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn d22_no_ordering_trait_emits_no_fence() {
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #effect plain() #mutates: [C] { return; }\n\
+        ";
+        let ir = lower_str(src).expect("lower plain effect");
+        assert!(
+            !ir.contains("fence "),
+            "no ordering trait → no fence; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn d22_acquire_on_interrupt_emits_entry_fence() {
+        // Interrupts get the same treatment as effects.
+        let src = "\
+            #automaton T { c: u32; }\n\
+            #interrupt SysTick() #mutates: [T] #priority: HIGH $ [Acquire] { return; }\n\
+        ";
+        let ir = lower_str(src).expect("lower interrupt acquire");
+        assert!(
+            ir.contains("entry:\n  fence acquire\n"),
+            "expected acquire fence on interrupt; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn d22_release_on_transition_emits_exit_fence() {
+        let src = "\
+            #automaton Counter { value: u32;\n  \
+              #transition tick $ [Release] { Counter.value = 1u32; }\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower transition release");
+        assert!(
+            ir.contains("  fence release\n  ret void\n"),
+            "expected release fence on transition exit; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn d22_release_emits_fence_at_each_explicit_ret() {
+        // A fn with an explicit `return expr;` (not just falling through
+        // to implicit ret void). The exit fence still goes before the
+        // `ret`.
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #effect get() -> u32 #mutates: [C] $ [Release] { return 5u32; }\n\
+        ";
+        let ir = lower_str(src).expect("lower explicit-return release");
+        // The exit fence sits between any tail-of-body code and the
+        // `ret i32 5`.
+        assert!(
+            ir.contains("  fence release\n  ret i32 5\n"),
+            "expected fence release before explicit ret; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn d22_other_traits_dont_emit_fences() {
+        // `Hardware`, `Realtime`, `LockingDiscipline`, `PureState`,
+        // `Encapsulated` are codegen-side declarative-only — no
+        // fences.
+        for trait_name in [
+            "Hardware",
+            "Realtime",
+            "LockingDiscipline",
+            "PureState",
+            "Encapsulated",
+        ] {
+            let src = format!(
+                "#automaton C {{ v: u32; }}\n\
+                 #effect e() #mutates: [C] $ [{trait_name}] {{ return; }}\n"
+            );
+            let ir = lower_str(&src).unwrap_or_else(|e| panic!("lower failed: {e:?}"));
+            assert!(
+                !ir.contains("fence "),
+                "trait `{trait_name}` should not emit a fence; got:\n{ir}"
+            );
+        }
     }
 
     #[test]
