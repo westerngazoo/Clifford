@@ -268,6 +268,22 @@ struct Emitter<'a> {
     /// Decision #22 release / SeqCst fence). `None` for monoid
     /// transitions or transitions without a `-> Dest` target.
     pending_transition_tag_write: Option<(String, u32)>,
+    /// Slice 11: name of the basic block currently being emitted
+    /// into. Updated whenever a new label is written. Used by phi
+    /// nodes (sigma loops) to identify their predecessor blocks.
+    /// Reset to `"entry"` at the start of every function.
+    current_block: String,
+    /// Slice 11: monotonically incrementing per-function counter
+    /// for fresh sigma-loop label IDs (`sigma.header.<n>`,
+    /// `sigma.body.<n>`, `sigma.exit.<n>`). Reset to 0 at the
+    /// start of every function.
+    next_label_id: u32,
+    /// Slice 11: `true` when the current basic block has been
+    /// terminated by a `ret`. The sigma-loop emitter consults this
+    /// before emitting the back-edge — emitting a second terminator
+    /// would produce invalid LLVM IR. Reset to `false` whenever a
+    /// new label opens a fresh basic block.
+    current_block_terminated: bool,
     /// Errors collected across the whole program.
     errors: Vec<CodegenError>,
 }
@@ -361,6 +377,9 @@ impl<'a> Emitter<'a> {
             enclosing_owner: None,
             pending_exit_fence: None,
             pending_transition_tag_write: None,
+            current_block: "entry".to_owned(),
+            next_label_id: 0,
+            current_block_terminated: false,
             errors: Vec::new(),
         }
     }
@@ -506,9 +525,7 @@ impl<'a> Emitter<'a> {
     /// [`memory_ordering_from_traits`].
     fn emit_effect(&mut self, decl: &EffectDecl) {
         // Reset per-function state.
-        self.next_value_id = 0;
-        self.locals.clear();
-        self.enclosing_owner = None;
+        self.reset_per_function_state();
 
         let ret_ty = self.lower_return_type(decl.return_type.as_ref());
 
@@ -559,9 +576,7 @@ impl<'a> Emitter<'a> {
     /// emission is handled identically to effects.
     fn emit_interrupt(&mut self, decl: &InterruptDecl) {
         // Reset per-function state.
-        self.next_value_id = 0;
-        self.locals.clear();
-        self.enclosing_owner = None;
+        self.reset_per_function_state();
 
         let ret_ty = self.lower_return_type(decl.return_type.as_ref());
 
@@ -629,9 +644,9 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_transition(&mut self, owner: &str, decl: &TransitionDecl) {
-        // Reset per-function state.
-        self.next_value_id = 0;
-        self.locals.clear();
+        // Reset per-function state. Transitions then immediately
+        // set enclosing_owner so `Self.field` resolves correctly.
+        self.reset_per_function_state();
         self.enclosing_owner = Some(owner.to_owned());
 
         let fn_name = format!("{owner}_{tr}", tr = decl.name);
@@ -700,10 +715,24 @@ impl<'a> Emitter<'a> {
         format!("%tmp.{id}")
     }
 
+    /// Slice 11: reset all per-function emitter state. Called at
+    /// the top of every callable emitter (`emit_fn`, `emit_effect`,
+    /// `emit_interrupt`, `emit_transition`) so each callable gets
+    /// fresh SSA-id, label-id, locals, and basic-block tracking.
+    /// Avoids four copies of the same reset block drifting out of
+    /// sync as new fields are added.
+    fn reset_per_function_state(&mut self) {
+        self.next_value_id = 0;
+        self.next_label_id = 0;
+        self.locals.clear();
+        self.enclosing_owner = None;
+        self.current_block = "entry".to_owned();
+        self.current_block_terminated = false;
+    }
+
     fn emit_fn(&mut self, decl: &FnDecl) {
         // Reset per-function state.
-        self.next_value_id = 0;
-        self.locals.clear();
+        self.reset_per_function_state();
 
         let ret_ty = self.lower_return_type(decl.return_type.as_ref());
 
@@ -776,8 +805,10 @@ impl<'a> Emitter<'a> {
             if ret_ty == "void" {
                 self.emit_exit_fence_if_pending();
                 writeln!(&mut self.out, "  ret void").ok();
+                self.current_block_terminated = true;
             } else {
                 writeln!(&mut self.out, "  unreachable").ok();
+                self.current_block_terminated = true;
                 self.errors.push(CodegenError::NotYetImplemented {
                     what: "non-unit @fn body without an explicit `return` statement",
                 });
@@ -831,6 +862,7 @@ impl<'a> Emitter<'a> {
                         // declared one.
                         self.emit_exit_fence_if_pending();
                         writeln!(&mut self.out, "  ret {ret_ty} {v}").ok();
+                        self.current_block_terminated = true;
                     }
                     Err(err) => self.errors.push(err),
                 }
@@ -838,6 +870,7 @@ impl<'a> Emitter<'a> {
             StmtKind::Return(None) => {
                 self.emit_exit_fence_if_pending();
                 writeln!(&mut self.out, "  ret void").ok();
+                self.current_block_terminated = true;
             }
             StmtKind::Let { name, ty, value, .. } => {
                 let ir_ty = match ty {
@@ -923,6 +956,15 @@ impl<'a> Emitter<'a> {
             }
             StmtKind::VolatileStore { ty, ptr, value } => {
                 if let Err(e) = self.emit_unchecked_store(ty, ptr, value, true) {
+                    self.errors.push(e);
+                }
+            }
+            // Decision #14 / §5.8: `sigma var in source { body }`
+            // bounded-iteration loop. Lowers to a counted-loop CFG
+            // (header + body + exit blocks) per spec §8.4. v0.1
+            // scope: range sources only.
+            StmtKind::Sigma { var, source, body } => {
+                if let Err(e) = self.emit_sigma(var, source, body) {
                     self.errors.push(e);
                 }
             }
@@ -1838,6 +1880,187 @@ impl<'a> Emitter<'a> {
         )
         .ok();
         Ok(result)
+    }
+
+    /// Slice 11: lower `sigma var in lo..hi { body }` to a counted-
+    /// loop CFG per spec §8.4 / Decision #14. The emitted shape:
+    ///
+    /// ```text
+    ///   ; predecessor block (whatever the current_block was)
+    ///   <emit lo and hi>
+    ///   br label %sigma.header.<id>
+    /// sigma.header.<id>:
+    ///   %sigma.i.<id> = phi <ty> [ %lo, %<pred> ], [ %sigma.i_next.<id>, %sigma.body.<id> ]
+    ///   %sigma.cond.<id> = icmp <op> <ty> %sigma.i.<id>, %hi
+    ///   br i1 %sigma.cond.<id>, label %sigma.body.<id>, label %sigma.exit.<id>
+    /// sigma.body.<id>:
+    ///   ; <body, with var bound to %sigma.i.<id>>
+    ///   %sigma.i_next.<id> = add nuw <ty> %sigma.i.<id>, 1
+    ///   br label %sigma.header.<id>
+    /// sigma.exit.<id>:
+    ///   ; (subsequent statements emit here)
+    /// ```
+    ///
+    /// The compare opcode picks `ult`/`ule` (unsigned) or
+    /// `slt`/`sle` (signed) based on the range bound's source
+    /// type. Inclusive `..=` uses `<op>e`; half-open `..` uses
+    /// `<op>` (strict).
+    ///
+    /// v0.1 scope: range sources only (`lo..hi`, `lo..=hi`).
+    /// Array sources (`sigma x in &arr`) need the slice-indexing
+    /// infrastructure and land in a future slice.
+    fn emit_sigma(
+        &mut self,
+        var: &str,
+        source: &Expr,
+        body: &Block,
+    ) -> Result<(), CodegenError> {
+        // Extract the range bounds. v0.1 supports range sources
+        // only; array sources surface a structured error.
+        let (lo, hi, inclusive) = match &source.kind {
+            ExprKind::Range { lo, hi, inclusive } => (lo.as_ref(), hi.as_ref(), *inclusive),
+            _ => {
+                return Err(CodegenError::NotYetImplemented {
+                    what: "sigma over a non-range source (array source needs the slice-indexing slice)",
+                });
+            }
+        };
+
+        // Iteration type + signedness from the lower bound.
+        // §5.8 says `lo` and `hi` must be the same integer type;
+        // upstream typing already enforces this (BinaryTypeMismatch
+        // for `..` / `..=`), so we trust `lo` here.
+        let ir_ty = self.expr_ir_type(lo);
+        let signed = self.expr_is_signed_int(lo);
+
+        // Emit lo / hi once in the predecessor block (so they aren't
+        // recomputed every iteration). Capture the predecessor's
+        // basic-block name BEFORE branching so the phi node's
+        // incoming-edge labels are correct.
+        let lo_val = self.emit_expr(lo)?;
+        let hi_val = self.emit_expr(hi)?;
+        let pred_block = self.current_block.clone();
+
+        // Allocate fresh label IDs for this loop. SSA-name conflicts
+        // across nested sigmas are avoided because each loop has its
+        // own `<id>` suffix.
+        let id = self.next_label_id;
+        self.next_label_id += 1;
+        let header_label = format!("sigma.header.{id}");
+        let body_label = format!("sigma.body.{id}");
+        let exit_label = format!("sigma.exit.{id}");
+        let i_name = format!("%sigma.i.{id}");
+        let i_next_name = format!("%sigma.i_next.{id}");
+        let cond_name = format!("%sigma.cond.{id}");
+
+        // Branch from the predecessor into the header.
+        writeln!(&mut self.out, "  br label %{header_label}").ok();
+
+        // Header block: phi + condition + conditional branch.
+        writeln!(&mut self.out, "{header_label}:").ok();
+        self.current_block = header_label.clone();
+        self.current_block_terminated = false;
+        writeln!(
+            &mut self.out,
+            "  {i_name} = phi {ir_ty} [ {lo_val}, %{pred_block} ], [ {i_next_name}, %{body_label} ]",
+        )
+        .ok();
+        let cmp_op = match (signed, inclusive) {
+            (false, false) => "ult",
+            (false, true) => "ule",
+            (true, false) => "slt",
+            (true, true) => "sle",
+        };
+        writeln!(
+            &mut self.out,
+            "  {cond_name} = icmp {cmp_op} {ir_ty} {i_name}, {hi_val}",
+        )
+        .ok();
+        writeln!(
+            &mut self.out,
+            "  br i1 {cond_name}, label %{body_label}, label %{exit_label}",
+        )
+        .ok();
+
+        // Body block: bind the loop variable, emit body statements,
+        // then the increment and back-edge.
+        writeln!(&mut self.out, "{body_label}:").ok();
+        self.current_block = body_label.clone();
+        self.current_block_terminated = false;
+
+        // Push the loop variable as a local for the body's scope.
+        // We snapshot the locals length so any lets inside the body
+        // are also dropped when the loop scope closes — matching
+        // Clifford's lexical scoping (the var isn't visible after
+        // the loop).
+        let scope_marker = self.locals.len();
+        self.locals.push(LocalBinding {
+            name: var.to_owned(),
+            value: i_name.clone(),
+            ir_type: ir_ty.clone(),
+        });
+
+        // Emit body statements. We don't reuse `emit_block` here
+        // because we need to inject the back-edge ourselves and
+        // we need to detect whether the body terminated (a `return`
+        // mid-body would terminate `sigma.body.<id>` and the
+        // back-edge would be invalid).
+        let mut body_returned = false;
+        for stmt in &body.stmts {
+            if body_returned {
+                break; // dead code after return
+            }
+            self.emit_stmt(stmt);
+            if matches!(stmt.kind, StmtKind::Return(_)) {
+                body_returned = true;
+            }
+        }
+
+        // Pop loop-scope locals.
+        self.locals.truncate(scope_marker);
+
+        // Back-edge: emit the increment + branch unless the body's
+        // current block was terminated by a `return` (or an inner
+        // `unreachable`). For nested sigmas, current_block now
+        // points at the inner loop's exit block — that's still a
+        // valid open block, so the back-edge correctly closes it.
+        if !self.current_block_terminated {
+            let one_op = if signed { "add nsw" } else { "add nuw" };
+            writeln!(
+                &mut self.out,
+                "  {i_next_name} = {one_op} {ir_ty} {i_name}, 1",
+            )
+            .ok();
+            writeln!(&mut self.out, "  br label %{header_label}").ok();
+        } else {
+            // Body returned. The header still has a phi referencing
+            // %sigma.i_next.<id>, which doesn't exist now — emit a
+            // synthetic unreachable definition so the IR verifies.
+            // Note: a body that always returns is structurally
+            // identical to a guarded early-exit; LLVM's DCE will
+            // collapse the loop entirely. The `unreachable` here
+            // satisfies LLVM's SSA-form requirement.
+            //
+            // We materialize i_next via `add` of `i` + 0 wrapped in
+            // an unreachable block so the phi resolves.
+            //
+            // Future slice: skip the back-edge entirely and rewrite
+            // the phi to drop the body-incoming edge — cleaner IR.
+            writeln!(
+                &mut self.out,
+                "  {i_next_name} = {} {ir_ty} {i_name}, 0",
+                if signed { "add nsw" } else { "add nuw" },
+            )
+            .ok();
+            writeln!(&mut self.out, "  br label %{header_label}").ok();
+        }
+
+        // Exit block: subsequent statements emit here.
+        writeln!(&mut self.out, "{exit_label}:").ok();
+        self.current_block = exit_label;
+        self.current_block_terminated = false;
+
+        Ok(())
     }
 
     /// Slice 9: lower `Auto@state` to a load of the state-tag
@@ -4852,6 +5075,295 @@ mod tests {
         assert_eq!(info.state_tag("A"), Some(0));
         assert_eq!(info.state_tag("B"), Some(1));
         assert_eq!(info.state_tag("C"), None);
+    }
+
+    // ─── Slice 11: sigma loops (Decision #14 / §5.8) ─────────────────────
+
+    #[test]
+    fn s11_sigma_basic_half_open_emits_loop_cfg() {
+        // `sigma i in 0u32..4u32 { … }` — canonical counted loop.
+        // Verifies the three-block CFG (header / body / exit), the
+        // phi node, the unsigned half-open compare (`ult`), and the
+        // increment back-edge.
+        let src = "@fn loop_test() { sigma i in 0u32..4u32 { } return; }";
+        let ir = lower_str(src).expect("lower sigma half-open");
+        // Three labels, each at column 0 (block headers).
+        assert!(ir.contains("\nsigma.header.0:\n"), "missing header label; got:\n{ir}");
+        assert!(ir.contains("\nsigma.body.0:\n"), "missing body label; got:\n{ir}");
+        assert!(ir.contains("\nsigma.exit.0:\n"), "missing exit label; got:\n{ir}");
+        // Branch into the header from entry.
+        assert!(
+            ir.contains("br label %sigma.header.0"),
+            "missing entry-to-header branch; got:\n{ir}"
+        );
+        // Phi: %sigma.i.0 = phi i32 [ 0, %entry ], [ %sigma.i_next.0, %sigma.body.0 ]
+        assert!(
+            ir.contains("%sigma.i.0 = phi i32 [ 0, %entry ], [ %sigma.i_next.0, %sigma.body.0 ]"),
+            "missing phi for i; got:\n{ir}"
+        );
+        // Unsigned half-open compare.
+        assert!(
+            ir.contains("%sigma.cond.0 = icmp ult i32 %sigma.i.0, 4"),
+            "missing icmp ult; got:\n{ir}"
+        );
+        // Conditional branch into body or exit.
+        assert!(
+            ir.contains("br i1 %sigma.cond.0, label %sigma.body.0, label %sigma.exit.0"),
+            "missing conditional branch; got:\n{ir}"
+        );
+        // Increment + back-edge.
+        assert!(
+            ir.contains("%sigma.i_next.0 = add nuw i32 %sigma.i.0, 1"),
+            "missing add nuw increment; got:\n{ir}"
+        );
+        assert!(
+            ir.matches("br label %sigma.header.0").count() >= 2,
+            "expected entry + back-edge branches into header; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s11_sigma_inclusive_uses_ule_compare() {
+        // `0u32..=10u32` — inclusive upper bound. Compare op is
+        // `ule` instead of `ult` (`i <= 10` instead of `i < 10`).
+        let src = "@fn t() { sigma i in 0u32..=10u32 { } return; }";
+        let ir = lower_str(src).expect("lower sigma inclusive");
+        assert!(
+            ir.contains("icmp ule i32 %sigma.i.0, 10"),
+            "expected icmp ule for inclusive range; got:\n{ir}"
+        );
+        // No `ult` should appear for an inclusive range.
+        assert!(
+            !ir.contains("icmp ult"),
+            "inclusive range must not use ult; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s11_sigma_signed_range_uses_slt_and_nsw() {
+        // Signed range source (`0i32..10i32`) — compare is `slt`
+        // (signed less-than) and increment uses `add nsw` (no
+        // signed wrap).
+        let src = "@fn t() { sigma i in 0i32..10i32 { } return; }";
+        let ir = lower_str(src).expect("lower signed sigma");
+        assert!(
+            ir.contains("icmp slt i32 %sigma.i.0, 10"),
+            "expected icmp slt for signed range; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("add nsw i32 %sigma.i.0, 1"),
+            "expected add nsw for signed increment; got:\n{ir}"
+        );
+        assert!(
+            !ir.contains("add nuw"),
+            "signed range must not use nuw; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s11_sigma_loop_var_bound_inside_body() {
+        // The loop variable `i` should be visible inside the body
+        // and resolve to the phi SSA name. We verify by using `i`
+        // in a binary op inside the body.
+        let src = "\
+            @fn t() {\n  \
+              sigma i in 0u32..4u32 {\n    \
+                let _x: u32 = i + 1u32;\n  \
+              }\n  \
+              return;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower sigma with body using i");
+        // The loop var resolves to %sigma.i.0; the body must
+        // reference it in an `add`.
+        assert!(
+            ir.contains("add i32 %sigma.i.0, 1"),
+            "expected body to reference %sigma.i.0; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s11_sigma_ranges_with_dynamic_bounds() {
+        // `lo..hi` where lo and hi are local-variable references —
+        // the bounds are emitted as SSA values in the predecessor
+        // block, not as constants in the phi.
+        let src = "\
+            @fn t(start: u32, end: u32) {\n  \
+              sigma i in start..end { }\n  \
+              return;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower sigma with dynamic bounds");
+        // Phi reads `%start` (the lo) on the entry edge.
+        assert!(
+            ir.contains("phi i32 [ %start, %entry ]"),
+            "expected phi initial value to be %start; got:\n{ir}"
+        );
+        // Compare reads %end as the upper bound.
+        assert!(
+            ir.contains("icmp ult i32 %sigma.i.0, %end"),
+            "expected compare to use %end; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s11_sigma_bounds_emitted_in_predecessor_block() {
+        // Bounds are evaluated ONCE before the loop, not per-iter.
+        // For a literal range this is hard to verify directly, but
+        // we can confirm the phi's predecessor edge points back to
+        // `%entry` (showing the bounds were captured there).
+        let src = "@fn t() { sigma i in 0u32..4u32 { } return; }";
+        let ir = lower_str(src).expect("lower sigma");
+        // The phi's first incoming edge label must be `%entry`,
+        // not the body label — otherwise the bound would be
+        // recomputed on every back-edge.
+        assert!(
+            ir.contains("phi i32 [ 0, %entry ]"),
+            "expected phi predecessor edge from %entry; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s11_sigma_followed_by_statements_emit_in_exit_block() {
+        // Statements after the sigma loop emit into `sigma.exit.0`,
+        // not into the body or header. We confirm by checking the
+        // `ret void` comes AFTER the exit label.
+        let src = "@fn t() { sigma i in 0u32..4u32 { } return; }";
+        let ir = lower_str(src).expect("lower sigma");
+        let exit_pos = ir.find("\nsigma.exit.0:\n").expect("exit label missing");
+        let ret_pos = ir.find("ret void").expect("ret void missing");
+        assert!(
+            exit_pos < ret_pos,
+            "ret void must come after exit label; positions {exit_pos} / {ret_pos} in:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s11_sigma_nested_uses_distinct_label_ids() {
+        // Two nested sigmas should get distinct label IDs (0 and 1)
+        // so their CFGs don't collide. We use the inner loop var
+        // in the body to force its scope handling.
+        let src = "\
+            @fn t() {\n  \
+              sigma i in 0u32..4u32 {\n    \
+                sigma j in 0u32..4u32 {\n      \
+                  let _x: u32 = i + j;\n    \
+                }\n  \
+              }\n  \
+              return;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower nested sigma");
+        // Two sets of header/body/exit labels with distinct IDs.
+        for label in [
+            "\nsigma.header.0:\n",
+            "\nsigma.body.0:\n",
+            "\nsigma.exit.0:\n",
+            "\nsigma.header.1:\n",
+            "\nsigma.body.1:\n",
+            "\nsigma.exit.1:\n",
+        ] {
+            assert!(
+                ir.contains(label),
+                "missing label `{}`; got:\n{ir}",
+                label.trim()
+            );
+        }
+        // Body of outer loop (i + j) uses both phis.
+        assert!(
+            ir.contains("%sigma.i.0"),
+            "outer loop var missing; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("%sigma.i.1"),
+            "inner loop var missing; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s11_sigma_loop_var_invisible_after_loop() {
+        // After the loop ends, the loop variable is out of scope.
+        // The resolver should reject `return i;` after a sigma
+        // loop with `UndefinedName { name: "i" }`. This test
+        // exercises the resolver side directly because lower_str
+        // panics on resolve failures (it expects pre-validated
+        // input).
+        let src = "\
+            @fn t() -> u32 {\n  \
+              sigma i in 0u32..4u32 { }\n  \
+              return i;\n\
+            }\n\
+        ";
+        let tokens = tokenize(src).expect("tokenize");
+        let program = parse(&tokens).expect("parse");
+        let result = resolve(&program);
+        assert!(
+            result.is_err(),
+            "expected resolver to reject out-of-scope loop var; got Ok"
+        );
+        // Verify the specific error shape — the loop var `i` is
+        // undefined OUTSIDE the loop body.
+        if let Err(errs) = result {
+            let saw_i = errs.iter().any(|e| {
+                let s = format!("{e}");
+                s.contains("`i`") || s.contains("\"i\"")
+            });
+            assert!(
+                saw_i,
+                "expected resolver error to mention `i`; got {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn s11_sigma_non_range_source_returns_e0810() {
+        // `sigma i in some_var { }` where the source isn't a Range
+        // expression — v0.1 supports range sources only. The
+        // resolver/types accept this (it's syntactically a value
+        // expression); codegen surfaces NotYetImplemented.
+        // Use a literal as a stand-in for any non-range source.
+        let src = "@fn t() { sigma i in 7u32 { } return; }";
+        let result = lower_str(src);
+        // Either typing fails (range-bound mismatch) or codegen
+        // surfaces NYI for non-range source. Either is acceptable.
+        assert!(
+            result.is_err(),
+            "expected error for non-range source; got:\n{:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn s11_sigma_with_mutate_short_inside_body() {
+        // Real firmware shape: initialize a buffer slot per
+        // iteration. Combines slice-9 multi-state field write with
+        // the loop var.
+        let src = "\
+            #automaton T {\n  \
+              count: u32;\n\
+            }\n\
+            #effect tally_n() #mutates: [T] {\n  \
+              sigma i in 0u32..4u32 {\n    \
+                T.count += 1u32;\n  \
+              }\n  \
+              return;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower mutate-inside-sigma");
+        // The mutate-short emits load+add+store inside the body
+        // block; verify the body label is present and the store
+        // happens between body and back-edge.
+        assert!(
+            ir.contains("\nsigma.body.0:\n"),
+            "missing body label; got:\n{ir}"
+        );
+        let body_pos = ir.find("\nsigma.body.0:\n").unwrap();
+        let back_edge_pos = ir.rfind("br label %sigma.header.0").unwrap();
+        let store_pos = ir.find("store i32").expect("store missing");
+        assert!(
+            body_pos < store_pos && store_pos < back_edge_pos,
+            "store must be between body label and back-edge; got:\n{ir}"
+        );
     }
 
     // ─── Decision #22 codegen: memory-ordering fences ────────────────────

@@ -1228,6 +1228,28 @@ pub enum StmtKind {
         /// Value being stored.
         value: Expr,
     },
+
+    /// `sigma <var> in <range_expr> { body }` — Decision #14 / §5.8
+    /// bounded-iteration loop. The range source is a half-open
+    /// (`lo..hi`) or inclusive (`lo..=hi`) range. The loop variable
+    /// is bound only inside `body` with the implicit refinement type
+    /// `bounded<lo, hi>` per §5.8.
+    ///
+    /// v0.1 scope (this slice): single-ident pattern + range source
+    /// only. The `(index, value)` pattern and array-source
+    /// (`sigma x in &arr`) forms in §5.8 land in subsequent slices
+    /// once slice-indexing infrastructure is in place.
+    Sigma {
+        /// The loop variable's source name.
+        var: String,
+        /// The range source — typed as `ExprKind::Range` after
+        /// parsing. Stored as `Expr` rather than the narrowed
+        /// `RangeExpr` so future array-source forms can drop in
+        /// without an enum change.
+        source: Expr,
+        /// Body block; runs once per iteration.
+        body: Block,
+    },
 }
 
 /// One `field = expr` (or `field[index] = expr`) inside a `#mutate Auto { … }`.

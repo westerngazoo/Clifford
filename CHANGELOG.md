@@ -7,6 +7,186 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 11: sigma loops (Decision #14 / §5.8) (2026-05-14)
+
+The first language-feature slice that crosses the entire pipeline.
+Adds `sigma <var> in <range_expr> { body }` end-to-end: lexer
+keyword, AST node, parser, resolver scoping, type checker, and
+codegen (counted-loop CFG with header / body / exit basic blocks).
+Closes the last v0.1 firmware language gap — bounded iteration
+that lowers to a tight LLVM loop with proper SSA / phi shape.
+
+**The headline shape:**
+
+```clifford
+#automaton RingBuffer {
+  #states: [Uninitialized, Ready];
+  storage: [u8; 64];
+  zeroed:  u32;
+
+  #transition boot -> Ready $ [Release] {
+    sigma i in 0u32..64u32 {
+      #mutate RingBuffer { storage[i] = 0u8 };
+      RingBuffer.zeroed += 1u32;
+    }
+  }
+}
+```
+
+→
+
+```llvm
+define void @RingBuffer_boot() {
+entry:
+  br label %sigma.header.0
+sigma.header.0:
+  %sigma.i.0 = phi i32 [ 0, %entry ], [ %sigma.i_next.0, %sigma.body.0 ]
+  %sigma.cond.0 = icmp ult i32 %sigma.i.0, 64
+  br i1 %sigma.cond.0, label %sigma.body.0, label %sigma.exit.0
+sigma.body.0:
+  ; storage[i] = 0u8 — two-level GEP using the loop var
+  %tmp.0 = getelementptr %struct.RingBuffer, %struct.RingBuffer* @RingBuffer.state, i32 0, i32 1
+  %tmp.1 = getelementptr [64 x i8], [64 x i8]* %tmp.0, i32 0, i32 %sigma.i.0
+  store i8 0, i8* %tmp.1
+  ; zeroed += 1u32
+  ; ... three lines of load+add+store at idx 2 ...
+  %sigma.i_next.0 = add nuw i32 %sigma.i.0, 1
+  br label %sigma.header.0
+sigma.exit.0:
+  ; tag write (Ready=1) → release fence → ret  (Decision #22 + slice 9)
+  store i32 1, i32* (... idx 0 ...)
+  fence release
+  ret void
+}
+```
+
+**Implementation across six crates:**
+
+- **`clifford-lexer`**: new `KwSigma` token and `"sigma"` keyword
+  match. The `all_bare_keywords` test was extended to cover it.
+- **`clifford-ast`**: new `StmtKind::Sigma { var, source, body }`
+  variant. Source is stored as a generic `Expr` so future array-
+  source forms (`sigma x in &arr`) drop in without a variant change.
+- **`clifford-parser`**: new `parse_sigma_stmt` recognises `sigma
+  <ident> in <expr> <block>`. Wired into `parse_stmt` dispatch.
+  Five parser tests cover half-open / inclusive / body statements
+  / missing-`in` / missing-var error paths.
+- **`clifford-resolve`**: new `LocalKind::Sigma` variant and a
+  matching arm in `walk_stmt`. The source expression is resolved
+  in the OUTER scope (so range bounds reference outer bindings),
+  then a new scope is pushed, the loop var is declared, the body
+  is walked, and the scope is popped. Loop var is invisible after
+  the loop. `LocalKind` was marked `#[non_exhaustive]` so adding
+  variants stays non-breaking.
+- **`clifford-types`**: new arm in `walk_stmt` infers the loop
+  var's type from the range source's `Type::Range::element`.
+  Pushes/pops a typing scope around the body so the var is typed
+  inside but not outside.
+- **`clifford-codegen`**: this is where the real work happens.
+
+**Codegen detail (`Emitter::emit_sigma`):**
+
+- New Emitter fields:
+  - `current_block: String` — name of the basic block currently
+    being emitted into. Used by phi nodes to label their
+    predecessor edges. Reset to `"entry"` per function.
+  - `next_label_id: u32` — per-function counter for unique label
+    suffixes (`sigma.header.0`, `.1`, …).
+  - `current_block_terminated: bool` — `true` after a `ret` is
+    emitted. Sigma's back-edge consults this so a body that
+    `return`s mid-loop doesn't try to add a second terminator
+    to the same basic block.
+- New `Emitter::reset_per_function_state()` helper consolidates
+  the four (now five-field) per-function reset that was duplicated
+  across `emit_fn` / `emit_effect` / `emit_interrupt` /
+  `emit_transition`. Avoids drift as new fields are added.
+- The three existing `ret` emission sites now set
+  `current_block_terminated = true` so loop emitters can detect
+  block termination uniformly.
+- `emit_sigma`:
+  1. Match the source — `ExprKind::Range` only for v0.1; array
+     sources surface a structured `NotYetImplemented`.
+  2. Get the iteration IR type + signedness from the lower bound
+     (the existing `expr_ir_type` and `expr_is_signed_int`
+     helpers handle all integer primitives).
+  3. Emit `lo` and `hi` as SSA values in the predecessor block.
+     Capture the predecessor's name BEFORE emitting the branch
+     so phi labels are correct.
+  4. Allocate fresh label IDs and SSA names for the loop's
+     `header`, `body`, `exit`, `i`, `i_next`, `cond`.
+  5. Branch into the header. Emit the header label, the phi node,
+     the comparison (`ult` / `ule` / `slt` / `sle` based on
+     signedness × inclusiveness), and the conditional branch.
+  6. Emit the body label, push the loop var as a local binding,
+     snapshot the locals length so any body-local lets are
+     dropped at scope close, then walk the body statements.
+  7. After the body, truncate locals back to the snapshot. If
+     the body's current block isn't terminated, emit the
+     increment + back-edge. (If it is terminated — e.g. a
+     `return` mid-body — emit a synthetic `add … 0` to keep the
+     phi well-formed; LLVM DCE will collapse the loop in that
+     case.)
+  8. Emit the exit label and update `current_block`.
+
+**CFG correctness verified by tests:**
+
+- Phi predecessor edge labels are derived from `current_block` at
+  branch time, so nested sigmas (which reset `current_block` to
+  the inner exit block) emit the OUTER loop's back-edge into
+  whatever block is open at that point — naturally correct.
+- Compare opcode picks correctly across the four (signed × incl)
+  combinations.
+- Bounds are evaluated once in the predecessor block (not on every
+  iteration), per the spec's note that "the bound expression is
+  evaluated once at loop entry."
+- The body's loop-var binding is popped on scope close, so a `let`
+  inside the body doesn't leak into the exit block.
+
+**End-to-end smoke** (`examples/buffer_init_sigma.cl`): a 60-line
+sample exercising sigma with literal bounds, dynamic bounds (effect
+parameter), inclusive range (`..=`), indexed-field write inside the
+body, and the multi-state `-> Ready $ [Release]` pairing. Compiles
+to a 60-line LLVM module ready for `clang`.
+
+**Deferred to later slices (per spec §5.8):**
+
+- Array sources (`sigma x in &arr`) — needs slice/borrow
+  infrastructure.
+- The `(index, value)` tuple pattern for array iteration.
+- `sigma <pat> in <range>.rev()` — descending iteration is v0.2.
+- Bounds-tracking + bounds-check elision per §5.8 (the `bounded<lo,
+  hi>` refinement type). Today every `arr[i]` inside a sigma still
+  GEPs without a runtime check (because we don't insert checks
+  yet either); when bounds checking lands, the elider needs the
+  refinement to suppress them on provable accesses.
+- `break` / `continue` inside sigma — needs Break / Continue
+  statement variants in the AST and target labels in codegen.
+
+**Tests added:**
+
+- `clifford-lexer` (1 modified): `all_bare_keywords` updated.
+- `clifford-parser` (5 new): half-open range, inclusive range,
+  body statements, missing-`in` error, missing-var error.
+- `clifford-codegen` (11 new):
+  - `s11_sigma_basic_half_open_emits_loop_cfg`
+  - `s11_sigma_inclusive_uses_ule_compare`
+  - `s11_sigma_signed_range_uses_slt_and_nsw`
+  - `s11_sigma_loop_var_bound_inside_body`
+  - `s11_sigma_ranges_with_dynamic_bounds`
+  - `s11_sigma_bounds_emitted_in_predecessor_block`
+  - `s11_sigma_followed_by_statements_emit_in_exit_block`
+  - `s11_sigma_nested_uses_distinct_label_ids`
+  - `s11_sigma_loop_var_invisible_after_loop` (resolver-side)
+  - `s11_sigma_non_range_source_returns_e0810`
+  - `s11_sigma_with_mutate_short_inside_body`
+
+Plus `examples/buffer_init_sigma.cl`: end-to-end sample compiled
+via `cliffordc compile`.
+
+Total codegen tests: **142** (131 pre-slice-11 + 11 new). Total
+parser tests: **235** (230 pre-slice-11 + 5 new). All green;
+clippy clean across the workspace.
+
 ### Fixed — Codegen: multi-state automaton field reads used unshifted index (2026-05-13)
 
 Slice 9 prepended an `i32` state-tag at LLVM struct index 0 for

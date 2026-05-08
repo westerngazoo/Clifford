@@ -125,6 +125,9 @@ pub enum TokenKind {
     KwLoop,
     /// `for`
     KwFor,
+    /// `sigma` — Decision #14 / §5.8 bounded-iteration loop keyword
+    /// (`sigma i in lo..hi { … }`).
+    KwSigma,
     /// `in`
     KwIn,
     /// `match`
@@ -675,6 +678,7 @@ impl<'src> Lexer<'src> {
             "while" => TokenKind::KwWhile,
             "loop" => TokenKind::KwLoop,
             "for" => TokenKind::KwFor,
+            "sigma" => TokenKind::KwSigma,
             "in" => TokenKind::KwIn,
             "match" => TokenKind::KwMatch,
             "break" => TokenKind::KwBreak,
@@ -1358,7 +1362,7 @@ mod tests {
 
     #[test]
     fn all_bare_keywords() {
-        let src = "let mut const static if else while loop for in match break continue return extern unsafe as access null self Self true false";
+        let src = "let mut const static if else while loop for sigma in match break continue return extern unsafe as access null self Self true false";
         let expected = vec![
             TokenKind::KwLet,
             TokenKind::KwMut,
@@ -1369,6 +1373,7 @@ mod tests {
             TokenKind::KwWhile,
             TokenKind::KwLoop,
             TokenKind::KwFor,
+            TokenKind::KwSigma,
             TokenKind::KwIn,
             TokenKind::KwMatch,
             TokenKind::KwBreak,

@@ -444,6 +444,7 @@ pub struct LocalBinding {
 
 /// Flavours of local binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum LocalKind {
     /// `mut? name: T` — function/effect/interrupt parameter.
     Param {
@@ -462,6 +463,11 @@ pub enum LocalKind {
     /// `let name := expr;` — Decision #8 short binding. Always immutable,
     /// always inferred.
     LetShort,
+    /// `sigma name in <range> { … }` — Decision #14 / §5.8 sigma-loop
+    /// iteration variable. Always immutable; type is inferred from the
+    /// range source's bounds (`bounded<lo, hi>` per §5.8). Visible only
+    /// inside the loop body.
+    Sigma,
 }
 
 /// The output of [`resolve`] — the top-level [`SymbolTable`] plus a per-AST
@@ -1040,6 +1046,25 @@ impl<'a> Walker<'a> {
             | StmtKind::VolatileStore { ptr, value, .. } => {
                 self.walk_expr(ptr);
                 self.walk_expr(value);
+            }
+            // Decision #14 / §5.8: `sigma var in source { body }`.
+            // The source expression is resolved in the OUTER scope
+            // (so range bounds reference outer bindings), then we
+            // open a new scope, declare the loop var inside it, and
+            // walk the body. The var is invisible after the loop
+            // ends.
+            StmtKind::Sigma { var, source, body } => {
+                self.walk_expr(source);
+                self.push_scope();
+                self.declare(LocalBinding {
+                    name: var.clone(),
+                    kind: LocalKind::Sigma,
+                    def_span: stmt.span,
+                });
+                for s in &body.stmts {
+                    self.walk_stmt(s);
+                }
+                self.pop_scope();
             }
             // `Stmt` is `#[non_exhaustive]`. Forward-compat: new statement
             // kinds default to "no body work." Add an explicit arm when the

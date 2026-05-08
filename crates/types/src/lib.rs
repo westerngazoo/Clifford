@@ -1852,6 +1852,31 @@ impl<'a> Inferer<'a> {
                 let _ = self.infer_expr(ptr);
                 let _ = self.infer_expr(value);
             }
+            // Decision #14 / §5.8: `sigma var in source { body }`.
+            //
+            // The loop variable's type is the range-source's element
+            // type — for `lo..hi` we use the type of `lo` (and trust
+            // upstream span checks to verify `hi` matches per §5.8's
+            // `BinaryTypeMismatch`). The variable is scoped to the
+            // body only; we open a new typing scope, declare the
+            // variable, walk the body, and pop the scope.
+            //
+            // v0.1 scope: range sources only. Array sources (which
+            // would type the var as the array's element type) land
+            // when slice-indexing infrastructure is built out.
+            StmtKind::Sigma { var, source, body } => {
+                let source_ty = self.infer_expr(source);
+                let var_ty = match &source_ty {
+                    Type::Range { element, .. } => (**element).clone(),
+                    _ => Type::Unknown("sigma source not a range (v0.1 supports range sources only)"),
+                };
+                self.push_scope();
+                self.declare(var, var_ty);
+                for s in &body.stmts {
+                    self.walk_stmt(s);
+                }
+                self.pop_scope();
+            }
             // `Stmt` is `#[non_exhaustive]`. Forward-compat: new statement
             // kinds default to "no expression typing." Add explicit arms
             // when the statement carries expressions.
