@@ -83,7 +83,11 @@ dependencies = [
 name = "clifford-ortho"
 version = "0.1.0"
 dependencies = [
+ "clifford-ast",
  "clifford-effect",
+ "clifford-lexer",
+ "clifford-parser",
+ "clifford-resolve",
  "thiserror",
 ]
 

@@ -3,10 +3,20 @@
 // Two UART RX interrupts (the producers) record incoming bytes into a
 // shared telemetry automaton. The foreground task (the consumer)
 // reads the totals and the most-recently-seen byte. The cross-context
-// handoff is correct by virtue of Decision #22 traits:
+// handoff is correct by virtue of:
 //
-//     producers: $ [Release] on each tally transition  →  fence release
-//     consumer:  $ [Acquire] on the drain effect       →  fence acquire
+// 1. Decision #22 traits (publication ordering):
+//      producers: $ [Release] on each tally transition  →  fence release
+//      consumer:  $ [Acquire] on the drain effect       →  fence acquire
+//
+// 2. Spec §7 GA orthogonality (write-write race freedom):
+//      The two ISRs touch *strictly disjoint* fields. Earlier drafts
+//      of this sample shared `bytes_total` and `last_byte` between
+//      producers — the §7 verifier (correctly) rejected that with
+//      E0520. Splitting into per-source `bytes_uartN` /
+//      `last_byte_uartN` makes the wedge-product non-zero and the
+//      program race-free under the engine's restricted Cl(0,0,n)
+//      algebra.
 //
 // The Release on the producer side publishes the new state-tag plus
 // every store that came before it; the Acquire on the consumer side
@@ -67,53 +77,60 @@
 #automaton Telemetry {
   #states: [Empty, NonEmpty];
 
-  // Per-source byte counters. Each ISR only writes its own counter,
-  // so there's no producer-producer contention.
+  // Per-source byte counters. Each ISR writes its own counter only —
+  // strictly disjoint to satisfy the §7 GA orthogonality engine.
+  // The ISRs may preempt each other (different vector entries); a
+  // shared `bytes_total` field would race even at the same priority
+  // on multi-core targets, so we keep the counters separate and let
+  // the consumer sum them.
   bytes_uart1: u32;
   bytes_uart2: u32;
 
-  // Total across both producers — derived; the consumer can read it
-  // without reading both source-specific counters.
-  bytes_total: u32;
+  // Per-source most-recently-received byte. Splitting these keeps
+  // the ISRs strictly disjoint; a single shared `last_byte` would
+  // be a write-write race the §7 verifier (correctly) rejects.
+  last_byte_uart1: u8;
+  last_byte_uart2: u8;
 
-  // Most recently received byte (low 8 bits of the UART RX register).
-  // Single-slot "buffer" — overwritten on every byte.
-  last_byte: u8;
-
-  // Producer 1: invoked from USART1_IRQ. Increments uart1 + total
-  // and stamps last_byte. The Release fence publishes the new
-  // state-tag plus all the field stores before this transition's
-  // ret returns to the ISR prologue.
+  // Producer 1: invoked from USART1_IRQ. Touches ONLY the uart1
+  // counter and uart1 last_byte. The Release fence publishes the
+  // new state-tag plus all the field stores before this
+  // transition's ret returns to the ISR prologue.
   #transition tally_uart1 -> NonEmpty $ [Release] {
     Telemetry.bytes_uart1 += 1u32;
-    Telemetry.bytes_total += 1u32;
-    Telemetry.last_byte = (Uart1.rx_data as u8);
+    Telemetry.last_byte_uart1 = (Uart1.rx_data as u8);
   }
 
-  // Producer 2: invoked from USART2_IRQ. Same shape; touches the
-  // disjoint uart2 counter.
+  // Producer 2: invoked from USART2_IRQ. Touches ONLY the uart2
+  // counter and uart2 last_byte. Strictly disjoint from tally_uart1's
+  // write set per §7 — `wedge(behavior(IRQ1), behavior(IRQ2)) ≠ 0`.
   #transition tally_uart2 -> NonEmpty $ [Release] {
     Telemetry.bytes_uart2 += 1u32;
-    Telemetry.bytes_total += 1u32;
-    Telemetry.last_byte = (Uart2.rx_data as u8);
+    Telemetry.last_byte_uart2 = (Uart2.rx_data as u8);
   }
 }
 
 
 // ─── Foreground consumer ────────────────────────────────────────────
 //
-// `drain_total` returns the total byte count visible AS OF the
-// Acquire fence. The fence pairs with the Release on every producer
-// transition, so any byte that was tallied before this call is
-// guaranteed to be reflected in the count.
+// `drain_total` returns the SUM across both per-source counters,
+// computed at read time. The Acquire fence pairs with the Release
+// on every producer transition, so any byte tallied before this
+// call is guaranteed to be reflected in the sum.
 
 #effect drain_total() -> u32 #mutates: [Telemetry] $ [Acquire] {
-  return Telemetry.bytes_total;
+  return Telemetry.bytes_uart1 + Telemetry.bytes_uart2;
 }
 
-// Read the most recent byte. Same Acquire pattern.
-#effect drain_last() -> u8 #mutates: [Telemetry] $ [Acquire] {
-  return Telemetry.last_byte;
+// Read the most recent byte from each source. The consumer chooses
+// which is "newer" by checking the corresponding counter (or by
+// pre-deciding which UART to drain).
+#effect drain_last_uart1() -> u8 #mutates: [Telemetry] $ [Acquire] {
+  return Telemetry.last_byte_uart1;
+}
+
+#effect drain_last_uart2() -> u8 #mutates: [Telemetry] $ [Acquire] {
+  return Telemetry.last_byte_uart2;
 }
 
 // Read which state we're in. Useful for "have we seen anything yet?"

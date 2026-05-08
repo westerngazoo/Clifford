@@ -41,6 +41,7 @@ use clifford_check::check;
 use clifford_codegen::lower;
 use clifford_effect::{extract_call_graph, extract_categories, extract_mutation_profiles};
 use clifford_lexer::tokenize;
+use clifford_ortho::verify as verify_ortho;
 use clifford_parser::parse;
 use clifford_resolve::resolve;
 use clifford_types::infer;
@@ -344,6 +345,7 @@ fn run_compile(
 /// - `error[types]:`   — type inference / annotation mismatches
 /// - `error[check]:`   — sigil-layer / mutation auth / totality
 /// - `error[effect]:`  — categorical / mutation-profile / call-graph
+/// - `error[ortho]:`   — §7 GA orthogonality (write-write race detection)
 /// - `error[codegen]:` — IR-emission gap (NotYetImplemented surface)
 fn compile_source(source: &str, module_name: &str) -> Result<String, CompileError> {
     let tokens = tokenize(source).map_err(|e| CompileError::Phase {
@@ -378,11 +380,13 @@ fn compile_source(source: &str, module_name: &str) -> Result<String, CompileErro
     })?;
 
     // Per-callable mutation profiles + #mutates / #cannot_mutate
-    // validation per §6.
-    extract_mutation_profiles(&program, &resolution).map_err(|errs| CompileError::Phase {
-        name: "effect",
-        diags: errs.iter().map(PhaseDiag::from_error).collect(),
-    })?;
+    // validation per §6. Held alive across this scope so the
+    // ortho verifier can consume them downstream.
+    let profiles =
+        extract_mutation_profiles(&program, &resolution).map_err(|errs| CompileError::Phase {
+            name: "effect",
+            diags: errs.iter().map(PhaseDiag::from_error).collect(),
+        })?;
 
     // Proc-call graph cycle detection (catches mutual #> recursion).
     extract_call_graph(&program, &resolution).map_err(|errs| CompileError::Phase {
@@ -390,9 +394,14 @@ fn compile_source(source: &str, module_name: &str) -> Result<String, CompileErro
         diags: errs.iter().map(PhaseDiag::from_error).collect(),
     })?;
 
-    // clifford-ortho's top-level §7 verifier doesn't exist yet —
-    // only the `outer_product` primitive lives in that crate today.
-    // When the verifier lands, an `error[ortho]:` arm goes here.
+    // §7 GA orthogonality engine: write-write race detection across
+    // every pair of concurrent callables via wedge-product check on
+    // their behaviour blades. Decoder names shared fields by source
+    // identifier per Emergent Rule 1 (no raw `e_n` indices).
+    verify_ortho(&program, &profiles).map_err(|errs| CompileError::Phase {
+        name: "ortho",
+        diags: errs.iter().map(PhaseDiag::from_error).collect(),
+    })?;
 
     lower(&program, &resolution, &typing, module_name).map_err(|errs| CompileError::Phase {
         name: "codegen",
