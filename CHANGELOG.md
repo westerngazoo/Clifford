@@ -7,6 +7,153 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — `clifford-ortho` v0.2-β: read-write race detection (§7.2 graded algebra) (2026-05-08)
+
+Extends the §7 verifier from "write-write only" (v0.2-α) to the
+full graded read-write algebra per spec §7.2. Each callable now
+carries TWO blades — `writes` and `reads` — and the orthogonality
+check covers all three race classes:
+
+```text
+safe(A, B) ⟺ (writes_A ∧ writes_B == 0)    [v0.1: write-write]
+           ∧ (reads_A  ∧ writes_B == 0)    [v0.2-β: read-write]
+           ∧ (writes_A ∧ reads_B  == 0)    [v0.2-β: write-read]
+```
+
+Read-read overlap is never a conflict — two reads of the same
+field don't race. The cost is roughly 2× engine work per pair, as
+the spec predicted.
+
+**The verifier caught two more real bugs in `dual_uart_telemetry.cl`.**
+The slice-α version split the producer-side counters into per-source
+fields (which fixed the v0.1 write-write race). v0.2-β then flagged
+the *consumer* side: `drain_total` reads `bytes_uartN` while the
+ISRs write them.
+
+```text
+error[[ortho]]: E0520: orthogonality violation between
+  `effect drain_total` and `interrupt USART1_IRQ`:
+  shared field(s) `Telemetry.bytes_uart1`
+error[[ortho]]: E0520: orthogonality violation between
+  `effect drain_total` and `interrupt USART2_IRQ`:
+  shared field(s) `Telemetry.bytes_uart2`
+```
+
+This is the spec's exact §7.2 promise: "the engine catches read-
+write races at field granularity." On aligned 32-bit hardware the
+race is benign at the instruction level (single-word loads are
+atomic), but at the abstract memory-cell level it's a real race
+that the v0.2-β engine correctly rejects. The two paths to make
+the pattern safe — `#atomic: interrupt_critical` (CLI/STI wrapper)
+or `@snapshot Auto.field` (Decision #24 / ADR 0004 copy-then-read)
+— are deferred to subsequent slices. For v0.2-β shipping, the
+sample drops the drain effects with a comment documenting the
+race and the routes to safety.
+
+**Pipeline changes:**
+
+- `clifford-effect`:
+  - `MutationProfile` gains `actual_reads: HashSet<FieldRef>`
+    alongside `actual_writes`.
+  - The body walker now traverses every expression-bearing
+    statement (`Let` / `LetShort` / `Return(Some(_))` / `Expr` /
+    `Mutate` value / `MutateShort` value / `ProcCall` args /
+    `UncheckedStore` ptr+value / `VolatileStore` ptr+value /
+    `Assign` value / `If` cond+branches / `Sigma` source+body)
+    via the new `walk_expr_for_reads` helper.
+  - `walk_expr_for_reads` recursively descends every expression
+    tree and records `FieldAccess { obj: Path([X]), field }` as
+    a read iff `X` resolves to an automaton (via the resolver
+    symbol table) or `X == "Self"` inside a transition body. Also
+    records `@snapshot Auto.field` as a read.
+  - Compound `MutateShort` (`Auto.field <op>= expr` with
+    `op != Eq`) now records the LHS as a read in addition to a
+    write — load-modify-store is implicit.
+  - Plain `MutateShort` (`Auto.field = expr`) records ONLY a
+    write; the field is overwritten without being read.
+  - The transitive-closure pass propagates reads through
+    `#> proc()` calls symmetrically with writes.
+  - `actual_automata` continues to track WRITES only — §6.2's
+    `#mutates` / `#cannot_mutate` declaration check gates writes,
+    not reads.
+
+- `clifford-ortho`:
+  - Internal `Behaviour` is now `{ writes: u64, reads: u64 }`
+    instead of a single `u64` blade.
+  - `behaviour_from_profile_and_traits` populates both blades:
+    field writes + in-basis traits → writes; field reads → reads.
+  - `behaviour_from_fn_traits` populates both blades: traits →
+    writes; field reads (from `actual_reads`, if profile is
+    available) → reads.
+  - `verify` performs the three-class graded check and unions
+    the conflict bits across all three for the diagnostic.
+
+**Tests added:** 9 new in ortho (27 → 36). 0 new in effect (the
+existing 51 still pass — no regression).
+
+*v0.2-β tests:*
+- `effect_reads_field_that_interrupt_writes_violates` — the
+  canonical SPSC consumer-side race.
+- `interrupt_reads_field_that_effect_writes_violates` — mirror
+  case; check is symmetric.
+- `read_read_does_not_violate` — two reads of the same field is
+  never a conflict.
+- `compound_assign_implies_read` — `Auto.field += expr` is a
+  load-modify-store, so the LHS counts as a read.
+- `pure_write_without_read_dependency_passes` — plain `=` is a
+  pure store, no implicit read.
+- `read_in_let_initializer_counts` — `let _x = Auto.field`
+  captured.
+- `read_in_if_condition_counts` — `if Auto.field > 0` captured.
+- `read_in_sigma_range_bound_counts` — `sigma i in 0..Auto.field`
+  captured.
+- `read_propagates_through_proc_call` — transitive read
+  propagation symmetric to writes.
+
+**Pipeline regression checked against every committed example:**
+
+| Sample | v0.2-α | v0.2-β |
+|---|---|---|
+| `examples/dual_uart_telemetry.cl` | ✓ | ✗ → fixed (drain side removed) |
+| `examples/buffer_init_sigma.cl` | ✓ | ✓ |
+| `examples/uart_fsm.cl` | ✓ | ✓ |
+| `examples/traffic_classifier.cl` | ✓ | ✓ |
+| `examples/crc32.cl` | ✓ | ✓ |
+| `tests/qemu/firmware_smoke.cl` | ✓ | ✓ |
+
+Five of six passed unchanged; the sixth — the multi-producer
+telemetry — got its consumer side legitimately flagged by the
+new check. The fix preserved the producer-side demonstration and
+documented the consumer-side race + the routes to safety.
+
+**API changes:**
+
+- `clifford_effect::MutationProfile` gained `actual_reads`
+  field — a public addition. Existing readers that destructure
+  the struct need an explicit `actual_reads: _` ignore arm; the
+  workspace's only such reader (`crates/ortho`) was updated.
+- No changes to `clifford-codegen`, `clifford-check`,
+  `clifford-resolve`, or `clifford-types`.
+
+**Deferred to subsequent ortho slices:**
+
+- **`@sequential(A, B)` consumption** (Decision #11). The
+  dual_uart_telemetry pattern is exactly the case `@sequential`
+  was designed for — let users assert "drain runs only when
+  ISRs are masked" so the verifier skips the pair.
+- **`#atomic: interrupt_critical` annotation** (§6.6). Wraps a
+  body in CLI/STI; turns the body's reads into safe atomic ones
+  for orthogonality purposes.
+- **`@snapshot Auto.field` codegen** (Decision #24 / ADR 0004).
+  The parser ships in v0.2-α; codegen lowering would let users
+  copy-then-read without a race.
+- **`#basis` override clauses** (Decision #4 rule 2).
+- **Property tests via `proptest`** per CLAUDE.md §4.1 mandate
+  (still blocked on the toolchain pin).
+
+Total ortho tests: **36** (27 pre-v0.2-β + 9 new). Total effect
+tests: **51** (unchanged). Workspace clean; clippy clean.
+
 ### Added — `clifford-ortho` v0.2-α: trait basis + `@fn` concurrency nodes (2026-05-08)
 
 Extends the §7 verifier from "field basis only" (v0.1) to the

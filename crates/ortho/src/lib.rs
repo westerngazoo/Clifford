@@ -386,60 +386,109 @@ fn trait_lists_of(item: &Item) -> &[TraitRef] {
 
 // ─── §7.2 Behaviour Multivector Construction ───────────────────────────────
 
-/// Behaviour blade for one callable: the wedge of basis vectors for
-/// every field it writes (transitively, per §6.2's `actual_writes`
-/// closure) AND every §7-basis trait in its declared `trait_list`.
-/// v0.2-α represents this as a single `u64` since under the
-/// restricted Cl(0,0,n) algebra each callable contributes exactly one
-/// blade — the union of its writes' bits and its in-basis traits' bits.
-type Behaviour = u64;
+/// Behaviour signature for one callable, carrying separate write
+/// and read blades per spec §7.2's graded read-write algebra.
+///
+/// - `writes`: the wedge of basis vectors for every field the
+///   callable writes (transitively, per §6.2's `actual_writes`
+///   closure) AND every §7-basis trait in its declared
+///   `trait_list`.
+/// - `reads`: the wedge of basis vectors for every field the
+///   callable reads (transitively, per `actual_reads`). Trait
+///   bits do NOT enter `reads` — traits are about what the
+///   callable *commits to do*, not what it *observes*.
+///
+/// The §7.4 orthogonality check is now graded:
+///
+/// ```text
+/// safe(A, B) ⟺ (writes_A ∧ writes_B == 0)
+///            ∧ (reads_A  ∧ writes_B == 0)
+///            ∧ (writes_A ∧ reads_B  == 0)
+/// ```
+///
+/// Read-read (`reads_A ∧ reads_B`) is never a conflict — two reads
+/// of the same field don't race.
+#[derive(Debug, Clone, Copy, Default)]
+struct Behaviour {
+    writes: u64,
+    reads: u64,
+}
 
-/// Build the behaviour blade for an `#effect`/`#interrupt` from its
+/// Build the behaviour for an `#effect`/`#interrupt` from its
 /// mutation profile + declared trait list. Field writes contribute
-/// bits 0..|F|; in-basis traits contribute bits |F|..|F|+|T|.
+/// bits 0..|F| in the `writes` blade; field reads contribute bits
+/// 0..|F| in the `reads` blade; in-basis traits contribute bits
+/// |F|..|F|+|T| in the `writes` blade.
 fn behaviour_from_profile_and_traits(
     profile: Option<&MutationProfile>,
     trait_list: &[TraitRef],
     basis: &BasisAssignment,
 ) -> Behaviour {
-    let mut blade: u64 = 0;
+    let mut beh = Behaviour::default();
     if let Some(p) = profile {
         for fref in &p.actual_writes {
             if let Some(bit) = basis.bit_index(fref) {
-                blade |= 1u64 << bit;
+                beh.writes |= 1u64 << bit;
+            }
+        }
+        for fref in &p.actual_reads {
+            if let Some(bit) = basis.bit_index(fref) {
+                beh.reads |= 1u64 << bit;
             }
         }
     }
     for tref in trait_list {
         if let Some(bit) = basis.trait_bit_index(&tref.name) {
-            blade |= 1u64 << bit;
+            beh.writes |= 1u64 << bit;
         }
     }
-    blade
+    beh
 }
 
-/// Build the behaviour blade for an `@fn`. Pure functions cannot
-/// write automaton fields per the sigil-layer rule, so the blade is
-/// just the wedge of in-basis traits the function declares.
+/// Build the behaviour for an `@fn`. Pure functions cannot write
+/// automaton fields per the sigil-layer rule, so the writes blade
+/// is just trait bits. The reads blade IS populated from the
+/// mutation profile — a `@fn` can read from automaton state via
+/// `Self.field` (inside trait methods on a future slice) or via
+/// `@snapshot Auto.field` (Decision #24, parser-only today).
 ///
 /// **Default trait** (Emergent Rule 2): an `@fn` with no `$ [...]`
-/// defaults to `$ [Pure]`. We mirror that here so a bare `@fn` carries
-/// the `Pure` bit and is therefore orthogonal to anything that doesn't.
-fn behaviour_from_fn_traits(trait_list: &[TraitRef], basis: &BasisAssignment) -> Behaviour {
-    let mut blade: u64 = 0;
+/// defaults to `$ [Pure]` — the bare `@fn` carries the `Pure` bit.
+fn behaviour_from_fn_traits(
+    profile: Option<&MutationProfile>,
+    trait_list: &[TraitRef],
+    basis: &BasisAssignment,
+) -> Behaviour {
+    let mut beh = Behaviour::default();
     if trait_list.is_empty() {
         // Emergent Rule 2: empty trait_list defaults to `[Pure]`.
         if let Some(bit) = basis.trait_bit_index("Pure") {
-            blade |= 1u64 << bit;
+            beh.writes |= 1u64 << bit;
         }
-        return blade;
-    }
-    for tref in trait_list {
-        if let Some(bit) = basis.trait_bit_index(&tref.name) {
-            blade |= 1u64 << bit;
+    } else {
+        for tref in trait_list {
+            if let Some(bit) = basis.trait_bit_index(&tref.name) {
+                beh.writes |= 1u64 << bit;
+            }
         }
     }
-    blade
+    if let Some(p) = profile {
+        for fref in &p.actual_reads {
+            if let Some(bit) = basis.bit_index(fref) {
+                beh.reads |= 1u64 << bit;
+            }
+        }
+        // Defensive: a @fn shouldn't have actual_writes (sigil-layer
+        // rule rejects it upstream). If it does, include them anyway
+        // so the §7 check stays sound — better an over-strict false
+        // positive than a missed race.
+        for fref in &p.actual_writes {
+            if let Some(bit) = basis.bit_index(fref) {
+                beh.writes |= 1u64 << bit;
+            }
+        }
+    }
+    beh
 }
 
 // ─── §7.3 Concurrency Inference (extended for @fn nodes) ───────────────────
@@ -559,51 +608,70 @@ pub fn verify(
         Err(e) => return Err(vec![e]),
     };
 
-    // Collect every concurrency-checked node with its behaviour
-    // blade. We include `@fn`s as nodes (v0.2-α addition) so trait-
-    // basis interactions can be checked.
+    // Collect every concurrency-checked node with its behaviour.
+    // We include `@fn`s as nodes (v0.2-α) so trait-basis and
+    // read-basis interactions can be checked.
     let mut nodes: Vec<(ConcurrencyNode, Behaviour)> = Vec::new();
     for item in &program.items {
         match item {
             Item::Fn(decl) => {
                 let id = ConcurrencyNode::Fn(decl.name.clone());
-                let blade = behaviour_from_fn_traits(&decl.trait_list, &basis);
-                nodes.push((id, blade));
+                // @fns aren't tracked in clifford-effect's profile
+                // map (CallableId only covers Effect/Interrupt/
+                // Transition), so profile lookup returns None.
+                // Future slice that adds @fn-callable mutation
+                // profiles can pass `profiles.lookup_fn(&decl.name)`
+                // here. For now, behaviour_from_fn_traits handles
+                // None gracefully and uses just trait bits.
+                let beh = behaviour_from_fn_traits(None, &decl.trait_list, &basis);
+                nodes.push((id, beh));
             }
             Item::Effect(decl) => {
                 let cid = CallableId::Effect(decl.name.clone());
-                let blade = behaviour_from_profile_and_traits(
+                let beh = behaviour_from_profile_and_traits(
                     profiles.lookup(&cid),
                     &decl.trait_list,
                     &basis,
                 );
-                nodes.push((ConcurrencyNode::Effect(decl.name.clone()), blade));
+                nodes.push((ConcurrencyNode::Effect(decl.name.clone()), beh));
             }
             Item::Interrupt(decl) => {
                 let cid = CallableId::Interrupt(decl.name.clone());
-                let blade = behaviour_from_profile_and_traits(
+                let beh = behaviour_from_profile_and_traits(
                     profiles.lookup(&cid),
                     &decl.trait_list,
                     &basis,
                 );
-                nodes.push((ConcurrencyNode::Interrupt(decl.name.clone()), blade));
+                nodes.push((ConcurrencyNode::Interrupt(decl.name.clone()), beh));
             }
             _ => {}
         }
     }
 
-    // Pairwise check per §7.4. O(N²) pairs but N is the count of
-    // top-level callables — a few dozen for realistic firmware.
+    // Pairwise graded check per §7.2 + §7.4:
+    //
+    //   safe(A, B) ⟺ (writes_A ∧ writes_B == 0)     [v0.1: write-write]
+    //              ∧ (reads_A  ∧ writes_B == 0)     [v0.2-β: read-write]
+    //              ∧ (writes_A ∧ reads_B  == 0)     [v0.2-β: write-read]
+    //
+    // Read-read overlap is never a conflict.
     let mut errors: Vec<OrthoError> = Vec::new();
     for i in 0..nodes.len() {
         for j in (i + 1)..nodes.len() {
-            let (id_a, blade_a) = &nodes[i];
-            let (id_b, blade_b) = &nodes[j];
+            let (id_a, beh_a) = &nodes[i];
+            let (id_b, beh_b) = &nodes[j];
             if !can_concur(id_a, id_b) {
                 continue;
             }
-            if outer_product(*blade_a, *blade_b).is_none() {
-                let conflict = blade_a & blade_b;
+            // Combined conflict mask across the three race classes.
+            // Same field appearing in writes(A) and writes(B), or
+            // in reads(A) and writes(B), or writes(A) and reads(B)
+            // → conflict.
+            let ww = beh_a.writes & beh_b.writes;
+            let rw = beh_a.reads & beh_b.writes;
+            let wr = beh_a.writes & beh_b.reads;
+            let conflict = ww | rw | wr;
+            if conflict != 0 {
                 let (shared_fields, shared_traits) = basis.decode_mask(conflict);
                 let shared_display = render_shared(&shared_fields, &shared_traits);
                 errors.push(OrthoError::OrthogonalityViolation {
@@ -965,6 +1033,229 @@ mod tests {
         let program = parse_program(src);
         let profiles = build_profiles(&program);
         verify(&program, &profiles).expect("imperative traits are not in the basis");
+    }
+
+    // ─── v0.2-β: read-write race detection (§7.2 graded algebra) ─────
+
+    #[test]
+    fn effect_reads_field_that_interrupt_writes_violates() {
+        // The canonical SPSC read-write race: foreground effect
+        // reads a counter that an interrupt writes. v0.1 missed
+        // this (writes_eff = ∅, no overlap with writes_irq);
+        // v0.2-β catches it via reads_eff ∧ writes_irq != 0.
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #effect drain() -> u32 #mutates: [C] { return C.v; }\n\
+            #interrupt Tally() #mutates: [C] #priority: HIGH { C.v += 1u32; }\n\
+        ";
+        let program = parse_program(src);
+        let profiles = build_profiles(&program);
+        let errs = verify(&program, &profiles).expect_err("expected E0520 read-write");
+        assert_eq!(errs.len(), 1);
+        match &errs[0] {
+            OrthoError::OrthogonalityViolation { shared_fields, .. } => {
+                assert_eq!(shared_fields.len(), 1);
+                assert_eq!(shared_fields[0].field, "v");
+            }
+            other => panic!("expected OrthogonalityViolation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interrupt_reads_field_that_effect_writes_violates() {
+        // Mirror case: the interrupt reads, the effect writes. The
+        // graded check is symmetric — `writes_A ∧ reads_B` covers
+        // both orderings.
+        let src = "\
+            #automaton C { v: u32; flag: u32; }\n\
+            #effect main_loop() #mutates: [C] { C.v += 1u32; }\n\
+            #interrupt Sampler() #mutates: [C] #priority: HIGH {\n  \
+              C.flag = C.v;\n\
+            }\n\
+        ";
+        let program = parse_program(src);
+        let profiles = build_profiles(&program);
+        let errs = verify(&program, &profiles).expect_err("expected E0520");
+        // Two distinct shared fields would produce one error each;
+        // single shared field `v` produces one. (`flag` is written
+        // by Sampler, not read by main_loop, so no second conflict.)
+        assert_eq!(errs.len(), 1);
+        match &errs[0] {
+            OrthoError::OrthogonalityViolation { shared_fields, .. } => {
+                let names: Vec<&str> = shared_fields.iter().map(|f| f.field.as_str()).collect();
+                assert!(names.contains(&"v"));
+            }
+            _ => panic!("expected OrthogonalityViolation"),
+        }
+    }
+
+    #[test]
+    fn read_read_does_not_violate() {
+        // Two concurrent callables BOTH reading the same field
+        // is fine — reads don't race with reads. v0.2-β must
+        // NOT flag this case.
+        let src = "\
+            #automaton C { v: u32; tally: u32; }\n\
+            #effect read_v() #mutates: [C] { C.tally = C.v; }\n\
+            #interrupt Sampler() #mutates: [C] #priority: HIGH {\n  \
+              let _x: u32 = C.v;\n  \
+              return;\n\
+            }\n\
+        ";
+        // read_v writes `tally` and reads `v`.
+        // Sampler reads `v` (no write).
+        // Conflict matrix:
+        //   writes_eff (tally) ∧ writes_irq (∅)        = 0 ✓
+        //   reads_eff (v) ∧ writes_irq (∅)             = 0 ✓
+        //   writes_eff (tally) ∧ reads_irq (v)         = 0 ✓
+        // Read-read (v ∧ v) is not in the check. So passes.
+        let program = parse_program(src);
+        let profiles = build_profiles(&program);
+        verify(&program, &profiles).expect("read-read should not violate");
+    }
+
+    #[test]
+    fn compound_assign_implies_read() {
+        // `Auto.field += expr` is a load-modify-store, so it must
+        // count as a read of `field`. A separate effect that just
+        // writes `field` from outside would still be a write-write
+        // race (and that's caught by v0.1). But a separate
+        // PURE-WRITE-only callable concurrent with the compound
+        // assign should NOT count as read-write — the compound's
+        // read happens IN the interrupt, not concurrently.
+        //
+        // This test verifies a different shape: a compound assign
+        // and a separate read-only effect on the same field. The
+        // read in the effect races with the write of the compound
+        // assign in the interrupt.
+        let src = "\
+            #automaton C { v: u32; tally: u32; }\n\
+            #effect snapshot() #mutates: [C] { C.tally = C.v; }\n\
+            #interrupt Tally() #mutates: [C] #priority: HIGH { C.v += 1u32; }\n\
+        ";
+        let program = parse_program(src);
+        let profiles = build_profiles(&program);
+        let errs = verify(&program, &profiles).expect_err("expected E0520");
+        match &errs[0] {
+            OrthoError::OrthogonalityViolation { shared_fields, .. } => {
+                let names: Vec<&str> = shared_fields.iter().map(|f| f.field.as_str()).collect();
+                assert!(names.contains(&"v"));
+            }
+            _ => panic!("expected OrthogonalityViolation"),
+        }
+    }
+
+    #[test]
+    fn pure_write_without_read_dependency_passes() {
+        // Plain `=` (not compound) is a pure store; no read
+        // implicit. Two callables that ONLY write disjoint fields
+        // should pass. (This was already v0.1 behaviour; verifies
+        // we didn't introduce a regression by counting plain `=`
+        // as a read.)
+        let src = "\
+            #automaton C { v: u32; w: u32; }\n\
+            #effect set_v() #mutates: [C] { C.v = 1u32; }\n\
+            #interrupt Tally() #mutates: [C] #priority: HIGH { C.w = 2u32; }\n\
+        ";
+        let program = parse_program(src);
+        let profiles = build_profiles(&program);
+        verify(&program, &profiles).expect("disjoint pure writes should pass");
+    }
+
+    #[test]
+    fn read_in_let_initializer_counts() {
+        // `let _x: u32 = Auto.field;` reads `field`. Verify the
+        // walker captures it.
+        let src = "\
+            #automaton C { v: u32; tally: u32; }\n\
+            #effect snapshot() #mutates: [C] {\n  \
+              let _x: u32 = C.v;\n  \
+              C.tally = 1u32;\n  \
+              return;\n\
+            }\n\
+            #interrupt Tally() #mutates: [C] #priority: HIGH { C.v = 1u32; }\n\
+        ";
+        let program = parse_program(src);
+        let profiles = build_profiles(&program);
+        let errs = verify(&program, &profiles).expect_err("expected E0520");
+        match &errs[0] {
+            OrthoError::OrthogonalityViolation { shared_fields, .. } => {
+                let names: Vec<&str> = shared_fields.iter().map(|f| f.field.as_str()).collect();
+                assert!(names.contains(&"v"), "expected `v` in shared; got {names:?}");
+            }
+            _ => panic!("expected OrthogonalityViolation"),
+        }
+    }
+
+    #[test]
+    fn read_in_if_condition_counts() {
+        // `if Auto.field > 0 { ... }` reads `field`.
+        let src = "\
+            #automaton C { v: u32; tally: u32; }\n\
+            #effect inspect() #mutates: [C] {\n  \
+              if C.v > 0u32 { C.tally = 1u32; }\n  \
+              return;\n\
+            }\n\
+            #interrupt Tally() #mutates: [C] #priority: HIGH { C.v = 1u32; }\n\
+        ";
+        let program = parse_program(src);
+        let profiles = build_profiles(&program);
+        let errs = verify(&program, &profiles).expect_err("expected E0520");
+        let names: Vec<&str> = match &errs[0] {
+            OrthoError::OrthogonalityViolation { shared_fields, .. } => {
+                shared_fields.iter().map(|f| f.field.as_str()).collect()
+            }
+            _ => panic!("expected OrthogonalityViolation"),
+        };
+        assert!(names.contains(&"v"));
+    }
+
+    #[test]
+    fn read_in_sigma_range_bound_counts() {
+        // `sigma i in 0u32..Auto.field { ... }` reads `field`.
+        let src = "\
+            #automaton C { len: u32; tally: u32; }\n\
+            #effect iterate() #mutates: [C] {\n  \
+              sigma i in 0u32..C.len { C.tally += 1u32; }\n  \
+              return;\n\
+            }\n\
+            #interrupt SetLen() #mutates: [C] #priority: HIGH { C.len = 10u32; }\n\
+        ";
+        let program = parse_program(src);
+        let profiles = build_profiles(&program);
+        let errs = verify(&program, &profiles).expect_err("expected E0520");
+        let names: Vec<&str> = match &errs[0] {
+            OrthoError::OrthogonalityViolation { shared_fields, .. } => {
+                shared_fields.iter().map(|f| f.field.as_str()).collect()
+            }
+            _ => panic!("expected OrthogonalityViolation"),
+        };
+        assert!(names.contains(&"len"));
+    }
+
+    #[test]
+    fn read_propagates_through_proc_call() {
+        // An effect that calls a transition that reads the field —
+        // the read should propagate transitively into the effect's
+        // read profile, then trigger the wedge check against the
+        // interrupt's write.
+        let src = "\
+            #automaton C { v: u32; tally: u32;\n  \
+              #transition tick { C.tally = C.v; }\n\
+            }\n\
+            #effect drain() #mutates: [C] { #> tick(); }\n\
+            #interrupt Sampler() #mutates: [C] #priority: HIGH { C.v = 1u32; }\n\
+        ";
+        let program = parse_program(src);
+        let profiles = build_profiles(&program);
+        let errs = verify(&program, &profiles).expect_err("expected E0520");
+        match &errs[0] {
+            OrthoError::OrthogonalityViolation { shared_fields, .. } => {
+                let names: Vec<&str> = shared_fields.iter().map(|f| f.field.as_str()).collect();
+                assert!(names.contains(&"v"));
+            }
+            _ => panic!("expected OrthogonalityViolation"),
+        }
     }
 
     #[test]

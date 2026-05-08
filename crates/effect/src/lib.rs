@@ -58,10 +58,11 @@
 use std::collections::{HashMap, HashSet};
 
 use clifford_ast::{
-    AutomatonDecl, Block, FieldAssign, Item, Program, Stmt, StmtKind, TransitionDecl,
+    AssignOp, AutomatonDecl, Block, Expr, ExprKind, FieldAssign, Item, Program, Stmt, StmtKind,
+    TransitionDecl,
 };
 use clifford_lexer::Span;
-use clifford_resolve::{BindingRef, CallContext, Resolution};
+use clifford_resolve::{BindingRef, CallContext, Resolution, SymbolKind};
 use thiserror::Error;
 
 /// Errors produced during effect / FSM extraction.
@@ -538,18 +539,33 @@ pub struct FieldRef {
 ///
 /// `actual_writes` is the set of `(automaton, field)` pairs the callable
 /// writes — including writes propagated transitively through `#> proc()`
-/// calls per Decision #3. This is what `crates/ortho` consumes.
+/// calls per Decision #3. This is what `crates/ortho` consumes for
+/// write-write race detection.
+///
+/// `actual_reads` (v0.2-β) is the set of `(automaton, field)` pairs
+/// the callable reads from in expression positions. Like writes, it
+/// includes transitive reads propagated through proc-calls. Spec §7.2's
+/// graded read-write algebra uses this to detect read-write races at
+/// field granularity.
 ///
 /// `actual_automata` is the set of automaton names appearing in
 /// `actual_writes`; pre-computed for the §6.2 subset / disjointness
 /// checks against the declared `#mutates` and `#cannot_mutate` clauses.
+/// Read-only access does NOT contribute to this set — the §6.2 check
+/// gates writes only.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MutationProfile {
     /// Every `(automaton, field)` pair the callable writes (direct +
     /// transitive through proc-calls).
     pub actual_writes: HashSet<FieldRef>,
+    /// Every `(automaton, field)` pair the callable reads (direct +
+    /// transitive). Added in v0.2-β for spec §7.2's read-write race
+    /// detection. Does NOT include the write-implies-read overlap
+    /// for compound assignments — those are recorded explicitly.
+    pub actual_reads: HashSet<FieldRef>,
     /// Every automaton name appearing in `actual_writes`. Derived
     /// upstream and cached here for fast subset / disjointness checks.
+    /// Reads do not contribute (§6.2 gates writes only).
     pub actual_automata: HashSet<String>,
 }
 
@@ -667,12 +683,26 @@ pub fn extract_mutation_profiles(
     }
 }
 
-/// Internal: per-callable record of direct writes and direct proc-call
-/// targets. The transitive-closure pass runs over this to produce the
-/// final [`MutationProfile`]s.
+/// Internal: per-callable record of direct writes, direct reads,
+/// and direct proc-call targets. The transitive-closure pass runs
+/// over this to produce the final [`MutationProfile`]s.
+///
+/// Reads (added in v0.2-β for spec §7.2's graded read-write
+/// algebra) are collected by walking expression positions for
+/// `Auto.field` references — these include:
+/// - Field accesses in `let` / `let mut` initialisers.
+/// - Field accesses in `return expr;`.
+/// - Field accesses in conditions (`if expr`, sigma `range`).
+/// - Field accesses on the RHS of `Auto.field <op>= expr` (the
+///   LHS is added to writes; the RHS is walked for nested reads).
+/// - Field accesses on the LHS of compound `Auto.field <op>= expr`
+///   when `op != Eq` (load-modify-store implies a read).
+/// - Field accesses on the RHS of `local = expr;`.
+/// - Field accesses passed as arguments to `#> proc()` calls.
 #[derive(Debug, Clone, Default)]
 struct DirectProfile {
     writes: HashSet<FieldRef>,
+    reads: HashSet<FieldRef>,
     proc_calls: HashSet<CallableId>,
 }
 
@@ -713,40 +743,77 @@ fn collect_direct_profiles(
 
 fn walk_body_for_direct(body: &Block, resolution: &Resolution) -> DirectProfile {
     let mut profile = DirectProfile::default();
-    walk_stmts(&body.stmts, resolution, &mut profile);
+    // Top-level `#effect` / `#interrupt` bodies have no `Self` —
+    // pass `None` for the enclosing owner. Any `Self.field`
+    // appearing here is invalid (resolver already emitted an error),
+    // and we silently skip it during read collection.
+    walk_stmts(&body.stmts, resolution, None, &mut profile);
     profile
 }
 
 fn walk_transition_for_direct(
-    _automaton: &AutomatonDecl,
+    automaton: &AutomatonDecl,
     trans: &TransitionDecl,
     resolution: &Resolution,
 ) -> DirectProfile {
     let mut profile = DirectProfile::default();
-    walk_stmts(&trans.body.stmts, resolution, &mut profile);
+    // Inside a `#transition` body, `Self.field` resolves to the
+    // owning automaton's field. Pass the owner so the read walker
+    // can attribute `Self.field` reads correctly.
+    walk_stmts(
+        &trans.body.stmts,
+        resolution,
+        Some(automaton.name.as_str()),
+        &mut profile,
+    );
     profile
 }
 
-fn walk_stmts(stmts: &[Stmt], resolution: &Resolution, out: &mut DirectProfile) {
+fn walk_stmts(
+    stmts: &[Stmt],
+    resolution: &Resolution,
+    enclosing_owner: Option<&str>,
+    out: &mut DirectProfile,
+) {
     for stmt in stmts {
         match &stmt.kind {
             StmtKind::Mutate { automaton, assigns } => {
-                for FieldAssign { field, .. } in assigns {
+                for FieldAssign { field, index, value, .. } in assigns {
                     out.writes.insert(FieldRef {
                         automaton: automaton.clone(),
                         field: field.clone(),
                     });
+                    // Walk the index (if any) and value for nested
+                    // automaton-field reads.
+                    if let Some(idx_expr) = index {
+                        walk_expr_for_reads(idx_expr, resolution, enclosing_owner, out);
+                    }
+                    walk_expr_for_reads(value, resolution, enclosing_owner, out);
                 }
             }
             StmtKind::MutateShort {
-                automaton, field, ..
+                automaton,
+                field,
+                op,
+                value,
+                ..
             } => {
                 out.writes.insert(FieldRef {
                     automaton: automaton.clone(),
                     field: field.clone(),
                 });
+                // v0.2-β: compound assignment (`+=`, `*=`, etc.)
+                // lowers to load-modify-store, so the LHS is also
+                // read. Plain `=` is a pure store, no read.
+                if !matches!(op, AssignOp::Eq) {
+                    out.reads.insert(FieldRef {
+                        automaton: automaton.clone(),
+                        field: field.clone(),
+                    });
+                }
+                walk_expr_for_reads(value, resolution, enclosing_owner, out);
             }
-            StmtKind::ProcCall { name, .. } => {
+            StmtKind::ProcCall { name, args } => {
                 // The resolver tagged the call site with a Proc binding
                 // carrying CallContext. Resolve to the right CallableId.
                 if let Some(BindingRef::Proc { name: pn, ctx, .. }) =
@@ -779,37 +846,215 @@ fn walk_stmts(stmts: &[Stmt], resolution: &Resolution, out: &mut DirectProfile) 
                     // emitted E0404; we silently ignore here so we don't
                     // double-report.
                 }
+                // v0.2-β: walk arguments for field reads.
+                for a in args {
+                    walk_expr_for_reads(a, resolution, enclosing_owner, out);
+                }
             }
-            // Recurse into expression-bearing statements where bodies
-            // can't appear today, but where a future construct (e.g.
-            // `if`/`match` blocks) would warrant recursion. For now,
-            // these statements have no nested write sites.
-            StmtKind::Let { .. }
-            | StmtKind::LetShort { .. }
-            | StmtKind::Expr(_)
-            | StmtKind::Return(_)
-            | StmtKind::UncheckedStore { .. }
-            | StmtKind::VolatileStore { .. } => {}
+            // v0.2-β: walk every expression-bearing statement so
+            // automaton-field reads in any position are captured.
+            StmtKind::Let { value, .. } | StmtKind::LetShort { value, .. } => {
+                walk_expr_for_reads(value, resolution, enclosing_owner, out);
+            }
+            StmtKind::Expr(e) | StmtKind::Return(Some(e)) => {
+                walk_expr_for_reads(e, resolution, enclosing_owner, out);
+            }
+            StmtKind::Return(None) => {}
+            StmtKind::UncheckedStore { ptr, value, .. }
+            | StmtKind::VolatileStore { ptr, value, .. } => {
+                walk_expr_for_reads(ptr, resolution, enclosing_owner, out);
+                walk_expr_for_reads(value, resolution, enclosing_owner, out);
+            }
+            StmtKind::Assign { value, .. } => {
+                // The LHS is a local, not an automaton field. The RHS
+                // is the only expression that can contain field reads.
+                walk_expr_for_reads(value, resolution, enclosing_owner, out);
+            }
+            StmtKind::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                walk_expr_for_reads(cond, resolution, enclosing_owner, out);
+                walk_stmts(&then_block.stmts, resolution, enclosing_owner, out);
+                if let Some(blk) = else_block {
+                    walk_stmts(&blk.stmts, resolution, enclosing_owner, out);
+                }
+            }
+            StmtKind::Sigma { source, body, .. } => {
+                walk_expr_for_reads(source, resolution, enclosing_owner, out);
+                walk_stmts(&body.stmts, resolution, enclosing_owner, out);
+            }
             // Forward-compat for new statement kinds.
             _ => {}
         }
     }
 }
 
-/// Compute the transitive closure of writes through the proc-call graph.
+/// v0.2-β: recursively walk an expression tree and record every
+/// `Auto.field` (or `Self.field` inside a transition) as a read in
+/// the profile. Other expression shapes recurse into their
+/// children but contribute no reads themselves.
 ///
-/// Worklist algorithm: starts each callable with its direct writes,
-/// repeatedly unions in callees' writes until no profile changes.
-/// Terminates because the union over a finite field-set is monotonic
-/// and bounded.
+/// Resolution: the receiver of a `FieldAccess` must be a single-
+/// segment `Path` whose first segment either:
+/// - is a single ident `X` where `X` resolves to an automaton in
+///   the symbol table, OR
+/// - is the literal `"Self"` and `enclosing_owner` is `Some(_)`
+///   (we're inside a `#transition` body of that owner).
 ///
-/// Cycles in the proc-call graph (e.g. effect A calls B calls A) are
-/// handled defensively: each iteration only unions in writes already
-/// known, so the fixed point is reached without infinite recursion.
+/// Field-of-local accesses (e.g. `x.foo` where `x` is a let-bound
+/// tuple) don't constitute automaton reads; we recurse into `obj`
+/// regardless to catch nested reads inside.
+fn walk_expr_for_reads(
+    expr: &Expr,
+    resolution: &Resolution,
+    enclosing_owner: Option<&str>,
+    out: &mut DirectProfile,
+) {
+    match &expr.kind {
+        ExprKind::FieldAccess { obj, field } => {
+            // Try to resolve the receiver as an automaton name.
+            if let ExprKind::Path(segs) = &obj.kind {
+                if segs.len() == 1 {
+                    let head = segs[0].as_str();
+                    let resolved_owner = if head == "Self" {
+                        enclosing_owner
+                    } else if resolution
+                        .symbols
+                        .lookup(head)
+                        .is_some_and(|s| matches!(s.kind, SymbolKind::Automaton))
+                    {
+                        Some(head)
+                    } else {
+                        None
+                    };
+                    if let Some(owner) = resolved_owner {
+                        out.reads.insert(FieldRef {
+                            automaton: owner.to_owned(),
+                            field: field.clone(),
+                        });
+                    }
+                }
+            }
+            // Always recurse into the receiver to catch nested
+            // reads (e.g. `Auto.field.subfield` in a future
+            // tuple-field slice; harmless today).
+            walk_expr_for_reads(obj, resolution, enclosing_owner, out);
+        }
+        ExprKind::Index { obj, index } => {
+            walk_expr_for_reads(obj, resolution, enclosing_owner, out);
+            walk_expr_for_reads(index, resolution, enclosing_owner, out);
+        }
+        ExprKind::Binary { lhs, rhs, .. } => {
+            walk_expr_for_reads(lhs, resolution, enclosing_owner, out);
+            walk_expr_for_reads(rhs, resolution, enclosing_owner, out);
+        }
+        ExprKind::Unary { operand, .. } | ExprKind::Ref { operand, .. } => {
+            walk_expr_for_reads(operand, resolution, enclosing_owner, out);
+        }
+        ExprKind::Paren(inner) => {
+            walk_expr_for_reads(inner, resolution, enclosing_owner, out);
+        }
+        ExprKind::Cast { value, .. } => {
+            walk_expr_for_reads(value, resolution, enclosing_owner, out);
+        }
+        ExprKind::Call { callee, args } => {
+            walk_expr_for_reads(callee, resolution, enclosing_owner, out);
+            for a in args {
+                walk_expr_for_reads(a, resolution, enclosing_owner, out);
+            }
+        }
+        ExprKind::MethodCall { obj, args, .. } => {
+            walk_expr_for_reads(obj, resolution, enclosing_owner, out);
+            for a in args {
+                walk_expr_for_reads(a, resolution, enclosing_owner, out);
+            }
+        }
+        ExprKind::Range { lo, hi, .. } => {
+            walk_expr_for_reads(lo, resolution, enclosing_owner, out);
+            walk_expr_for_reads(hi, resolution, enclosing_owner, out);
+        }
+        ExprKind::Tuple(elems) | ExprKind::Array(elems) => {
+            for e in elems {
+                walk_expr_for_reads(e, resolution, enclosing_owner, out);
+            }
+        }
+        ExprKind::ArrayRepeat { value, count } => {
+            walk_expr_for_reads(value, resolution, enclosing_owner, out);
+            walk_expr_for_reads(count, resolution, enclosing_owner, out);
+        }
+        ExprKind::UncheckedLoad { ptr, .. } | ExprKind::VolatileLoad { ptr, .. } => {
+            walk_expr_for_reads(ptr, resolution, enclosing_owner, out);
+        }
+        ExprKind::UncheckedCast { value, .. } => {
+            walk_expr_for_reads(value, resolution, enclosing_owner, out);
+        }
+        ExprKind::UncheckedOffset { ptr, n, .. } => {
+            walk_expr_for_reads(ptr, resolution, enclosing_owner, out);
+            walk_expr_for_reads(n, resolution, enclosing_owner, out);
+        }
+        // `Snapshot { automaton, field }` is `@snapshot Auto.field` —
+        // semantically a read of that field per Decision #24 / ADR
+        // 0004. Treat it as a read for the §7.2 algebra.
+        ExprKind::Snapshot { automaton, field } => {
+            let owner = if automaton == "Self" {
+                enclosing_owner.map(str::to_owned)
+            } else {
+                Some(automaton.clone())
+            };
+            if let Some(o) = owner {
+                out.reads.insert(FieldRef {
+                    automaton: o,
+                    field: field.clone(),
+                });
+            }
+        }
+        // `Auto@state` reads the state-tag — for v0.2-β we treat
+        // this as a read of an implicit "tag" pseudo-field of the
+        // automaton. Today the tag isn't a named field in the
+        // basis (slice-9 prepends it as LLVM struct slot 0
+        // without a source-level name), so we skip recording it.
+        // A future slice could add `__state_tag` to the basis if
+        // race-on-tag-read becomes a concern.
+        ExprKind::StateRead(_) => {}
+        // Atomic literals + path expressions can't contain nested
+        // reads.
+        ExprKind::IntLit(_)
+        | ExprKind::HexLit(_)
+        | ExprKind::BinLit(_)
+        | ExprKind::FloatLit(_)
+        | ExprKind::CharLit(_)
+        | ExprKind::ByteLit(_)
+        | ExprKind::StringLit(_)
+        | ExprKind::BoolLit(_)
+        | ExprKind::Null
+        | ExprKind::Path(_) => {}
+        // Forward-compat for new expression kinds.
+        _ => {}
+    }
+}
+
+/// Compute the transitive closure of writes AND reads through the
+/// proc-call graph.
+///
+/// Worklist algorithm: starts each callable with its direct writes
+/// and reads, repeatedly unions in callees' writes and reads until
+/// no profile changes. Terminates because the union over a finite
+/// field-set is monotonic and bounded.
+///
+/// Cycles in the proc-call graph (e.g. effect A calls B calls A)
+/// are handled defensively: each iteration only unions in
+/// already-known writes/reads, so the fixed point is reached
+/// without infinite recursion.
+///
+/// Reads were added in v0.2-β for spec §7.2's graded read-write
+/// algebra. Their propagation is symmetric to writes — if A calls
+/// B, then everything B reads is reachable from A.
 fn transitively_close(
     direct: &HashMap<CallableId, DirectProfile>,
 ) -> HashMap<CallableId, MutationProfile> {
-    // Initialise: each callable starts with its direct writes.
+    // Initialise: each callable starts with its direct writes + reads.
     let mut profiles: HashMap<CallableId, MutationProfile> = direct
         .iter()
         .map(|(id, dp)| {
@@ -819,6 +1064,7 @@ fn transitively_close(
                 id.clone(),
                 MutationProfile {
                     actual_writes: dp.writes.clone(),
+                    actual_reads: dp.reads.clone(),
                     actual_automata,
                 },
             )
@@ -841,11 +1087,13 @@ fn transitively_close(
     };
 
     // Fixed-point iteration. Bounded by total number of
-    // (callable, field) pairs in the program.
+    // (callable, field) pairs in the program; reads propagate
+    // symmetrically with writes.
     loop {
         let mut changed = false;
         for (caller_id, dp) in direct {
-            let mut additions: HashSet<FieldRef> = HashSet::new();
+            let mut write_additions: HashSet<FieldRef> = HashSet::new();
+            let mut read_additions: HashSet<FieldRef> = HashSet::new();
             for callee_id in &dp.proc_calls {
                 let resolved_callees: Vec<CallableId> = match callee_id {
                     CallableId::Effect(_) | CallableId::Interrupt(_) => {
@@ -859,23 +1107,35 @@ fn transitively_close(
                 };
                 for resolved in resolved_callees {
                     if let Some(callee_profile) = profiles.get(&resolved) {
+                        let caller_writes = profiles
+                            .get(caller_id)
+                            .map(|p| &p.actual_writes);
+                        let caller_reads = profiles
+                            .get(caller_id)
+                            .map(|p| &p.actual_reads);
                         for fr in &callee_profile.actual_writes {
-                            if !profiles
-                                .get(caller_id)
-                                .map(|p| p.actual_writes.contains(fr))
-                                .unwrap_or(false)
-                            {
-                                additions.insert(fr.clone());
+                            if !caller_writes.is_some_and(|w| w.contains(fr)) {
+                                write_additions.insert(fr.clone());
+                            }
+                        }
+                        for fr in &callee_profile.actual_reads {
+                            if !caller_reads.is_some_and(|r| r.contains(fr)) {
+                                read_additions.insert(fr.clone());
                             }
                         }
                     }
                 }
             }
-            if !additions.is_empty() {
+            if !write_additions.is_empty() || !read_additions.is_empty() {
                 if let Some(p) = profiles.get_mut(caller_id) {
-                    for fr in additions {
+                    for fr in write_additions {
                         p.actual_automata.insert(fr.automaton.clone());
                         p.actual_writes.insert(fr);
+                    }
+                    for fr in read_additions {
+                        // Note: reads do NOT contribute to actual_automata
+                        // (§6.2 #mutates check gates writes only).
+                        p.actual_reads.insert(fr);
                     }
                     changed = true;
                 }
