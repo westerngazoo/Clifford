@@ -7,6 +7,75 @@ may include breaking changes.
 
 ## [Unreleased]
 
+(no entries yet)
+
+## [0.1.0] — 2026-05-08
+
+The first tagged release. v0.1 cuts the language and toolchain at
+the point where:
+
+- The full firmware language surface lowers to LLVM IR
+  (slices 1–13: `@fn`, `#automaton` mono- and multi-state,
+  `#effect`, `#interrupt`, `#transition`, register-block MMIO with
+  volatile loads/stores, indexed-field operations, aggregate
+  literals, integer casts, Decision #17/19 unsafe primitives,
+  `Auto@state`, sigma loops, local `let mut` re-assignment,
+  `if`/`else`, comparison + bitwise + shift ops, Decision #22
+  Acquire/Release/SeqCst fence ordering).
+- `cliffordc compile foo.cl` produces a `.ll` file end-to-end
+  (slice 10), with the four upstream semantic gates wired in
+  (slice 15: sigil-layer + mutation-auth + totality + categorical
+  + mutation-profile + call-graph), and source-line diagnostics
+  rendered via `codespan-reporting` (slice 16).
+- The bare-metal Cortex-M3 path is verified by a CI job running
+  `qemu-system-arm -M lm3s6965evb` against a checked-in firmware
+  smoke test (slice 14 + post-merge defensive hardening).
+- A non-firmware pure-functional example (`examples/crc32.cl`)
+  proves Clifford targets the same problem space as host-side
+  systems languages — not just embedded.
+
+**Test surface:**
+
+| Crate | Tests |
+|---|---|
+| `clifford-codegen` | 163 |
+| `clifford-parser` | 242 |
+| `clifford-cli` | 29 |
+| `clifford-types` | 176 |
+| `clifford-resolve` | 80 |
+| `clifford-check` | 51 |
+| `clifford-effect` | 48 |
+| `clifford-ast` | 70 |
+| `clifford-lexer` | 3 |
+| (other small crates) | ≈10 |
+| **Total** | **~870** |
+
+All green; clippy clean across the workspace.
+
+**What v0.1 deliberately leaves for v0.2+:**
+
+- The `clifford-ortho` GA orthogonality engine itself — the
+  crate exposes only the `outer_product` primitive today; the
+  full §7 verifier (with behaviour-multivector lifting + race
+  detection) is the next slice.
+- Compound assignment on locals (`x += 1u32` works on automaton
+  fields but not on `let mut` locals — workaround:
+  `x = x + 1u32`).
+- `break` / `continue` inside sigma loops.
+- `match` expressions / statements.
+- Method calls + trait dispatch.
+- String literals as values.
+- `@snapshot` boundary-crossing reads (Decision #24 / ADR 0004).
+- The `test`, `lint`, `audit`, `inspect` CLI subcommands.
+
+None of these block firmware shipping; v0.1 is the proof that
+the language compiles and runs on real hardware.
+
+**Spec snapshot at v0.1.0:**
+
+- `docs/CLIFFORD_SPEC.md` v0.6.0-draft
+- `docs/DECISIONS.md` decisions #1–#22 + #25 locked
+
 ### Added — Non-firmware example: pure-functional CRC-32 (2026-05-08)
 
 Per CLAUDE.md §10 v0.1 criteria: "Also: a non-firmware example
