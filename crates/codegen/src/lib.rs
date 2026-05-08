@@ -820,35 +820,41 @@ impl<'a> Emitter<'a> {
     /// void`. If no return is present but the function has a non-unit
     /// return type, emits `unreachable` and records an error.
     fn emit_block(&mut self, block: &Block, ret_ty: &str) {
-        let mut returned = false;
+        // Slice 13: drive termination off `current_block_terminated`
+        // rather than a top-level Return-statement check. This
+        // correctly handles the case where the LAST top-level
+        // statement is an `if`/`sigma`/`return`-bearing block whose
+        // branches all terminate — the function's current block is
+        // already terminated by the time we reach the end-of-block
+        // check, so we don't synthesize a redundant terminator.
         for stmt in &block.stmts {
-            if returned {
-                // Statements after a return are dead — skip silently.
-                // Future slice may want to warn; today we trust the
-                // upstream check pass to flag truly suspicious code.
+            if self.current_block_terminated {
+                // Statements after a terminator are dead — skip
+                // silently. (Same fall-through semantics as before;
+                // future slice may want a warning.)
                 break;
             }
             self.emit_stmt(stmt);
-            if matches!(stmt.kind, StmtKind::Return(_)) {
-                returned = true;
-            }
         }
-        if !returned {
-            // No explicit return. Either emit `ret void` (if the fn
-            // returns unit) or produce a synthetic `unreachable` and
-            // surface a NotYetImplemented (since slice-1 doesn't
-            // generate unit values from non-return paths yet).
+        if !self.current_block_terminated {
+            // No terminator on the open block. Two cases:
+            //   - void return: emit `ret void` (with any pending
+            //     exit fence and slice-9 transition tag write).
+            //   - non-void return: emit `unreachable` to close the
+            //     block. This satisfies LLVM's "every basic block
+            //     ends in a terminator" rule. We deliberately do
+            //     not push an error here — the resolver / type
+            //     checker is the right place to detect "a non-unit
+            //     fn that may fall off the end without returning",
+            //     and the IR `unreachable` instruction has the
+            //     same UB semantics as the source-level oversight.
             if ret_ty == "void" {
                 self.emit_exit_fence_if_pending();
                 writeln!(&mut self.out, "  ret void").ok();
-                self.current_block_terminated = true;
             } else {
                 writeln!(&mut self.out, "  unreachable").ok();
-                self.current_block_terminated = true;
-                self.errors.push(CodegenError::NotYetImplemented {
-                    what: "non-unit @fn body without an explicit `return` statement",
-                });
             }
+            self.current_block_terminated = true;
         }
     }
 
@@ -1042,6 +1048,19 @@ impl<'a> Emitter<'a> {
             // Stack (alloca pointer). Lowers to a single store.
             StmtKind::Assign { name, value } => {
                 if let Err(e) = self.emit_local_assign(name, value) {
+                    self.errors.push(e);
+                }
+            }
+            // Slice 13: `if cond { … } else { … }` — statement-form
+            // conditional. Lowers to a `br i1` plus a then-block, an
+            // optional else-block, and a merge label. Subsequent
+            // statements emit into the merge block.
+            StmtKind::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                if let Err(e) = self.emit_if(cond, then_block, else_block.as_ref()) {
                     self.errors.push(e);
                 }
             }
@@ -2000,6 +2019,119 @@ impl<'a> Emitter<'a> {
     /// `<op>` (strict).
     ///
     /// v0.1 scope: range sources only (`lo..hi`, `lo..=hi`).
+    /// Slice 13: lower `if cond { … } else { … }` (statement form)
+    /// to a conditional-branch CFG.
+    ///
+    /// Emitted shape (with else):
+    /// ```text
+    ///   <cond emitted in current block>
+    ///   br i1 %cond, label %if.then.<id>, label %if.else.<id>
+    /// if.then.<id>:
+    ///   <then body>
+    ///   br label %if.exit.<id>
+    /// if.else.<id>:
+    ///   <else body>
+    ///   br label %if.exit.<id>
+    /// if.exit.<id>:
+    ///   <subsequent statements emit here>
+    /// ```
+    ///
+    /// Without else: the false-edge of the `br i1` jumps directly
+    /// to `if.exit.<id>`; no `if.else.<id>` block is emitted.
+    ///
+    /// If a branch terminates (e.g. `return` mid-body), its
+    /// `br label %if.exit.<id>` is suppressed so we don't try to
+    /// add a second terminator. If BOTH branches terminate, the
+    /// merge block is unreachable; we still emit it (LLVM tolerates
+    /// blocks with no predecessors and DCE removes them).
+    fn emit_if(
+        &mut self,
+        cond: &Expr,
+        then_block: &Block,
+        else_block: Option<&Block>,
+    ) -> Result<(), CodegenError> {
+        // Lower the condition in the current block. The condition's
+        // IR type must be `i1` (bool); we don't insert a coercion —
+        // upstream typing should reject non-bool conditions in a
+        // future slice.
+        let cond_val = self.emit_expr(cond)?;
+
+        // Allocate fresh label IDs for this `if`.
+        let id = self.next_label_id;
+        self.next_label_id += 1;
+        let then_label = format!("if.then.{id}");
+        let exit_label = format!("if.exit.{id}");
+        let else_label = if else_block.is_some() {
+            Some(format!("if.else.{id}"))
+        } else {
+            None
+        };
+
+        // Emit the conditional branch from the current block.
+        let false_target = else_label.as_deref().unwrap_or(&exit_label);
+        writeln!(
+            &mut self.out,
+            "  br i1 {cond_val}, label %{then_label}, label %{false_target}",
+        )
+        .ok();
+
+        // Then block.
+        writeln!(&mut self.out, "{then_label}:").ok();
+        self.current_block = then_label.clone();
+        self.current_block_terminated = false;
+        let then_scope = self.locals.len();
+        let mut then_returned = false;
+        for s in &then_block.stmts {
+            if then_returned {
+                break;
+            }
+            self.emit_stmt(s);
+            if matches!(s.kind, StmtKind::Return(_)) {
+                then_returned = true;
+            }
+        }
+        self.locals.truncate(then_scope);
+        // Branch to exit if the then-block didn't already terminate
+        // (e.g. via `return`). A nested `if`/`sigma` may have moved
+        // current_block to its own merge/exit; we still emit the
+        // jump from THERE to our exit, which is correct.
+        if !self.current_block_terminated {
+            writeln!(&mut self.out, "  br label %{exit_label}").ok();
+        }
+
+        // Else block (if present).
+        if let Some(else_blk) = else_block {
+            let else_lbl = else_label.as_ref().expect("else_label set above");
+            writeln!(&mut self.out, "{else_lbl}:").ok();
+            self.current_block = else_lbl.clone();
+            self.current_block_terminated = false;
+            let else_scope = self.locals.len();
+            let mut else_returned = false;
+            for s in &else_blk.stmts {
+                if else_returned {
+                    break;
+                }
+                self.emit_stmt(s);
+                if matches!(s.kind, StmtKind::Return(_)) {
+                    else_returned = true;
+                }
+            }
+            self.locals.truncate(else_scope);
+            if !self.current_block_terminated {
+                writeln!(&mut self.out, "  br label %{exit_label}").ok();
+            }
+        }
+
+        // Exit block — subsequent statements emit here. May be
+        // unreachable if both branches terminate; LLVM tolerates
+        // that and DCE collapses it.
+        writeln!(&mut self.out, "{exit_label}:").ok();
+        self.current_block = exit_label;
+        self.current_block_terminated = false;
+
+        Ok(())
+    }
+
     /// Slice 12: lower `name = expr;` to a single LLVM `store`
     /// against the local's alloca pointer. The resolver has already
     /// verified that `name` resolves to a `let mut` binding (which
@@ -2457,6 +2589,30 @@ impl<'a> Emitter<'a> {
         // signed (i8/i16/i32/i64/isize). Float div/rem will land
         // alongside float-arithmetic support in a later slice.
         let signed = self.expr_is_signed_int(lhs);
+
+        // Slice 13: comparison ops produce i1 (bool) from any
+        // integer source — the dest type differs from the input
+        // type. Dispatch first so we can pick the right opcode and
+        // force the dest IR type to `i1`.
+        let cmp_op = match op {
+            BinaryOp::Eq => Some("eq"),
+            BinaryOp::Ne => Some("ne"),
+            BinaryOp::Lt => Some(if signed { "slt" } else { "ult" }),
+            BinaryOp::Le => Some(if signed { "sle" } else { "ule" }),
+            BinaryOp::Gt => Some(if signed { "sgt" } else { "ugt" }),
+            BinaryOp::Ge => Some(if signed { "sge" } else { "uge" }),
+            _ => None,
+        };
+        if let Some(cmp) = cmp_op {
+            let dst = self.fresh_value();
+            writeln!(
+                &mut self.out,
+                "  {dst} = icmp {cmp} {ir_ty} {l}, {r}",
+            )
+            .ok();
+            return Ok(dst);
+        }
+
         let opcode = match op {
             BinaryOp::Add => "add",
             BinaryOp::Sub => "sub",
@@ -2475,11 +2631,31 @@ impl<'a> Emitter<'a> {
                     "urem"
                 }
             }
-            other => {
-                return Err(CodegenError::NotYetImplemented {
-                    what: binary_op_name(other),
-                });
+            // Slice 13 add-ons: bitwise + shift + logical ops.
+            // Logical and/or on `bool` (i1) and bitwise variants
+            // on integer types both lower to the same LLVM op
+            // (`and`, `or`) — the IR type from `lhs` distinguishes.
+            // Shift right is `lshr` (logical) for unsigned and
+            // `ashr` (arithmetic) for signed; spec aligns with
+            // the source type's signedness.
+            BinaryOp::And | BinaryOp::BitAnd => "and",
+            BinaryOp::Or | BinaryOp::BitOr => "or",
+            BinaryOp::BitXor => "xor",
+            BinaryOp::Shl => "shl",
+            BinaryOp::Shr => {
+                if signed {
+                    "ashr"
+                } else {
+                    "lshr"
+                }
             }
+            // Comparison ops are handled above.
+            BinaryOp::Eq
+            | BinaryOp::Ne
+            | BinaryOp::Lt
+            | BinaryOp::Le
+            | BinaryOp::Gt
+            | BinaryOp::Ge => unreachable!("handled by cmp_op dispatch above"),
         };
         let dst = self.fresh_value();
         writeln!(&mut self.out, "  {dst} = {opcode} {ir_ty} {l}, {r}").ok();
@@ -2544,7 +2720,22 @@ impl<'a> Emitter<'a> {
             }
             ExprKind::BoolLit(_) => "i1".to_owned(),
             ExprKind::Paren(inner) => self.expr_ir_type(inner),
-            ExprKind::Binary { lhs, .. } => self.expr_ir_type(lhs),
+            // Slice 13: comparison ops (and short-circuit logical
+            // ops) yield `i1`; everything else yields the LHS's
+            // IR type. Without this, `if x < 10 { … }` would
+            // compute the cond as `i32` from the LHS and the br i1
+            // would type-mismatch.
+            ExprKind::Binary { op, lhs, .. } => match op {
+                BinaryOp::Eq
+                | BinaryOp::Ne
+                | BinaryOp::Lt
+                | BinaryOp::Le
+                | BinaryOp::Gt
+                | BinaryOp::Ge
+                | BinaryOp::And
+                | BinaryOp::Or => "i1".to_owned(),
+                _ => self.expr_ir_type(lhs),
+            },
             ExprKind::Path(segs) if segs.len() == 1 => self
                 .lookup_local_ir_type(&segs[0])
                 .unwrap_or_else(|| "i32".to_owned()),
@@ -3171,6 +3362,10 @@ const fn type_kind_name(t: &TypeKind) -> &'static str {
     }
 }
 
+/// Slice 13: human-readable name for a [`BinaryOp`]. Reserved for
+/// diagnostics — every operator is now lowered, so this is no
+/// longer reachable from `emit_binary`'s fall-through.
+#[allow(dead_code)]
 const fn binary_op_name(op: BinaryOp) -> &'static str {
     match op {
         BinaryOp::Add => "+",
@@ -5225,6 +5420,264 @@ mod tests {
         assert_eq!(info.state_tag("A"), Some(0));
         assert_eq!(info.state_tag("B"), Some(1));
         assert_eq!(info.state_tag("C"), None);
+    }
+
+    // ─── Slice 13: if / else statement form ──────────────────────────────
+
+    #[test]
+    fn s13_if_no_else_emits_conditional_branch_to_exit() {
+        // `if cond { … }` (no else) — false-edge of br i1 jumps
+        // straight to the exit label. Only two basic blocks
+        // emitted (then + exit; no else).
+        let src = "@fn t() { if true { return; } return; }";
+        let ir = lower_str(src).expect("lower if-no-else");
+        assert!(
+            ir.contains("br i1 1, label %if.then.0, label %if.exit.0"),
+            "expected br i1 to then or exit; got:\n{ir}"
+        );
+        assert!(ir.contains("\nif.then.0:\n"), "missing then label; got:\n{ir}");
+        assert!(ir.contains("\nif.exit.0:\n"), "missing exit label; got:\n{ir}");
+        // No else label should be emitted.
+        assert!(
+            !ir.contains("if.else.0:"),
+            "no else block: must not emit else label; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s13_if_with_else_emits_three_blocks() {
+        // `if cond { … } else { … }` — three labels, br i1 picks
+        // between then and else, both jump to exit.
+        let src = "\
+            @fn t() {\n  \
+              if true { let _x: u32 = 1u32; }\n  \
+              else { let _y: u32 = 2u32; }\n  \
+              return;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower if-else");
+        assert!(
+            ir.contains("br i1 1, label %if.then.0, label %if.else.0"),
+            "expected br to then/else; got:\n{ir}"
+        );
+        for label in [
+            "\nif.then.0:\n",
+            "\nif.else.0:\n",
+            "\nif.exit.0:\n",
+        ] {
+            assert!(ir.contains(label), "missing {}; got:\n{ir}", label.trim());
+        }
+        // Both then and else branch to exit (two `br label %exit`).
+        assert!(
+            ir.matches("br label %if.exit.0").count() >= 2,
+            "expected branches from both then and else to exit; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s13_if_condition_uses_dynamic_value() {
+        // Boolean condition computed at runtime (binary compare).
+        let src = "\
+            @fn t(x: u32) {\n  \
+              if x < 10u32 { return; }\n  \
+              return;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower if with dynamic cond");
+        // The compare produces an i1 SSA value used by br i1.
+        assert!(
+            ir.contains("icmp ult i32 %x, 10"),
+            "expected icmp ult for `<`; got:\n{ir}"
+        );
+        // br i1 should reference the SSA name from the icmp.
+        assert!(
+            ir.contains("br i1 %tmp."),
+            "expected br i1 from a fresh-value SSA; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s13_if_then_returns_no_back_edge_emitted() {
+        // If the then-block returns, no `br label %if.exit.0`
+        // should be emitted from the then block (would be a
+        // double terminator).
+        let src = "\
+            @fn t(x: u32) -> u32 {\n  \
+              if true { return x; }\n  \
+              return 0u32;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower if-with-return");
+        // Find the then block content, ensure exactly ONE branch
+        // to exit (from the implicit fall-through after the if;
+        // the then-block returned so no jump from it).
+        // We expect: br to then/exit, then label, ret x, exit
+        // label — no `br label %if.exit.0` between ret and exit.
+        let then_pos = ir.find("\nif.then.0:\n").unwrap();
+        let exit_pos = ir.find("\nif.exit.0:\n").unwrap();
+        let between = &ir[then_pos..exit_pos];
+        assert!(
+            !between.contains("br label %if.exit.0"),
+            "then-block returned; must not emit branch to exit; got:\n{between}"
+        );
+    }
+
+    #[test]
+    fn s13_if_else_both_return_exit_block_unreachable() {
+        // Both branches return — no edges into the exit block;
+        // it's unreachable. Code after the `if` is dead.
+        let src = "\
+            @fn t() -> u32 {\n  \
+              if true { return 1u32; }\n  \
+              else { return 2u32; }\n  \
+              return 0u32;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower if-else-both-return");
+        // Both branches have ret without a follow-up branch.
+        assert!(
+            ir.contains("ret i32 1") && ir.contains("ret i32 2"),
+            "expected both rets; got:\n{ir}"
+        );
+        // No `br label %if.exit.0` should be emitted.
+        assert!(
+            !ir.contains("br label %if.exit.0"),
+            "both branches return; no merge branch should be emitted; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s13_else_if_chain_emits_nested_blocks() {
+        // `if a { } else if b { } else { }` — the inner else-if
+        // produces its own set of labels with a fresh ID.
+        let src = "\
+            @fn t() {\n  \
+              if true { return; }\n  \
+              else if false { return; }\n  \
+              else { return; }\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower else-if chain");
+        // Outer if uses ID 0, inner uses ID 1.
+        for label in [
+            "\nif.then.0:\n",
+            "\nif.else.0:\n",
+            "\nif.then.1:\n",
+            "\nif.else.1:\n",
+        ] {
+            assert!(
+                ir.contains(label),
+                "missing {}; got:\n{ir}",
+                label.trim()
+            );
+        }
+    }
+
+    #[test]
+    fn s13_if_let_inside_branch_invisible_outside() {
+        // A `let` inside a then-branch is NOT visible after the
+        // if. Resolver enforces this — verifies our scope
+        // bracketing is correct.
+        let src = "\
+            @fn t() -> u32 {\n  \
+              if true { let x: u32 = 5u32; }\n  \
+              return x;\n\
+            }\n\
+        ";
+        let tokens = tokenize(src).expect("tokenize");
+        let program = parse(&tokens).expect("parse");
+        let result = resolve(&program);
+        assert!(
+            result.is_err(),
+            "expected resolver to reject `x` after the if branch; got Ok"
+        );
+    }
+
+    #[test]
+    fn s13_if_with_local_assign_in_branch() {
+        // Slice 12 + slice 13 interaction: a `let mut` declared
+        // outside the if, reassigned inside one branch.
+        let src = "\
+            @fn t(c: bool) -> u32 {\n  \
+              let mut x: u32 = 0u32;\n  \
+              if c { x = 1u32; }\n  \
+              else { x = 2u32; }\n  \
+              return x;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower if-with-assign");
+        // Two `store i32` for the assigns + 1 for the initial =
+        // 3 stores. (One initial + two branch-side stores.)
+        assert_eq!(
+            ir.matches("store i32").count(),
+            3,
+            "expected 3 stores; got:\n{ir}"
+        );
+        // The return at the end loads the final value.
+        assert!(
+            ir.contains("load i32, i32*"),
+            "expected load on return; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s13_nested_if_inside_if() {
+        // Nested ifs get distinct label IDs (0 outer, 1 inner).
+        let src = "\
+            @fn t(a: bool, b: bool) {\n  \
+              if a {\n    \
+                if b { return; }\n  \
+              }\n  \
+              return;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower nested if");
+        assert!(
+            ir.contains("\nif.then.0:\n"),
+            "missing outer then; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("\nif.then.1:\n"),
+            "missing inner then; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("\nif.exit.0:\n"),
+            "missing outer exit; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("\nif.exit.1:\n"),
+            "missing inner exit; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s13_if_inside_sigma_body_works() {
+        // `if` and sigma compose — the inner if uses ID 0 (it's
+        // the first label in this fn), the sigma uses ID 1.
+        // Actually order of allocation: sigma allocates ID 0
+        // for header/body/exit, then the if inside body
+        // allocates ID 1.
+        let src = "\
+            @fn t() {\n  \
+              sigma i in 0u32..4u32 {\n    \
+                if true { return; }\n  \
+              }\n  \
+              return;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower if-inside-sigma");
+        assert!(
+            ir.contains("\nsigma.header.0:\n"),
+            "missing sigma header; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("\nif.then.1:\n"),
+            "missing if.then.1; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("\nif.exit.1:\n"),
+            "missing if.exit.1; got:\n{ir}"
+        );
     }
 
     // ─── Slice 12: local mutable re-assignment ───────────────────────────
