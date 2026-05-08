@@ -15,9 +15,17 @@ description = "GA Orthogonality Engine — the heart of Clifford. Implements §7
 # - Error messages must name original source identifiers, never `e_n` indices.
 
 [dependencies]
+clifford-ast.workspace = true
 clifford-effect.workspace = true
 thiserror.workspace = true
 
 # dev-deps (proptest required for ortho per CLAUDE.md §4) added when first
 # property test arrives. Both currently pull transitive crates needing newer
 # rustc than the pinned 1.76.
+
+[dev-dependencies]
+# Ortho's integration tests parse + resolve real Clifford source so the
+# verifier exercises against actual MutationProfiles, not synthetic ones.
+clifford-lexer.workspace = true
+clifford-parser.workspace = true
+clifford-resolve.workspace = true

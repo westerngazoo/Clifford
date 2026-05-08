@@ -7,7 +7,158 @@ may include breaking changes.
 
 ## [Unreleased]
 
-(no entries yet)
+### Added — `clifford-ortho` §7 verifier (2026-05-08)
+
+The first post-v0.1.0 slice. Implements the GA orthogonality
+engine end-to-end: basis assignment, behaviour-multivector
+construction, concurrency inference, pairwise wedge-product
+check, and source-identifier diagnostics per spec §7. Wired into
+`cliffordc compile` between the `effect` gate and `codegen`, so
+programs with concurrent write-write races on the same automaton
+field are now rejected with `E0520`.
+
+**The verifier caught its first real bug.** While integrating
+into the CLI, the verifier rejected `examples/dual_uart_telemetry.cl`
+with:
+
+```text
+error[[ortho]]: E0520: orthogonality violation between
+  `interrupt USART1_IRQ` and `interrupt USART2_IRQ`:
+  shared field(s) `Telemetry.bytes_total`, `Telemetry.last_byte`
+```
+
+The original sample claimed "the two UART ISRs touch disjoint
+counters" but actually shared `bytes_total` and `last_byte`. The
+v0.1 codegen happily compiled the racy program; the §7 verifier
+proved it unsafe at the wedge-product level. Fixed by splitting
+the shared fields into per-source `bytes_uartN` / `last_byte_uartN`
+counters. **The verifier did its job on the first real program.**
+
+**Spec mapping:**
+
+- §7.1 basis assignment → `BasisAssignment::build(program)` —
+  fields in declaration order, automaton-major / field-minor;
+  `BasisExhausted` when count > 64 (the `u64` blade width).
+  Trait basis (§7.1 step 2) deferred — v0.1 firmware code uses
+  fields, not trait-only callables.
+- §7.2 behaviour multivector → `behaviour_for(profile, basis)` —
+  union of basis bits for fields in `MutationProfile.actual_writes`
+  (the transitive closure already computed by `clifford-effect`).
+  v0.1 collapses to a single blade per callable since field-only
+  basis means every write contributes to one grade.
+- §7.3 concurrency inference → `can_concur(a, b)` — sound-
+  conservative:
+    - effect × effect → `false` (single foreground thread)
+    - interrupt × anything → `true` (preemption)
+    - transition × anything → `false` (transitions are leaves of
+      `#>` chains; their writes propagate via the transitive
+      closure of the calling effect/interrupt's blade)
+- §7.4 wedge product → `outer_product(a, b)` — the algorithmic
+  core. `Some(a | b)` if disjoint, `None` if overlap.
+- §7.5 error reporting → `OrthoError::OrthogonalityViolation`
+  decodes the conflict mask back to `(automaton, field)` pairs
+  via `BasisAssignment::decode_mask`. Per Emergent Rule 1, the
+  diagnostic NEVER exposes raw `e_n` indices — always source
+  identifiers.
+
+**v0.1 scope (matches spec §7's "restricted form"):**
+
+- Cl(0,0,n) algebra: every basis vector squares to zero.
+- Field basis only (trait basis deferred).
+- Write-write races at field granularity. Read-write races are
+  v0.2 graded-algebra work per §7.2.
+- No `@sequential(A, B)` overrides yet (Decision #11 is parsed
+  but not consumed by the verifier; conservative).
+- No explicit `#basis` override clauses (Decision #4 rule 2
+  parsed but not consumed; auto-assignment is canonical).
+
+**Spec §7.0.1 pillars deliberately not guaranteed:**
+
+- Mutations through `#unchecked_store` / `#volatile_store` /
+  `#asm` — outside the proof boundary by design.
+- Read-write races — v0.2.
+- Concurrency excluded by `@sequential` — user-trusted.
+
+**Implementation (`crates/ortho/src/lib.rs`, ~420 lines + tests):**
+
+- Replaced the slice-3-era stub (`outer_product` + a placeholder
+  enum) with the full verifier.
+- New deps in `crates/ortho/Cargo.toml`: `clifford-ast` (to walk
+  the program for basis assignment); dev-deps: `clifford-lexer`,
+  `clifford-parser`, `clifford-resolve` (for integration tests
+  that parse + resolve real Clifford source).
+- Public API: `verify(program, profiles) -> Result<(), Vec<OrthoError>>`
+  is the top-level entry. `outer_product` and `BasisAssignment`
+  remain public for external use (the spec uses them in the
+  Appendix B proof and in `--verbose-basis` IDE integration).
+- The CLI's `compile_source` wires `verify_ortho` between
+  `extract_call_graph` and `lower`. The `error[ortho]:` phase
+  prefix is added to the taxonomy in the doc-comment.
+
+**Tests added: 19 in the ortho crate.**
+
+*Primitive (3):*
+- `disjoint_bitmasks_wedge_to_union` / `sharing_any_bit_yields_none`
+  / `outer_product_invariant` (the mandatory CLAUDE.md §4.1
+  invariant: `outer_product(a, b).is_some() ⟺ a & b == 0`).
+
+*BasisAssignment (4):*
+- `basis_is_empty_for_program_with_no_automatons`.
+- `basis_assigns_in_declaration_order` —
+  `(A.x, A.y, B.z) → (0, 1, 2)`.
+- `basis_decode_mask_returns_named_fields` — round-trip from
+  bitmask back to source identifiers.
+- `basis_exhausted_when_more_than_64_fields` — the v0.1 width
+  limit.
+
+*Verifier (7):*
+- `orthogonal_program_passes` — disjoint ISRs.
+- `two_effects_never_concurrent_so_no_violation` — §7.3 says
+  effects share the foreground thread.
+- `empty_program_passes` — degenerate baseline.
+- `interrupt_and_effect_writing_same_field_violates` — the
+  canonical `E0520` shape.
+- `two_interrupts_writing_same_field_violates` —
+  preemption-driven race.
+- `diagnostic_names_source_identifiers_not_basis_indices` —
+  Emergent Rule 1: messages must say `Counter.value`, never
+  `e_2`.
+- `multiple_violations_all_reported` — N violations → N
+  `E0520`s, not just the first.
+- `transition_writes_propagate_into_caller_blade` — §6.2
+  transitive closure: an interrupt that calls a transition
+  inherits the transition's writes in its behaviour blade.
+
+*can_concur (4):*
+- `can_concur_effect_effect_returns_false`.
+- `can_concur_interrupt_effect_returns_true`.
+- `can_concur_interrupt_interrupt_returns_true`.
+- `can_concur_skips_transitions`.
+
+Plus the `dual_uart_telemetry.cl` race fix (4 fields renamed
+to be per-source, `bytes_total` / `last_byte` removed). The
+sample's intro comment now documents that the §7 verifier
+proved the original design unsafe.
+
+Total tests: ortho **19**, CLI **29** (unchanged), workspace
+~770. All green; clippy clean across the workspace.
+
+**What's next for ortho (v0.2):**
+
+- **Trait basis** (§7.1 step 2). Adds `Pure` / `Readable` /
+  `Observable` / `Opaque` + user `@trait`s to the basis. Lets
+  the engine catch "pure callable concurrent with mutating
+  one" patterns at the trait level.
+- **Read-write race detection** (§7.2 graded algebra). Track
+  reads on a separate read-blade; the check becomes
+  `(write_A ∧ write_B) ⊕ (read_A ∧ write_B) ⊕ (write_A ∧ read_B)`.
+- **`@sequential(A, B)` consumption** (Decision #11). Suppress
+  pairs the user has asserted as serialised.
+- **`#basis` override clauses** (Decision #4 rule 2). Honour
+  user-supplied basis assignments instead of auto-assigning.
+- **Property tests via `proptest`** per CLAUDE.md §4.1 mandate.
+  Currently blocked on the toolchain pin (proptest's transitive
+  deps want newer rustc); land alongside a toolchain bump.
 
 ## [0.1.0] — 2026-05-08
 
