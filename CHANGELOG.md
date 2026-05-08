@@ -7,6 +7,91 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 14 (1/3 of v0.1 release prep): QEMU firmware smoke test (2026-05-08)
+
+End-to-end proof that `cliffordc`-generated LLVM IR compiles to a
+working Cortex-M3 binary and runs correctly under QEMU. This is
+the **v0.1 release-blocker test** — every codegen slice
+contributes a function to `tests/qemu/firmware_smoke.cl`, the C
+harness verifies each returns the expected value, and a
+regression anywhere in the pipeline fails the test.
+
+**The test surface (`firmware_smoke.cl`):**
+
+| Function | Slice exercised | Verified |
+|---|---|---|
+| `answer()` | 1 — basic integer fn | returns 42 |
+| `clamp(x)` | 13 — `if` + comparison | clamp(50)=50, clamp(200)=100 |
+| `sum_to(n)` | 11+12 — sigma + `let mut` accumulator | sum_to(10)=45 |
+| `bit_count(x)` | 13 — `if` + sigma + bitwise + shift | bit_count(0xFF)=8 |
+
+Eight functional checks total. The harness exits via ARM
+semihosting `SYS_EXIT_EXTENDED` with code 0 on success or `1..=8`
+indicating which check failed; QEMU propagates that as the
+process exit code.
+
+**Pipeline (per `tests/qemu/run.sh`):**
+
+```
+firmware_smoke.cl
+  -> cliffordc compile           -> firmware_smoke.ll
+  -> clang --target=thumbv7m-none-eabi -c
+                                  -> firmware_smoke.o
+  -> link with startup.o + harness.o + link.ld
+                                  -> app.elf
+  -> qemu-system-arm -M lm3s6965evb -kernel app.elf
+                                  -> exit code (functional check result)
+```
+
+**Why bare-metal Cortex-M3 (not Linux user-mode ARM):** the v0.1
+target IS firmware. A user-mode test would prove the codegen
+produces valid ARM machine code, but it wouldn't exercise the
+vector table layout (Decision #10), the fixed memory map
+(Decision #6 register-block `#address`), the no-runtime
+discipline (no libc, no allocator, no `_start`), or the
+semihosting exit primitive. The `lm3s6965evb` board is the
+embedded community's standard QEMU smoke target precisely because
+it's minimal and supports semihosting out of the box.
+
+**Files added:**
+
+- `tests/qemu/firmware_smoke.cl` — the Clifford program with four
+  functions exercising slices 1–13.
+- `tests/qemu/harness.c` — extern declarations + 8 functional
+  checks + semihosting exit propagation.
+- `tests/qemu/startup.c` — minimal Cortex-M3 boot: vector table
+  at `.vectors`, `Reset_Handler` that zeros `.bss` and copies
+  `.data` from flash to SRAM, `semihost_exit(code)` primitive
+  using the ARM semihosting `SYS_EXIT_EXTENDED` (0x20) call with
+  `ADP_Stopped_ApplicationExit` reason code.
+- `tests/qemu/link.ld` — Cortex-M3 linker script matching the
+  Stellaris LM3S6965 memory map: 256 KB flash at 0x00000000, 64
+  KB SRAM at 0x20000000. Vector table KEEP'd at the start of
+  flash; stack grows down from the top of SRAM.
+- `tests/qemu/run.sh` — end-to-end driver script (cargo + clang +
+  qemu-system-arm).
+- `tests/qemu/README.md` — manual + CI flow documentation.
+- `.github/workflows/qemu-firmware.yml` — runs on every PR via
+  Ubuntu, installs `clang`, `llvm`, `qemu-system-arm` via apt,
+  builds cliffordc release, runs `tests/qemu/run.sh`.
+
+**`tests/qemu/build/`** is gitignored — intermediate `.ll`,
+`.o`, `.elf` artefacts.
+
+**Adding a new slice's smoke check** requires only:
+1. Append a function to `firmware_smoke.cl`.
+2. Append an `extern` decl + check to `harness.c`.
+
+No CMake, no Cargo target glue, no embedded HAL — the harness
+stays small on purpose so a regression points at exactly one
+slice.
+
+**Local toolchain unavailable on the development machine** — the
+Windows environment `cliffordc` was developed in doesn't have
+`clang --target=thumbv7m-none-eabi` or `qemu-system-arm`
+installed. The CI job IS the proof. Ubuntu PRs will catch any
+break in the bare-metal Cortex-M path on every change.
+
 ### Added — Slice 13: `if` / `else` statement form (2026-05-08)
 
 The single most-felt remaining v0.1 ergonomic gap: conditional
