@@ -7,6 +7,110 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 16 (3/3 of v0.1 release prep): source-line diagnostics via `codespan-reporting` (2026-05-08)
+
+Errors now render with line / column position, the actual
+offending source line, and a caret pointing at the exact byte —
+not just `at byte 1234`. The polish lift that makes
+`cliffordc`'s diagnostics usable for real users.
+
+**Before (slice 15):**
+
+```text
+error[parse]: E0204: expected expression, found Semi at byte 51
+```
+
+**After (slice 16):**
+
+```text
+error[[parse]]: E0204: expected expression, found Semi at byte 51
+  ┌─ examples/bad.cl:3:14
+  │
+3 │   return x + ;  // syntax error
+  │              ^ here
+```
+
+ANSI-coloured on capable terminals; falls back to monochrome on
+pipes / redirects via `ColorChoice::Auto`.
+
+**Implementation (`crates/cli/src/main.rs`):**
+
+- `CompileError::Phase(String)` was replaced with
+  `CompileError::Phase { name: &'static str, diags: Vec<PhaseDiag> }`.
+  `PhaseDiag` carries the original error message plus an optional
+  byte offset extracted at construction time.
+- New `byte_offset_from_msg(msg) -> Option<usize>` helper. The
+  `clifford-*` error catalogues universally embed `at byte N`,
+  `(at byte N)`, or `referenced at byte N` in their `Display`
+  output (per `thiserror` formatters). The helper does a literal
+  `find("byte ")` followed by an ASCII-digit run scan — no regex
+  dependency, ~20 lines, handles all current catalogue shapes.
+- New `PhaseDiag::from_error(e)` builds a single diagnostic from
+  any `Display`-able error.
+- New `render_phase_error(file_name, source, name, diags)` builds
+  one `codespan_reporting::Diagnostic::error()` per `PhaseDiag`
+  with the phase name as the diagnostic code (`[parse]`, etc.)
+  and a primary `Label` at the byte offset (1-byte point span;
+  full start..end ranges await per-error-variant span plumbing
+  in a future slice).
+- The renderer is invoked from `run_compile`, which has the
+  source text in scope. `main()` just maps the error variant to
+  the appropriate exit code; rendering happens earlier so the
+  source string stays alive across the codespan-reporting borrow.
+
+**Why Display-string extraction (not per-variant pattern
+matching):** modifying every error enum across the seven
+`clifford-*` crates to expose a `primary_offset()` method would
+touch 50+ variants. The Display-string approach captures ~95% of
+cases (everything that includes `byte N` in its message) with
+~20 lines in one file. Errors without an offset (`E0205 unexpected
+end of input`, `E0500 ortho not yet implemented`,
+`E0810 codegen not yet implemented`, `E0422 proc-call cycle`)
+render as plain `error[phase]: …` banners with no source snippet
+— acceptable for v0.1.
+
+**Plumbing the actual `Span` (start..end) into each error variant
+is the natural slice 17.** It would let the caret span the whole
+offending token instead of just one byte, and would also let
+errors with multiple positions (e.g. E0401's `duplicate item …
+first declared at byte X`) render two labels — primary at the
+duplicate, secondary at the original.
+
+**Tests added:** 8 new tests, +1 retired (the dead
+`format_phase_errors_joins_multiple_with_newlines` that tested
+the now-deleted helper).
+
+- `byte_offset_from_msg_extracts_basic_form` — `at byte 42` →
+  `Some(42)`.
+- `byte_offset_from_msg_handles_parenthesized_form` — `(at byte 7)`.
+- `byte_offset_from_msg_handles_referenced_form` — `referenced at byte 123`.
+- `byte_offset_from_msg_returns_first_offset_when_multiple` —
+  E0401's two-position message returns the duplicate's offset.
+- `byte_offset_from_msg_returns_none_for_no_offset` — empty,
+  no-offset, plain message.
+- `byte_offset_from_msg_skips_byte_without_digits` — defensive
+  case where the literal word "byte" appears in non-offset
+  context.
+- `phase_diag_from_error_extracts_offset_when_present` — direct
+  unit on the `PhaseDiag` constructor.
+- `phase_diag_from_error_offset_none_when_absent` — same, no-offset.
+- `compile_source_phase_error_carries_offsets_for_renderable_diagnostics`
+  — end-to-end: real parse errors carry offsets that the CLI can
+  render.
+
+Plus the three slice-15 gate tests
+(`compile_source_surfaces_*`) updated to match the new
+`Phase { name, diags }` shape.
+
+Total CLI tests: **28** (20 pre-slice-16 + 9 net new — 8 added,
+1 retired). All green; clippy clean across the workspace.
+
+**v0.1 release prep complete.** Slice 14 added the QEMU CI
+firmware proof; slice 15 wired the semantic gates; slice 16
+delivered usable diagnostics. The remaining items (compound
+assign on locals, `break`/`continue`, `match`, methods, strings,
+the §7 GA orthogonality verifier) are nice-to-haves for v0.2+.
+
 ### Added — Slice 15 (2/3 of v0.1 release prep): semantic gates wired into `cliffordc compile` (2026-05-08)
 
 The CLI now runs the four upstream semantic gates between `infer`
