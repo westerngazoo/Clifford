@@ -823,6 +823,45 @@ mod tests {
     }
 
     #[test]
+    fn non_firmware_example_crc32_compiles_cleanly() {
+        // Per CLAUDE.md §10 v0.1 criteria: "Also: a non-firmware
+        // example (e.g., a small CLI tool or a numerical kernel)
+        // to demonstrate the language is not embedded-only."
+        // examples/crc32.cl is that example — pure-functional,
+        // zero `#`-layer constructs, links with any host C harness.
+        // This test just asserts cliffordc accepts the file and
+        // produces the expected entry points.
+        let src = std::fs::read_to_string("../../examples/crc32.cl")
+            .expect("read examples/crc32.cl");
+        let ir = compile_source(&src, "crc32").expect("crc32 compiles");
+        for needle in [
+            "define i32 @crc32_init()",
+            "define i32 @crc32_byte(i32 %crc, i8 %byte)",
+            "define i32 @crc32_finalize(i32 %crc)",
+            "define i32 @crc32_test_vector()",
+        ] {
+            assert!(
+                ir.contains(needle),
+                "missing entry point `{needle}` in IR; got:\n{ir}"
+            );
+        }
+        // Sanity: zero `#`-layer artefacts in the IR (no
+        // %struct.<Auto>, no @<Auto>.state, no `section ".interrupts"`).
+        assert!(
+            !ir.contains("%struct."),
+            "non-firmware example should not emit automaton structs; got:\n{ir}"
+        );
+        assert!(
+            !ir.contains(".state ="),
+            "non-firmware example should not emit automaton globals; got:\n{ir}"
+        );
+        assert!(
+            !ir.contains("section \".interrupts\""),
+            "non-firmware example should not emit interrupt section; got:\n{ir}"
+        );
+    }
+
+    #[test]
     fn compile_source_phase_error_carries_offsets_for_renderable_diagnostics() {
         // A real parse error carries an "at byte N" offset that the
         // CLI extracts for codespan-rendering. Verifies the

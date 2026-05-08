@@ -7,6 +7,106 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Non-firmware example: pure-functional CRC-32 (2026-05-08)
+
+Per CLAUDE.md §10 v0.1 criteria: "Also: a non-firmware example
+(e.g., a small CLI tool or a numerical kernel) to demonstrate
+the language is not embedded-only." `examples/crc32.cl` is that
+example.
+
+**Zero `#`-layer constructs.** No `#automaton`, no `#effect`, no
+`#interrupt`, no `#transition`, no register-block MMIO. Just
+four pure `@fn`s that link against any host C / Rust / Zig
+harness. The IR is target-agnostic — `clang -c crc32.ll` works
+on x86_64-linux, aarch64-darwin, thumbv7m-none-eabi, riscv32imc,
+or anywhere else LLVM has a backend.
+
+**The four entry points:**
+
+```clifford
+@fn crc32_init() -> u32                    // 0xFFFFFFFF seed
+@fn crc32_byte(crc: u32, byte: u8) -> u32  // fold one byte
+@fn crc32_finalize(crc: u32) -> u32        // XOR with all-ones
+@fn crc32_test_vector() -> u32             // crc of "123456789"
+```
+
+Algorithm: CRC-32/ISO-HDLC. Reflected polynomial `0xEDB88320`,
+all-ones init, final XOR with all-ones. The variant used by
+gzip, zip, png, Ethernet FCS, and a hundred other host-side
+formats — proves Clifford targets the same problem space, not
+just embedded.
+
+**What it exercises across slices:**
+
+- `@fn` purity                       (slice 1)
+- integer arithmetic + `as u32` cast (slices 1, 7)
+- `let mut` + assignment             (slice 12)
+- sigma loops                        (slice 11)
+- `if` / `else`                      (slice 13)
+- comparison + bitwise + shift       (slice 13)
+
+**Files added:**
+
+- `examples/crc32.cl` — the four `@fn`s, ~50 lines.
+- `examples/crc32_host.c` — host C harness with three test vectors
+  (empty string, single byte 'a', canonical "123456789"). Verifies
+  exit code 0 on all passes.
+
+**How to run manually:**
+
+```bash
+cliffordc compile examples/crc32.cl
+clang examples/crc32.ll examples/crc32_host.c -o crc32
+./crc32
+# crc32 of "123456789" = 0xcbf43926  (PASS)
+# crc32 of "a"         = 0xe8b7be43  (PASS)
+# crc32 of "" (empty)  = 0x00000000  (PASS)
+```
+
+**Tests added:** 1 new CLI integration test
+(`non_firmware_example_crc32_compiles_cleanly`) verifies that
+cliffordc compiles `examples/crc32.cl` and the resulting IR
+exports all four expected entry points without leaking any
+`#`-layer artefacts (no `%struct.`, no `.state =`, no
+`section ".interrupts"`). Runs on every CI; doesn't require
+clang or qemu.
+
+Total CLI tests: **29**.
+
+### Fixed — QEMU CI test defensive hardening (2026-05-08)
+
+Three pre-emptive fixes for likely failure modes that the local
+toolchain couldn't reproduce (Windows dev machine doesn't have
+clang / qemu / lld installed):
+
+1. **`tests/qemu/link.ld`**: switched `.data` placement from a
+   hand-computed `AT (LOADADDR(.text) + SIZEOF(.text) +
+   SIZEOF(.rodata))` to the canonical `> SRAM AT > FLASH` form.
+   The arithmetic version assumed lld places `.rodata`
+   contiguously after `.text`, which lld is free to reorder; the
+   canonical form lets the linker pick the load address itself.
+
+2. **`tests/qemu/run.sh` + `qemu-firmware.yml`**: switched to
+   lld via `-fuse-ld=lld` and added `lld` to the apt install.
+   Ubuntu's default linker (ld.bfd) doesn't understand thumbv7m
+   ELF without a cross-binutils sysroot; lld is target-aware
+   out of the box.
+
+3. **`tests/qemu/run.sh`**: prepend `target triple =
+   "thumbv7m-none-eabi"` and the matching `target datalayout`
+   to the `.ll` before clang processes it. cliffordc doesn't
+   yet emit these in the IR header (deferred to a future slice
+   with a CLI `--target` flag); without them, clang substitutes
+   the host's datalayout, which would break struct layouts and
+   pointer arithmetic on Cortex-M.
+
+Plus toolchain pre-flight checks in `run.sh` so missing tools
+produce a clean "install via apt" error instead of a cryptic
+"command not found" mid-pipeline.
+
+These are educated guesses based on known QEMU + Cortex-M +
+clang gotchas; the actual proof comes from CI.
+
 ### Added — Slice 16 (3/3 of v0.1 release prep): source-line diagnostics via `codespan-reporting` (2026-05-08)
 
 Errors now render with line / column position, the actual
