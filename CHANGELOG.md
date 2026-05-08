@@ -7,6 +7,71 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 15 (2/3 of v0.1 release prep): semantic gates wired into `cliffordc compile` (2026-05-08)
+
+The CLI now runs the four upstream semantic gates between `infer`
+and `lower`:
+
+```text
+tokenize → parse → resolve → infer
+                            → check                    (sigil-layer + mut-auth + totality)
+                            → extract_categories       (Decision #5 categorical structure)
+                            → extract_mutation_profiles (§6 #mutates / #cannot_mutate)
+                            → extract_call_graph       (proc-call cycle detection)
+                            → lower                    (codegen)
+```
+
+Programs that violate any gate are now rejected with a
+phase-prefixed structured diagnostic instead of compiling to
+incorrect IR. The gate-prefix taxonomy is:
+
+| Prefix | Source |
+|---|---|
+| `error[lex]:` | `clifford-lexer` |
+| `error[parse]:` | `clifford-parser` |
+| `error[resolve]:` | `clifford-resolve` |
+| `error[types]:` | `clifford-types` |
+| `error[check]:` | `clifford-check` (§5.5 boundary, §5.4 mut-auth, Decision #23 totality) |
+| `error[effect]:` | `clifford-effect` (categories, mutation profiles, call-graph) |
+| `error[codegen]:` | `clifford-codegen` |
+
+**`clifford-ortho` deliberately deferred.** The crate is still
+scaffolding — only the `outer_product` primitive exists; no
+top-level `verify_orthogonality(program)` function lives there
+yet. The CLI carries an explicit comment marking where the
+`error[ortho]:` arm goes when §7 lands. v0.1 release ships with
+the gates that exist today.
+
+**Pipeline regression checked against every committed example:**
+
+| Sample | Status |
+|---|---|
+| `examples/dual_uart_telemetry.cl` | passes all gates ✓ |
+| `examples/buffer_init_sigma.cl` | passes all gates ✓ |
+| `examples/uart_fsm.cl` | passes all gates ✓ |
+| `examples/traffic_classifier.cl` | passes all gates ✓ |
+| `tests/qemu/firmware_smoke.cl` | passes all gates ✓ |
+
+So none of the slices 5–14 had latent semantic bugs that codegen
+was happily compiling around. The gates are now an active
+correctness check on every PR.
+
+**Tests added (`crates/cli/src/main.rs::tests`):** 3 new tests.
+
+- `compile_source_surfaces_check_phase_error` — `#> bump()` from
+  inside an `@fn` (sigil-layer violation per Emergent Rule 4)
+  is rejected with an upstream gate prefix.
+- `compile_source_surfaces_effect_phase_error_for_undeclared_mutates`
+  — `#effect bump() #mutates: [] { Counter.v += 1u32; }` is
+  rejected by the mutation-profile validator.
+- `compile_source_passes_all_gates_for_real_firmware` — positive
+  integration: a multi-state automaton with effects, transitions,
+  state-tagged data, and an `if`-conditional all pass through
+  the gated pipeline and produce IR.
+
+Total CLI tests: **20** (17 pre-slice-15 + 3 new). Workspace
+clean, clippy clean across the workspace.
+
 ### Added — Slice 14 (1/3 of v0.1 release prep): QEMU firmware smoke test (2026-05-08)
 
 End-to-end proof that `cliffordc`-generated LLVM IR compiles to a
