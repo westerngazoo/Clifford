@@ -44,6 +44,10 @@ use clifford_lexer::tokenize;
 use clifford_parser::parse;
 use clifford_resolve::resolve;
 use clifford_types::infer;
+use codespan_reporting::diagnostic::{Diagnostic, Label};
+use codespan_reporting::files::SimpleFile;
+use codespan_reporting::term;
+use codespan_reporting::term::termcolor::{ColorChoice, StandardStream};
 
 /// Top-level CLI invocation, parsed from `std::env::args`.
 #[derive(Debug, PartialEq, Eq)]
@@ -75,10 +79,11 @@ fn main() -> ExitCode {
                 eprintln!("cliffordc: I/O error: {msg}");
                 ExitCode::from(3)
             }
-            Err(CompileError::Phase(msg)) => {
-                eprintln!("{msg}");
-                ExitCode::from(1)
-            }
+            // Slice 16: phase errors are now rendered inside
+            // `run_compile` (which has the source text in scope and
+            // can pass it to codespan-reporting). By this point
+            // they've already been emitted to stderr.
+            Err(CompileError::Phase { .. }) => ExitCode::from(1),
         },
         Cli::Version => {
             println!("cliffordc {}", env!("CARGO_PKG_VERSION"));
@@ -175,12 +180,90 @@ fn parse_compile(args: &[String]) -> Cli {
     }
 }
 
-/// Outcome of `run_compile`. `Phase` carries pre-formatted text for stderr;
-/// `Io` carries a system-level error.
+/// Outcome of `run_compile`. `Phase` carries one or more structured
+/// per-error diagnostics so the caller can render them via
+/// `codespan-reporting` with the source file in scope; `Io` carries
+/// a system-level error.
 #[derive(Debug)]
 enum CompileError {
-    Phase(String),
+    Phase {
+        /// Phase identifier — e.g. `"parse"`, `"resolve"`, `"check"`.
+        /// Used as the diagnostic's `code` (`error[parse]: …`).
+        name: &'static str,
+        /// One entry per error reported by the phase. Each carries the
+        /// raw error message (already containing the `EXXXX:` code
+        /// from `thiserror`) plus an optional source byte offset
+        /// extracted from the message text.
+        diags: Vec<PhaseDiag>,
+    },
     Io(String),
+}
+
+/// One error diagnostic, with the byte offset extracted (if the
+/// underlying error message included one) so codespan-reporting can
+/// render the source line + caret. Slice 16.
+#[derive(Debug)]
+struct PhaseDiag {
+    /// Human-readable error message including the `EXXXX:` code.
+    message: String,
+    /// Source byte offset extracted from the message via
+    /// [`byte_offset_from_msg`]. `None` for errors that don't carry
+    /// a position (e.g. `E0205 unexpected end of input`,
+    /// `E0500 ortho not yet implemented`).
+    primary_offset: Option<usize>,
+}
+
+impl PhaseDiag {
+    /// Build a diagnostic from a `Display`-able error, automatically
+    /// extracting the byte offset via [`byte_offset_from_msg`].
+    fn from_error<E: std::fmt::Display>(e: &E) -> Self {
+        let message = format!("{e}");
+        let primary_offset = byte_offset_from_msg(&message);
+        PhaseDiag {
+            message,
+            primary_offset,
+        }
+    }
+
+    /// Build a diagnostic from a single pre-formatted message, without
+    /// trying to extract a byte offset. Used by phases that produce
+    /// just one error (e.g. lex / parse) so we can stay symmetric
+    /// with the multi-error phases.
+    fn from_single<E: std::fmt::Display>(e: &E) -> Vec<Self> {
+        vec![PhaseDiag::from_error(e)]
+    }
+}
+
+/// Slice 16: regex-free extraction of the first `byte N` decimal in
+/// an error message. `clifford-*` errors universally include
+/// `at byte 1234` (or variants like `(at byte 1234)`,
+/// `referenced at byte 1234`); this helper finds the literal text
+/// `byte ` followed by an ASCII digit run and parses out the
+/// number.
+///
+/// Returns `None` for messages that don't include a `byte N`
+/// pattern — those errors are rendered without a source line
+/// (e.g. cycle reports, "not yet implemented" stubs).
+fn byte_offset_from_msg(msg: &str) -> Option<usize> {
+    let needle = "byte ";
+    let mut search_from = 0;
+    while let Some(idx) = msg[search_from..].find(needle) {
+        let start = search_from + idx + needle.len();
+        let bytes = msg.as_bytes();
+        let mut end = start;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        if end > start {
+            if let Ok(n) = msg[start..end].parse::<usize>() {
+                return Some(n);
+            }
+        }
+        // Found "byte " but no digits after it; advance past this
+        // occurrence and keep looking.
+        search_from = start;
+    }
+    None
 }
 
 /// Run the full compile pipeline for one source file. Reads the source,
@@ -205,7 +288,18 @@ fn run_compile(
         .map(str::to_owned)
         .unwrap_or_else(|| default_module_name(input));
 
-    let ir = compile_source(&source, &module_name_owned)?;
+    // Slice 16: render phase errors via codespan-reporting before
+    // bubbling the error up. main() doesn't have the source text
+    // in scope; doing the render here keeps the source string
+    // alive across the codespan-reporting borrow.
+    let ir = match compile_source(&source, &module_name_owned) {
+        Ok(ir) => ir,
+        Err(CompileError::Phase { name, diags }) => {
+            render_phase_error(&input.display().to_string(), &source, name, &diags);
+            return Err(CompileError::Phase { name, diags });
+        }
+        Err(e) => return Err(e),
+    };
 
     std::fs::write(&output_path, ir).map_err(|e| {
         CompileError::Io(format!(
@@ -252,60 +346,100 @@ fn run_compile(
 /// - `error[effect]:`  — categorical / mutation-profile / call-graph
 /// - `error[codegen]:` — IR-emission gap (NotYetImplemented surface)
 fn compile_source(source: &str, module_name: &str) -> Result<String, CompileError> {
-    let tokens = tokenize(source)
-        .map_err(|e| CompileError::Phase(format!("error[lex]: {e}")))?;
-    let program = parse(&tokens)
-        .map_err(|e| CompileError::Phase(format!("error[parse]: {e}")))?;
-    let resolution = resolve(&program).map_err(|errs| {
-        CompileError::Phase(format_phase_errors("resolve", &errs))
+    let tokens = tokenize(source).map_err(|e| CompileError::Phase {
+        name: "lex",
+        diags: PhaseDiag::from_single(&e),
     })?;
-    let typing = infer(&program, &resolution).map_err(|errs| {
-        CompileError::Phase(format_phase_errors("types", &errs))
+    let program = parse(&tokens).map_err(|e| CompileError::Phase {
+        name: "parse",
+        diags: PhaseDiag::from_single(&e),
+    })?;
+    let resolution = resolve(&program).map_err(|errs| CompileError::Phase {
+        name: "resolve",
+        diags: errs.iter().map(PhaseDiag::from_error).collect(),
+    })?;
+    let typing = infer(&program, &resolution).map_err(|errs| CompileError::Phase {
+        name: "types",
+        diags: errs.iter().map(PhaseDiag::from_error).collect(),
     })?;
 
     // Slice 15 — semantic gates between typing and codegen.
 
     // §5.5 sigil-layer + §5.4 mutation-auth + Decision #23 totality.
-    check(&program, &resolution).map_err(|errs| {
-        CompileError::Phase(format_phase_errors("check", &errs))
+    check(&program, &resolution).map_err(|errs| CompileError::Phase {
+        name: "check",
+        diags: errs.iter().map(PhaseDiag::from_error).collect(),
     })?;
 
     // Decision #5 categorical structure of every #automaton.
-    extract_categories(&program).map_err(|errs| {
-        CompileError::Phase(format_phase_errors("effect", &errs))
+    extract_categories(&program).map_err(|errs| CompileError::Phase {
+        name: "effect",
+        diags: errs.iter().map(PhaseDiag::from_error).collect(),
     })?;
 
     // Per-callable mutation profiles + #mutates / #cannot_mutate
     // validation per §6.
-    extract_mutation_profiles(&program, &resolution).map_err(|errs| {
-        CompileError::Phase(format_phase_errors("effect", &errs))
+    extract_mutation_profiles(&program, &resolution).map_err(|errs| CompileError::Phase {
+        name: "effect",
+        diags: errs.iter().map(PhaseDiag::from_error).collect(),
     })?;
 
     // Proc-call graph cycle detection (catches mutual #> recursion).
-    extract_call_graph(&program, &resolution).map_err(|errs| {
-        CompileError::Phase(format_phase_errors("effect", &errs))
+    extract_call_graph(&program, &resolution).map_err(|errs| CompileError::Phase {
+        name: "effect",
+        diags: errs.iter().map(PhaseDiag::from_error).collect(),
     })?;
 
     // clifford-ortho's top-level §7 verifier doesn't exist yet —
     // only the `outer_product` primitive lives in that crate today.
     // When the verifier lands, an `error[ortho]:` arm goes here.
 
-    lower(&program, &resolution, &typing, module_name).map_err(|errs| {
-        CompileError::Phase(format_phase_errors("codegen", &errs))
+    lower(&program, &resolution, &typing, module_name).map_err(|errs| CompileError::Phase {
+        name: "codegen",
+        diags: errs.iter().map(PhaseDiag::from_error).collect(),
     })
 }
 
-/// Format a vector of errors from a single phase as one block of stderr
-/// text, one error per line.
-fn format_phase_errors<E: std::fmt::Display>(phase: &str, errors: &[E]) -> String {
-    let mut out = String::new();
-    for (i, e) in errors.iter().enumerate() {
-        if i > 0 {
-            out.push('\n');
+/// Slice 16: render a `Phase` error to stderr using
+/// `codespan-reporting`. Each diagnostic with a known byte offset
+/// gets a labelled source-line snippet (line number + caret); those
+/// without an offset render as a plain "error[phase]: message"
+/// banner.
+///
+/// `file_name` is the displayed path (only used for the banner);
+/// `source` is the actual source text passed to `codespan-reporting`
+/// for line/column resolution.
+fn render_phase_error(file_name: &str, source: &str, name: &str, diags: &[PhaseDiag]) {
+    let file = SimpleFile::new(file_name.to_owned(), source.to_owned());
+    let writer = StandardStream::stderr(ColorChoice::Auto);
+    let config = term::Config::default();
+    let mut writer_lock = writer.lock();
+
+    for diag in diags {
+        let mut diagnostic = Diagnostic::error()
+            .with_code(format!("[{name}]"))
+            .with_message(&diag.message);
+        if let Some(off) = diag.primary_offset {
+            // Default to a 1-byte span at the offset. Errors with
+            // a more precise span (start..end) would render a wider
+            // caret; today we don't have per-error spans plumbed
+            // from the source crates so we default to point-spans.
+            let end = (off + 1).min(source.len());
+            let start = off.min(source.len());
+            if start <= end {
+                diagnostic = diagnostic.with_labels(vec![
+                    Label::primary((), start..end).with_message("here"),
+                ]);
+            }
         }
-        out.push_str(&format!("error[{phase}]: {e}"));
+        // Render via codespan-reporting. Failure to write to
+        // stderr is non-fatal; we fall back to a plain eprintln.
+        if let Err(_render_err) =
+            term::emit(&mut writer_lock, &config, &file, &diagnostic)
+        {
+            eprintln!("error[{name}]: {}", diag.message);
+        }
     }
-    out
 }
 
 /// Default output path: input file with its extension replaced by `.ll`.
@@ -517,10 +651,13 @@ mod tests {
         // Garbled source produces a parse error.
         let err = compile_source("@fn ;", "test").expect_err("expected parse error");
         match err {
-            CompileError::Phase(msg) => {
+            CompileError::Phase { name, diags } => {
+                assert_eq!(name, "parse", "expected parse phase; got {name}");
+                assert!(!diags.is_empty(), "expected at least one diagnostic");
                 assert!(
-                    msg.starts_with("error[parse]:"),
-                    "expected parse-prefixed error; got: {msg}"
+                    diags[0].message.starts_with("E02"),
+                    "expected E02xx parse error code; got {:?}",
+                    diags[0].message
                 );
             }
             CompileError::Io(_) => panic!("unexpected I/O error"),
@@ -530,27 +667,19 @@ mod tests {
     #[test]
     fn compile_source_surfaces_check_phase_error() {
         // Slice 15: sigil-layer violation — calling `#> proc()` from
-        // inside an `@fn` body. The check phase rejects this with
-        // E0501 (or similar). Verifies the `error[check]:` prefix.
+        // inside an `@fn` body. Some upstream gate (resolve, check,
+        // or effect) rejects this; verifies one of them does.
         let src = "\
             #automaton C { v: u32; }\n\
             #effect bump() #mutates: [C] { return; }\n\
             @fn caller() { #> bump(); return; }\n\
         ";
-        // Resolve probably catches this first as `E0404` for the
-        // #> in @fn (proc-call inside functional layer is illegal
-        // per Emergent Rule 4). Either way, an upstream gate
-        // should reject before codegen.
         let err = compile_source(src, "test").expect_err("expected gate error");
         match err {
-            CompileError::Phase(msg) => {
-                // Accept any of the upstream gate prefixes — the
-                // exact one depends on which gate catches it first.
+            CompileError::Phase { name, .. } => {
                 assert!(
-                    msg.starts_with("error[resolve]:")
-                        || msg.starts_with("error[check]:")
-                        || msg.starts_with("error[effect]:"),
-                    "expected resolve/check/effect prefix; got: {msg}"
+                    matches!(name, "resolve" | "check" | "effect"),
+                    "expected resolve/check/effect; got {name}"
                 );
             }
             CompileError::Io(_) => panic!("unexpected I/O error"),
@@ -559,21 +688,17 @@ mod tests {
 
     #[test]
     fn compile_source_surfaces_effect_phase_error_for_undeclared_mutates() {
-        // Slice 15: effect `bump` mutates `Counter` without
-        // declaring it in `#mutates: [...]`. The effect phase
-        // catches this via mutation-profile validation (§6).
+        // Slice 15: effect mutates Counter without declaring it.
         let src = "\
             #automaton Counter { v: u32; }\n\
             #effect bump() #mutates: [] { Counter.v += 1u32; }\n\
         ";
         let err = compile_source(src, "test").expect_err("expected gate error");
         match err {
-            CompileError::Phase(msg) => {
+            CompileError::Phase { name, .. } => {
                 assert!(
-                    msg.starts_with("error[effect]:")
-                        || msg.starts_with("error[check]:")
-                        || msg.starts_with("error[resolve]:"),
-                    "expected effect/check/resolve prefix; got: {msg}"
+                    matches!(name, "resolve" | "check" | "effect"),
+                    "expected resolve/check/effect; got {name}"
                 );
             }
             CompileError::Io(_) => panic!("unexpected I/O error"),
@@ -613,14 +738,109 @@ mod tests {
         );
     }
 
+    // ─── Slice 16: source-line diagnostics ────────────────────────────
+
     #[test]
-    fn format_phase_errors_joins_multiple_with_newlines() {
-        let errs = vec!["first", "second", "third"];
-        let s = format_phase_errors("xyz", &errs);
-        assert!(s.contains("error[xyz]: first"));
-        assert!(s.contains("error[xyz]: second"));
-        assert!(s.contains("error[xyz]: third"));
-        // Three errors separated by two newlines.
-        assert_eq!(s.matches("error[xyz]:").count(), 3);
+    fn byte_offset_from_msg_extracts_basic_form() {
+        // Most clifford-* errors include "at byte N" verbatim.
+        assert_eq!(
+            byte_offset_from_msg("E0204: expected `;`, found Eq at byte 42"),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn byte_offset_from_msg_handles_parenthesized_form() {
+        // "(at byte N)" is the parenthesised variant some errors use.
+        assert_eq!(
+            byte_offset_from_msg("E0101: imperative construct in @fn (at byte 7)"),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn byte_offset_from_msg_handles_referenced_form() {
+        // Resolver errors say "referenced at byte N".
+        assert_eq!(
+            byte_offset_from_msg("E0405: `Counter` has no field `bogus` (referenced at byte 123)"),
+            Some(123)
+        );
+    }
+
+    #[test]
+    fn byte_offset_from_msg_returns_first_offset_when_multiple() {
+        // E0401 mentions "at byte X; first declared at byte Y" —
+        // we pick X (the current location, not the historical one).
+        assert_eq!(
+            byte_offset_from_msg(
+                "E0401: duplicate item `foo` at byte 50; first declared at byte 10"
+            ),
+            Some(50)
+        );
+    }
+
+    #[test]
+    fn byte_offset_from_msg_returns_none_for_no_offset() {
+        assert_eq!(byte_offset_from_msg("E0500: GA engine not yet implemented"), None);
+        assert_eq!(byte_offset_from_msg("just a plain message"), None);
+        assert_eq!(byte_offset_from_msg(""), None);
+    }
+
+    #[test]
+    fn byte_offset_from_msg_skips_byte_without_digits() {
+        // The literal word "byte" in a non-offset context shouldn't
+        // confuse the helper. (e.g. "wrote byte data" is rare in
+        // clifford errors but defensive.)
+        assert_eq!(
+            byte_offset_from_msg("the byte was bad and at byte 99 we found it"),
+            Some(99)
+        );
+    }
+
+    #[test]
+    fn phase_diag_from_error_extracts_offset_when_present() {
+        struct E;
+        impl std::fmt::Display for E {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "E0204: expected `;` at byte 42")
+            }
+        }
+        let d = PhaseDiag::from_error(&E);
+        assert_eq!(d.primary_offset, Some(42));
+        assert!(d.message.contains("E0204"));
+    }
+
+    #[test]
+    fn phase_diag_from_error_offset_none_when_absent() {
+        struct E;
+        impl std::fmt::Display for E {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "E0500: GA engine not yet implemented")
+            }
+        }
+        let d = PhaseDiag::from_error(&E);
+        assert_eq!(d.primary_offset, None);
+    }
+
+    #[test]
+    fn compile_source_phase_error_carries_offsets_for_renderable_diagnostics() {
+        // A real parse error carries an "at byte N" offset that the
+        // CLI extracts for codespan-rendering. Verifies the
+        // extraction works on actual upstream errors, not just
+        // synthetic Display impls.
+        let err = compile_source("@fn ;", "test").expect_err("expected parse error");
+        match err {
+            CompileError::Phase { diags, .. } => {
+                assert!(!diags.is_empty(), "expected diagnostics");
+                // Parse errors all carry "at byte N"; the offset
+                // should be Some for at least the first one.
+                assert!(
+                    diags[0].primary_offset.is_some(),
+                    "expected primary_offset on parse error; got {:?}",
+                    diags[0]
+                );
+            }
+            CompileError::Io(_) => panic!("unexpected I/O error"),
+        }
     }
 }
