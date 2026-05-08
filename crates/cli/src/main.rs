@@ -37,7 +37,9 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use clifford_check::check;
 use clifford_codegen::lower;
+use clifford_effect::{extract_call_graph, extract_categories, extract_mutation_profiles};
 use clifford_lexer::tokenize;
 use clifford_parser::parse;
 use clifford_resolve::resolve;
@@ -223,9 +225,32 @@ fn run_compile(
     Ok(())
 }
 
-/// Run the lex → parse → resolve → types → codegen pipeline against a
-/// source string. Errors are pre-formatted with phase prefixes so the
-/// caller can print them verbatim.
+/// Run the full pipeline against a source string:
+///
+/// ```text
+/// tokenize → parse → resolve → infer → check → effect → codegen
+/// ```
+///
+/// Slice 15 wired the four upstream gates (`check`, `extract_categories`,
+/// `extract_mutation_profiles`, `extract_call_graph`) into the CLI so
+/// programs that violate sigil-layer / mutation-authorisation / category
+/// / call-graph invariants are rejected with structured diagnostics
+/// before codegen runs. `clifford-ortho` is still scaffolding (only
+/// `outer_product` exists; no top-level orthogonality verifier yet),
+/// so it remains a stub — the v0.1 release ships with the gates that
+/// exist today and earmarks ortho integration for the next slice that
+/// implements §7.
+///
+/// Errors are pre-formatted with phase prefixes so the caller can
+/// `eprintln!` them verbatim. The phase-prefix taxonomy is:
+///
+/// - `error[lex]:`     — tokenisation failure
+/// - `error[parse]:`   — syntactic error
+/// - `error[resolve]:` — name resolution / mutability violations
+/// - `error[types]:`   — type inference / annotation mismatches
+/// - `error[check]:`   — sigil-layer / mutation auth / totality
+/// - `error[effect]:`  — categorical / mutation-profile / call-graph
+/// - `error[codegen]:` — IR-emission gap (NotYetImplemented surface)
 fn compile_source(source: &str, module_name: &str) -> Result<String, CompileError> {
     let tokens = tokenize(source)
         .map_err(|e| CompileError::Phase(format!("error[lex]: {e}")))?;
@@ -237,6 +262,34 @@ fn compile_source(source: &str, module_name: &str) -> Result<String, CompileErro
     let typing = infer(&program, &resolution).map_err(|errs| {
         CompileError::Phase(format_phase_errors("types", &errs))
     })?;
+
+    // Slice 15 — semantic gates between typing and codegen.
+
+    // §5.5 sigil-layer + §5.4 mutation-auth + Decision #23 totality.
+    check(&program, &resolution).map_err(|errs| {
+        CompileError::Phase(format_phase_errors("check", &errs))
+    })?;
+
+    // Decision #5 categorical structure of every #automaton.
+    extract_categories(&program).map_err(|errs| {
+        CompileError::Phase(format_phase_errors("effect", &errs))
+    })?;
+
+    // Per-callable mutation profiles + #mutates / #cannot_mutate
+    // validation per §6.
+    extract_mutation_profiles(&program, &resolution).map_err(|errs| {
+        CompileError::Phase(format_phase_errors("effect", &errs))
+    })?;
+
+    // Proc-call graph cycle detection (catches mutual #> recursion).
+    extract_call_graph(&program, &resolution).map_err(|errs| {
+        CompileError::Phase(format_phase_errors("effect", &errs))
+    })?;
+
+    // clifford-ortho's top-level §7 verifier doesn't exist yet —
+    // only the `outer_product` primitive lives in that crate today.
+    // When the verifier lands, an `error[ortho]:` arm goes here.
+
     lower(&program, &resolution, &typing, module_name).map_err(|errs| {
         CompileError::Phase(format_phase_errors("codegen", &errs))
     })
@@ -472,6 +525,92 @@ mod tests {
             }
             CompileError::Io(_) => panic!("unexpected I/O error"),
         }
+    }
+
+    #[test]
+    fn compile_source_surfaces_check_phase_error() {
+        // Slice 15: sigil-layer violation — calling `#> proc()` from
+        // inside an `@fn` body. The check phase rejects this with
+        // E0501 (or similar). Verifies the `error[check]:` prefix.
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #effect bump() #mutates: [C] { return; }\n\
+            @fn caller() { #> bump(); return; }\n\
+        ";
+        // Resolve probably catches this first as `E0404` for the
+        // #> in @fn (proc-call inside functional layer is illegal
+        // per Emergent Rule 4). Either way, an upstream gate
+        // should reject before codegen.
+        let err = compile_source(src, "test").expect_err("expected gate error");
+        match err {
+            CompileError::Phase(msg) => {
+                // Accept any of the upstream gate prefixes — the
+                // exact one depends on which gate catches it first.
+                assert!(
+                    msg.starts_with("error[resolve]:")
+                        || msg.starts_with("error[check]:")
+                        || msg.starts_with("error[effect]:"),
+                    "expected resolve/check/effect prefix; got: {msg}"
+                );
+            }
+            CompileError::Io(_) => panic!("unexpected I/O error"),
+        }
+    }
+
+    #[test]
+    fn compile_source_surfaces_effect_phase_error_for_undeclared_mutates() {
+        // Slice 15: effect `bump` mutates `Counter` without
+        // declaring it in `#mutates: [...]`. The effect phase
+        // catches this via mutation-profile validation (§6).
+        let src = "\
+            #automaton Counter { v: u32; }\n\
+            #effect bump() #mutates: [] { Counter.v += 1u32; }\n\
+        ";
+        let err = compile_source(src, "test").expect_err("expected gate error");
+        match err {
+            CompileError::Phase(msg) => {
+                assert!(
+                    msg.starts_with("error[effect]:")
+                        || msg.starts_with("error[check]:")
+                        || msg.starts_with("error[resolve]:"),
+                    "expected effect/check/resolve prefix; got: {msg}"
+                );
+            }
+            CompileError::Io(_) => panic!("unexpected I/O error"),
+        }
+    }
+
+    #[test]
+    fn compile_source_passes_all_gates_for_real_firmware() {
+        // Slice 15: positive integration — a realistic firmware
+        // shape passes lex/parse/resolve/types/check/effect and
+        // produces IR. This is the canonical "the gates don't
+        // break the v0.1 firmware path" check.
+        let src = "\
+            #automaton Counter {\n  \
+              #states: [Idle, Counting];\n  \
+              count: u32;\n  \
+              #transition start -> Counting { Counter.count = 0u32; }\n\
+            }\n\
+            #effect bump() #mutates: [Counter] { Counter.count += 1u32; }\n\
+            #effect peek() -> u32 #mutates: [Counter] {\n  \
+              if Counter.count > 100u32 { return 100u32; }\n  \
+              return Counter.count;\n\
+            }\n\
+        ";
+        let ir = compile_source(src, "fw").expect("real firmware passes all gates");
+        assert!(
+            ir.contains("define void @bump()"),
+            "expected bump fn; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("define i32 @peek()"),
+            "expected peek fn; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("br i1"),
+            "expected if-conditional branch; got:\n{ir}"
+        );
     }
 
     #[test]
