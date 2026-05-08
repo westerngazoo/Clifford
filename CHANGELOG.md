@@ -7,6 +7,155 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — `clifford-ortho` v0.2-α: trait basis + `@fn` concurrency nodes (2026-05-08)
+
+Extends the §7 verifier from "field basis only" (v0.1) to the
+full §7.1 basis: predeclared §4.5 pure-side traits + user-defined
+`@trait`s now contribute basis vectors alongside automaton fields.
+`@fn` callables become concurrency nodes whose behaviour blade is
+the wedge of their declared traits — letting the engine reason
+about the §7.1 prose example: a `$ [Readable]` `@fn` running
+concurrent with a mutating `#interrupt` is provably orthogonal.
+
+**What changed in the basis:**
+
+- **§4.5 predeclared pure-side traits** (`Pure`, `Readable`,
+  `Observable`, `Opaque`) get the lowest trait-basis indices in
+  table order, even if unreferenced. This keeps diagnostic bit
+  indices stable across edits that add or remove `@fn`s.
+- **User-defined traits** get bits in first-appearance order
+  after the predeclared four.
+- **Decision #22 imperative-side traits** (`Hardware`, `Realtime`,
+  `Acquire`, `Release`, `SeqCst`, `LockingDiscipline`,
+  `PureState`, `Encapsulated`) are deliberately EXCLUDED from
+  the basis per spec §2.6's note "the orthogonality engine
+  ignores `trait_list` entirely" with respect to those traits.
+  They serve different purposes — codegen fences, audit trail,
+  certification — and including them would create false
+  positives between interrupts that legitimately share an
+  ordering or hardware tag.
+
+**What changed in concurrency inference:**
+
+- `@fn` callables are now concurrency-checked against
+  `#interrupt`s. The §7.3 rationale is the spec's own: "A `@fn`
+  invoked from a `#`-context can_concur with anything its
+  caller can, inheriting the caller's concurrency class." v0.2-α
+  applies that conservatively — every `@fn` is a node, paired
+  against every interrupt.
+- `@fn × @fn`, `@fn × #effect` — never concurrent (single
+  foreground thread).
+- `@fn × #interrupt` — concurrent (interrupt preempts the
+  foreground while the `@fn` is running).
+- v0.1's existing rules unchanged: `#effect × #effect` →
+  never; `#interrupt × #interrupt` → concurrent;
+  `#transition × *` → never (transitions propagate via
+  `actual_writes` closure).
+
+**What changed in the behaviour blade:**
+
+- For `#effect` / `#interrupt`: the v0.1 field-write blade is
+  now OR'd with the basis bits for any §7-basis traits in the
+  declared `trait_list`.
+- For `@fn`: the blade is the wedge of in-basis traits in its
+  declared `trait_list`. Empty trait_list defaults to
+  `[Pure]` per Emergent Rule 2 — the bare `@fn` carries the
+  `Pure` bit.
+
+**Headline new test cases:**
+
+- `pure_fn_concurrent_with_mutating_interrupt_is_orthogonal` —
+  the §7.1 prose example. The `@fn`'s `Pure` bit and the
+  interrupt's field bits live in disjoint basis ranges → wedge
+  is non-zero → orthogonal.
+- `imperative_traits_dont_create_violations_between_interrupts`
+  — two interrupts both carrying `$ [Hardware, Release]` on
+  disjoint fields. Without §2.6's exclusion, the shared
+  `Hardware` and `Release` would falsely violate; with the
+  exclusion they pass cleanly.
+- `fn_and_interrupt_sharing_a_user_trait_violates` — verifies
+  the corner case where a user-defined trait DOES land on both
+  sides (since `@trait` is layer-universal in v0.2-β). The
+  shared user trait shows up as an E0520 with the trait name
+  in the diagnostic.
+
+**API surface added:**
+
+- `BasisAssignment::trait_bit_index(name)` — look up a trait's
+  bit index.
+- `BasisAssignment::field_count()` / `trait_count()` — split the
+  dimension for diagnostics + IDE integration.
+- `BasisAssignment::decode_mask(mask)` now returns
+  `(Vec<FieldRef>, Vec<String>)` so diagnostics can split
+  shared fields and shared traits.
+- `OrthoError::OrthogonalityViolation` gained a
+  `shared_traits: Vec<String>` field alongside the existing
+  `shared_fields: Vec<FieldRef>`. The display message renders as
+  `` shared field(s) `Counter.value`; shared trait(s) `Shared` ``
+  when both are present.
+
+**Tests added: 8 new in `crates/ortho/src/lib.rs`** (19 → 27).
+
+- `basis_user_traits_get_bits_after_predeclared`
+- `basis_imperative_traits_excluded_per_section_2_6`
+- `pure_fn_concurrent_with_mutating_interrupt_is_orthogonal`
+- `fn_with_user_trait_concurrent_with_unrelated_interrupt_is_orthogonal`
+- `fn_and_interrupt_sharing_a_user_trait_violates`
+- `two_pure_fns_are_skipped_by_concurrency_inference`
+- `imperative_traits_dont_create_violations_between_interrupts`
+- `can_concur_fn_fn_returns_false` /
+  `can_concur_fn_effect_returns_false` /
+  `can_concur_fn_interrupt_returns_true`
+
+Plus existing tests updated for the renamed shape:
+- `basis_is_just_predeclared_traits_for_program_with_no_automatons`
+  (renamed from `basis_is_empty_for_program_with_no_automatons`).
+- `basis_assigns_fields_first_then_traits` (renamed from
+  `basis_assigns_in_declaration_order`).
+- `basis_decode_mask_returns_named_fields_and_traits` (returns
+  the two-vec tuple now).
+- `basis_exhausted_when_more_than_64_basis_vectors` (now counts
+  fields + 4 predeclared traits).
+- `interrupt_and_effect_writing_same_field_violates` /
+  `transition_writes_propagate_into_caller_blade` (assertions
+  on the new `shared_fields` + `shared_traits` fields).
+- `multiple_violations_all_reported` unchanged.
+
+**Pipeline regression checked against every committed example:**
+
+| Sample | Status |
+|---|---|
+| `examples/dual_uart_telemetry.cl` | ✓ |
+| `examples/buffer_init_sigma.cl` | ✓ |
+| `examples/uart_fsm.cl` | ✓ |
+| `examples/traffic_classifier.cl` | ✓ |
+| `examples/crc32.cl` | ✓ |
+| `tests/qemu/firmware_smoke.cl` | ✓ |
+
+All pass through the trait-basis verifier. The trait-basis
+extension caught zero new false positives on real code — the
+§2.6 exclusion of imperative traits was the right call.
+
+**Deferred to subsequent ortho slices:**
+
+- **Read-write race detection** (§7.2 graded algebra). Track
+  reads on a separate read-blade.
+- **`@sequential(A, B)` consumption** (Decision #11). Suppress
+  pairs the user has asserted as serialised.
+- **`#basis` override clauses** (Decision #4 rule 2). Honour
+  user-supplied basis assignments.
+- **Property tests via `proptest`** per CLAUDE.md §4.1. Still
+  blocked on the toolchain pin.
+- **Transitive `@fn` trait inheritance** (§7.3 footnote): when
+  an `#effect` calls an `@fn`, the `@fn`'s trait bits should
+  enter the calling effect's blade. v0.2-α adds `@fn`s as
+  separate concurrency nodes instead, which is conservative but
+  not transitive; transitive would be a wider check at lower
+  cost per pair.
+
+Total ortho tests: **27** (19 pre-trait-basis + 8 new). Workspace
+clean; clippy clean.
+
 ### Added — `clifford-ortho` §7 verifier (2026-05-08)
 
 The first post-v0.1.0 slice. Implements the GA orthogonality
