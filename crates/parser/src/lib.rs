@@ -1874,6 +1874,8 @@ impl<'t> Parser<'t> {
             TokenKind::KwHashVolatileStore => {
                 self.parse_unchecked_store_stmt(start, /*volatile=*/ true)
             }
+            // Decision #14 / §5.8 sigma loop: `sigma var in lo..hi { body }`.
+            TokenKind::KwSigma => self.parse_sigma_stmt(start),
             // Mutation sugar (Decision #15): `Auto.field <op>= expr;` — must
             // be detected via lookahead. The Auto is an `Ident`, followed by
             // `.`, an `Ident` (field), then an assignment op.
@@ -2127,6 +2129,27 @@ impl<'t> Parser<'t> {
         Ok(Stmt {
             kind,
             span: Span::new(start, close.end),
+        })
+    }
+
+    /// Parse `sigma <ident> in <expr> { body }` per Decision #14 /
+    /// §5.8. The source expression is typically a `Range` (`lo..hi`
+    /// or `lo..=hi`) but the AST node carries a generic `Expr` so
+    /// future array-source / slice-source forms can drop in.
+    ///
+    /// v0.1 scope: single-ident loop variable only. The
+    /// `(index, value)` pattern from §5.8 lands when array sources
+    /// arrive.
+    fn parse_sigma_stmt(&mut self, start: usize) -> Result<Stmt, ParseError> {
+        self.advance(); // `sigma`
+        let (var, _) = self.expect_ident("loop variable name after `sigma`")?;
+        self.expect(TokenKind::KwIn, "`in` after sigma loop variable")?;
+        let source = self.parse_expr()?;
+        let body = self.parse_block()?;
+        let end = body.span.end;
+        Ok(Stmt {
+            kind: StmtKind::Sigma { var, source, body },
+            span: Span::new(start, end),
         })
     }
 
@@ -6293,5 +6316,76 @@ mod tests {
             }
             other => panic!("expected Fn at index 1, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn sigma_loop_basic_half_open_range() {
+        // `sigma i in 0..n { … }` — half-open range source.
+        let stmt = parse_stmt_str("sigma i in 0u32..10u32 { }");
+        match &stmt.kind {
+            StmtKind::Sigma { var, source, body } => {
+                assert_eq!(var, "i");
+                assert_eq!(body.stmts.len(), 0);
+                assert!(matches!(
+                    source.kind,
+                    ExprKind::Range { inclusive: false, .. }
+                ));
+            }
+            other => panic!("expected Sigma, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn sigma_loop_inclusive_range() {
+        // `sigma i in 0..=10 { … }` — inclusive range source.
+        let stmt = parse_stmt_str("sigma i in 0u32..=10u32 { }");
+        match &stmt.kind {
+            StmtKind::Sigma { source, .. } => {
+                assert!(matches!(
+                    source.kind,
+                    ExprKind::Range { inclusive: true, .. }
+                ));
+            }
+            other => panic!("expected Sigma, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn sigma_loop_with_body_statements() {
+        // Body statements are parsed as a normal block.
+        let stmt = parse_stmt_str(
+            "sigma i in 0u32..4u32 { let _x: u32 = i; return; }",
+        );
+        match &stmt.kind {
+            StmtKind::Sigma { body, .. } => {
+                assert_eq!(body.stmts.len(), 2);
+            }
+            other => panic!("expected Sigma, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn sigma_loop_missing_in_keyword_errors() {
+        // Forgetting `in` yields a parse error.
+        let err = parse_str("@fn t() { sigma i 0u32..4u32 { } }")
+            .expect_err("expected parse error without `in`");
+        // Just verify it errored with something meaningful.
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("in"),
+            "expected error to mention `in`; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn sigma_loop_missing_var_errors() {
+        // No loop variable name.
+        let err = parse_str("@fn t() { sigma in 0u32..4u32 { } }")
+            .expect_err("expected parse error without var");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("loop variable"),
+            "expected error to mention loop variable; got: {msg}"
+        );
     }
 }
