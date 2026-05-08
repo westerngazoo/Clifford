@@ -1089,6 +1089,29 @@ impl<'a> Walker<'a> {
                 }
                 self.pop_scope();
             }
+            // Slice 13: `if cond { … } else { … }` statement form.
+            // The condition resolves in the OUTER scope; each branch
+            // (then / else) opens a new scope so any `let` inside
+            // is invisible after the `if`.
+            StmtKind::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                self.walk_expr(cond);
+                self.push_scope();
+                for s in &then_block.stmts {
+                    self.walk_stmt(s);
+                }
+                self.pop_scope();
+                if let Some(else_blk) = else_block {
+                    self.push_scope();
+                    for s in &else_blk.stmts {
+                        self.walk_stmt(s);
+                    }
+                    self.pop_scope();
+                }
+            }
             // Slice 12: `name = expr;` — local mutable re-assignment.
             // Walk the RHS first so any references in it resolve in
             // the OUTER scope (consistent with let-stmt semantics).

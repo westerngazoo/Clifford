@@ -1876,6 +1876,8 @@ impl<'t> Parser<'t> {
             }
             // Decision #14 / §5.8 sigma loop: `sigma var in lo..hi { body }`.
             TokenKind::KwSigma => self.parse_sigma_stmt(start),
+            // Slice 13: `if cond { … } else { … }` statement form.
+            TokenKind::KwIf => self.parse_if_stmt(start),
             // Mutation sugar (Decision #15): `Auto.field <op>= expr;` — must
             // be detected via lookahead. The Auto is an `Ident`, followed by
             // `.`, an `Ident` (field), then an assignment op.
@@ -2147,6 +2149,52 @@ impl<'t> Parser<'t> {
         Ok(Stmt {
             kind,
             span: Span::new(start, close.end),
+        })
+    }
+
+    /// Parse `if <cond> { … } else { … }` per slice 13.
+    /// Supports `else if` chains by recursively building a synthetic
+    /// else-block whose only statement is the next `If`.
+    ///
+    /// Statement form only — no value yielded. The grammar for the
+    /// expression-form `if` (used as an rvalue) lands in a future
+    /// slice when `Block` gains a tail expression.
+    fn parse_if_stmt(&mut self, start: usize) -> Result<Stmt, ParseError> {
+        self.advance(); // `if`
+        let cond = self.parse_expr()?;
+        let then_block = self.parse_block()?;
+        let mut end = then_block.span.end;
+        let else_block = if matches!(self.peek().kind, TokenKind::KwElse) {
+            self.advance(); // `else`
+            // `else if` chain: parse the next `if` as a statement
+            // and wrap it in a synthetic single-stmt Block. This
+            // keeps the AST shape uniform — every `else_block` is
+            // a `Block`, regardless of whether the source wrote
+            // `else if` or `else { if … }`.
+            if matches!(self.peek().kind, TokenKind::KwIf) {
+                let inner_start = self.peek().span.start;
+                let inner = self.parse_if_stmt(inner_start)?;
+                let block_span = inner.span;
+                end = block_span.end;
+                Some(Block {
+                    stmts: vec![inner],
+                    span: block_span,
+                })
+            } else {
+                let blk = self.parse_block()?;
+                end = blk.span.end;
+                Some(blk)
+            }
+        } else {
+            None
+        };
+        Ok(Stmt {
+            kind: StmtKind::If {
+                cond,
+                then_block,
+                else_block,
+            },
+            span: Span::new(start, end),
         })
     }
 
@@ -6347,6 +6395,74 @@ mod tests {
                 }
             }
             other => panic!("expected Fn at index 1, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn if_stmt_no_else() {
+        // `if cond { … }` — no else branch.
+        let stmt = parse_stmt_str("if true { let _x: u32 = 1u32; }");
+        match &stmt.kind {
+            StmtKind::If { cond, then_block, else_block } => {
+                assert!(matches!(cond.kind, ExprKind::BoolLit(true)));
+                assert_eq!(then_block.stmts.len(), 1);
+                assert!(else_block.is_none());
+            }
+            other => panic!("expected If, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn if_stmt_with_else() {
+        let stmt = parse_stmt_str("if true { } else { let _x: u32 = 1u32; }");
+        match &stmt.kind {
+            StmtKind::If { else_block, .. } => {
+                let blk = else_block.as_ref().expect("else block");
+                assert_eq!(blk.stmts.len(), 1);
+            }
+            other => panic!("expected If, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn if_else_if_chain_nests() {
+        // `if a { } else if b { } else { }` — the inner else-if
+        // is a synthetic else block containing one If statement.
+        let stmt = parse_stmt_str(
+            "if true { } else if false { } else { let _x: u32 = 1u32; }",
+        );
+        match &stmt.kind {
+            StmtKind::If { else_block, .. } => {
+                let outer_else = else_block.as_ref().expect("outer else");
+                assert_eq!(
+                    outer_else.stmts.len(),
+                    1,
+                    "outer else should hold the synthetic If"
+                );
+                match &outer_else.stmts[0].kind {
+                    StmtKind::If {
+                        else_block: inner_else,
+                        ..
+                    } => {
+                        let inner = inner_else.as_ref().expect("inner else");
+                        assert_eq!(inner.stmts.len(), 1);
+                    }
+                    other => panic!("expected nested If, got {:?}", other),
+                }
+            }
+            other => panic!("expected outer If, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn if_stmt_with_complex_condition() {
+        // Condition is a binary comparison.
+        let stmt = parse_stmt_str("if 5u32 < 10u32 { return; }");
+        match &stmt.kind {
+            StmtKind::If { cond, .. } => {
+                assert!(matches!(cond.kind, ExprKind::Binary { .. }));
+            }
+            other => panic!("expected If, got {:?}", other),
         }
     }
 

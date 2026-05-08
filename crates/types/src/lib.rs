@@ -1852,6 +1852,30 @@ impl<'a> Inferer<'a> {
                 let _ = self.infer_expr(ptr);
                 let _ = self.infer_expr(value);
             }
+            // Slice 13: `if cond { … } else { … }` statement form.
+            // Type the condition (should be bool; the bool-ness
+            // check is deferred to a later validation slice — for
+            // now codegen surfaces a defensive error if the SSA
+            // value isn't `i1`). Push/pop typing scopes per branch.
+            StmtKind::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                let _ = self.infer_expr(cond);
+                self.push_scope();
+                for s in &then_block.stmts {
+                    self.walk_stmt(s);
+                }
+                self.pop_scope();
+                if let Some(else_blk) = else_block {
+                    self.push_scope();
+                    for s in &else_blk.stmts {
+                        self.walk_stmt(s);
+                    }
+                    self.pop_scope();
+                }
+            }
             // Slice 12: `name = expr;` — local mutable re-assignment.
             // We just type the RHS so any references inside it are
             // recorded; the resolver already enforced mutability and

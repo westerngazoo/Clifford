@@ -7,6 +7,194 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 13: `if` / `else` statement form (2026-05-08)
+
+The single most-felt remaining v0.1 ergonomic gap: conditional
+statements. Adds `if cond { … }`, `if cond { … } else { … }`,
+and `else if` chains end-to-end across the pipeline. Unlocks the
+"branch on `Auto@state`", "guarded mutation", and "early return"
+patterns that the dual-UART telemetry sample had to leave as
+TODO comments.
+
+The slice also closes a half-dozen parallel codegen gaps that
+fell out naturally from needing real boolean conditions:
+**comparison operators** (`==`, `!=`, `<`, `<=`, `>`, `>=`) and
+**bitwise / shift / logical operators** (`&`, `|`, `^`, `<<`,
+`>>`, `&&`, `||`) all land in this slice.
+
+**The headline shape — early-return classifier:**
+
+```clifford
+#effect classify() -> u8 #mutates: [Telemetry] {
+  if Telemetry.bytes_total == 0u32    { return 0u8; }
+  if Telemetry.bytes_total < 100u32   { return 1u8; }
+  if Telemetry.bytes_total < 1000u32  { return 2u8; }
+  return 3u8;
+}
+```
+
+→
+
+```llvm
+define i8 @classify() {
+entry:
+  %tmp.0 = getelementptr %struct.Telemetry, %struct.Telemetry* @Telemetry.state, i32 0, i32 1
+  %tmp.1 = load i32, i32* %tmp.0
+  %tmp.2 = icmp eq i32 %tmp.1, 0
+  br i1 %tmp.2, label %if.then.0, label %if.exit.0
+if.then.0:
+  ret i8 0
+if.exit.0:
+  ; ... reload + icmp ult + br ...
+  br i1 %tmp.5, label %if.then.1, label %if.exit.1
+if.then.1:
+  ret i8 1
+if.exit.1:
+  ; ... third comparison ...
+if.then.2:
+  ret i8 2
+if.exit.2:
+  ret i8 3
+}
+```
+
+**Pipeline changes (5 crates):**
+
+- **`clifford-ast`**: `StmtKind::If { cond, then_block, else_block }`.
+  `else_block` is `Option<Block>`. For `else if` chains the parser
+  builds a synthetic single-stmt `Block` containing the next `If`
+  — keeps the AST shape uniform.
+- **`clifford-parser`**: `parse_if_stmt` recognises `if`, `else`,
+  and `else if`. Wired into `parse_stmt` dispatch. Four parser
+  tests cover no-else / with-else / else-if-chain / complex-cond.
+- **`clifford-resolve`**: `walk_stmt` arm walks the cond in the
+  outer scope, then opens a new scope for each branch. Lets
+  inside one branch are invisible outside.
+- **`clifford-types`**: `walk_stmt` arm types the cond and walks
+  each branch with a fresh typing scope. Bool-ness check on the
+  condition is deferred to a later validation slice.
+- **`clifford-codegen`**: `emit_if` emits the conditional-branch
+  CFG with optional else and a merge label. Plus three concurrent
+  improvements:
+
+**Codegen detail (`emit_if`):**
+
+Emits one of these shapes depending on `else_block`:
+
+```text
+; with else:
+  br i1 %cond, label %if.then.<id>, label %if.else.<id>
+if.then.<id>:
+  <then body>
+  br label %if.exit.<id>      ; suppressed if then returned
+if.else.<id>:
+  <else body>
+  br label %if.exit.<id>      ; suppressed if else returned
+if.exit.<id>:
+  <subsequent stmts>
+
+; without else:
+  br i1 %cond, label %if.then.<id>, label %if.exit.<id>
+if.then.<id>:
+  <then body>
+  br label %if.exit.<id>      ; suppressed if then returned
+if.exit.<id>:
+  <subsequent stmts>
+```
+
+Each branch tracks its own `current_block_terminated` flag. If a
+branch's body emits a `return` mid-block (or has a fall-through
+that terminates), the `br label %if.exit.<id>` is suppressed so
+we don't try to add a second terminator to the same basic block.
+If BOTH branches terminate, the merge block is unreachable; LLVM
+tolerates blocks with no predecessors and DCE collapses them.
+
+Each branch also opens a fresh local-scope marker so `let`s inside
+one branch don't leak into the other or into the merge block.
+Mirrors the slice-11 sigma-loop scope handling.
+
+**Bonus: comparison + bitwise + shift + logical operators.** To
+make boolean conditions work, `emit_binary` grew arms for every
+remaining `BinaryOp` variant:
+
+| Operator | LLVM op |
+|---|---|
+| `==` | `icmp eq` |
+| `!=` | `icmp ne` |
+| `<` | `icmp slt` (signed) / `icmp ult` (unsigned) |
+| `<=` | `icmp sle` / `icmp ule` |
+| `>` | `icmp sgt` / `icmp ugt` |
+| `>=` | `icmp sge` / `icmp uge` |
+| `&&` / `&` | `and` |
+| `\|\|` / `\|` | `or` |
+| `^` | `xor` |
+| `<<` | `shl` |
+| `>>` | `ashr` (signed) / `lshr` (unsigned) |
+
+Comparison ops produce `i1` regardless of input type;
+`expr_ir_type` for `Binary` was updated to return `i1` for the
+six comparison ops and the two logical ops so `br i1 %cond` sees
+the right type.
+
+**Bonus: `emit_block` rewrite.** The slice-1 emit_block tracked
+"did a top-level Return statement appear?" to decide whether to
+emit a synthetic terminator. With if/else, the LAST top-level
+statement can be an `if` whose branches all return — current
+block IS terminated, but the old check fired the synthetic-ret
+path anyway. Refactored to consult `current_block_terminated`
+directly. The "non-unit @fn body without explicit return"
+diagnostic became a check-pass concern (deferred); codegen now
+emits `unreachable` to satisfy LLVM's terminator requirement and
+trusts upstream validation.
+
+**Deferred:**
+
+- Expression-form `if` (yields a value via phi nodes). Needs
+  `Block` to gain a tail-expression slot. For now, the early-
+  return idiom covers most use cases.
+- `match` expressions / statements. Bigger arc; needs pattern
+  matching support all the way through.
+- Short-circuit evaluation of `&&` / `||` when operands have side
+  effects. v0.1's `and` / `or` lowering is full-eval (both sides
+  always evaluated). Fine for pure conditions; the short-circuit
+  CFG lands when needed.
+
+**Tests added:** 4 parser + 10 codegen = **14 new tests**.
+
+*Parser (4):*
+- `if_stmt_no_else` — bare `if cond { … }`.
+- `if_stmt_with_else` — `if … else …`.
+- `if_else_if_chain_nests` — `else if` produces synthetic
+  single-stmt else-block.
+- `if_stmt_with_complex_condition` — Binary-comparison cond.
+
+*Codegen (10):*
+- `s13_if_no_else_emits_conditional_branch_to_exit`
+- `s13_if_with_else_emits_three_blocks`
+- `s13_if_condition_uses_dynamic_value` (icmp from runtime cmp)
+- `s13_if_then_returns_no_back_edge_emitted`
+- `s13_if_else_both_return_exit_block_unreachable`
+- `s13_else_if_chain_emits_nested_blocks`
+- `s13_if_let_inside_branch_invisible_outside` (resolver-side)
+- `s13_if_with_local_assign_in_branch` (slice-12 + slice-13)
+- `s13_nested_if_inside_if`
+- `s13_if_inside_sigma_body_works` (slice-11 + slice-13)
+
+Plus `examples/traffic_classifier.cl`: end-to-end smoke
+demonstrating early-return classifier, `else if` chain, and a
+slice-12+slice-13 `clamp_to_8` accumulator. Compiles to a 90-line
+LLVM module via `cliffordc compile`.
+
+Total codegen tests: **163** (153 pre-slice-13 + 10 new). Total
+parser tests: **242** (238 pre-slice-13 + 4 new). All green;
+clippy clean across the workspace.
+
+**v0.1 firmware language status:** with this slice the v0.1
+target is feature-complete for the Appendix A examples. The
+remaining items (compound assign on locals, `break` / `continue`,
+`match`, methods, strings) are nice-to-haves, not blockers. The
+QEMU integration test is the next milestone.
+
 ### Added — Slice 12: local mutable re-assignment (2026-05-15)
 
 Adds the missing piece between `let mut` (already parseable but

@@ -1251,6 +1251,36 @@ pub enum StmtKind {
         body: Block,
     },
 
+    /// `if <cond> { … } else { … }` — statement-form conditional
+    /// (slice 13).
+    ///
+    /// `cond` must type to `bool` (codegen surfaces a defensive
+    /// error if the SSA value isn't `i1`). `then_block` and the
+    /// optional `else_block` are independent lexical scopes — a
+    /// `let` inside one is invisible to the other and to code
+    /// after the `if`.
+    ///
+    /// `else_block` is `Option<Block>`:
+    /// - `None`: bare `if cond { … }` (codegen branches to the
+    ///   exit block on the false path).
+    /// - `Some(block)`: `if cond { … } else { … }`.
+    /// - For `else if` chains, the `else_block` is a synthetic
+    ///   `Block` containing a single `If` statement; the parser
+    ///   handles the chaining transparently.
+    ///
+    /// v0.1 scope: statement-form only. Expression-form `if`
+    /// (yields a value via phi nodes) lands when control-flow
+    /// expressions are added (currently `Block` is statement-only).
+    If {
+        /// Condition expression; must type to `bool`.
+        cond: Expr,
+        /// Block executed when `cond` is true.
+        then_block: Block,
+        /// Optional `else { … }` (or synthetic `else { if … }` for
+        /// `else if` chains).
+        else_block: Option<Block>,
+    },
+
     /// `name = expr;` — local mutable re-assignment.
     ///
     /// Distinct from `Mutate` / `MutateShort` which target
