@@ -1250,6 +1250,31 @@ pub enum StmtKind {
         /// Body block; runs once per iteration.
         body: Block,
     },
+
+    /// `name = expr;` — local mutable re-assignment.
+    ///
+    /// Distinct from `Mutate` / `MutateShort` which target
+    /// automaton fields (`Auto.field = …`). This variant is for
+    /// plain locals that were declared with `let mut`. The
+    /// resolver enforces that `name` resolves to a `let mut`
+    /// binding — re-assigning a `let` (immutable) or a parameter
+    /// without `mut` is rejected with an `E0410`-shaped error.
+    ///
+    /// At codegen, every `let mut` binding lives in a stack slot
+    /// (`alloca`) so re-assignment is a `store`; reads through
+    /// `ExprKind::Path` become `load`s. Immutable `let` bindings
+    /// keep their slice-1 SSA-direct lowering — the alloca is
+    /// only emitted when the binding is `mut`.
+    ///
+    /// v0.1 scope: single-ident LHS only. Tuple destructuring and
+    /// field-of-local assignment (`local.field = …`) are deferred
+    /// to later slices.
+    Assign {
+        /// The local being re-assigned.
+        name: String,
+        /// Right-hand side.
+        value: Expr,
+    },
 }
 
 /// One `field = expr` (or `field[index] = expr`) inside a `#mutate Auto { … }`.

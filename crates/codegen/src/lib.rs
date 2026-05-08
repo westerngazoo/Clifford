@@ -357,10 +357,34 @@ impl AutomatonInfo {
 /// One per-function local binding: source name + SSA-value ref + IR
 /// type. Slice 2 tracks the IR type alongside the value so path-
 /// position lookups don't need to re-walk the typing map.
+///
+/// Slice 12 added the `storage` field to discriminate between
+/// SSA-direct bindings (the slice-1 path: `value` is the SSA name
+/// holding the value) and stack-slot bindings (the new path for
+/// `let mut`: `value` is an `alloca`-produced pointer; reads load
+/// through it; writes store through it). Parameters and immutable
+/// `let` keep the SSA-direct shape; only `let mut` uses the stack.
 struct LocalBinding {
     name: String,
     value: String,
     ir_type: String,
+    /// Slice 12: discriminator for read/write lowering.
+    storage: LocalStorage,
+}
+
+/// Slice 12: how a local's value is held in IR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalStorage {
+    /// `LocalBinding::value` is the SSA name that holds the value.
+    /// Reads emit nothing; the SSA name is the value. Used for
+    /// parameters, immutable `let`, `let :=`, and `sigma`-loop
+    /// variables.
+    Ssa,
+    /// `LocalBinding::value` is an SSA name that holds an
+    /// `alloca`-produced pointer (`<ir_type>*`). Reads emit
+    /// `load <ir_type>, <ir_type>* %ptr`; writes emit
+    /// `store <ir_type> %v, <ir_type>* %ptr`. Used for `let mut`.
+    Stack,
 }
 
 impl<'a> Emitter<'a> {
@@ -543,6 +567,10 @@ impl<'a> Emitter<'a> {
                 name: p.name.clone(),
                 value: format!("%{}", p.name),
                 ir_type: p_ir_ty,
+                // Parameters are SSA-direct: the param SSA name
+                // holds the value. `let mut` is the only thing
+                // that uses Stack storage today.
+                storage: LocalStorage::Ssa,
             });
         }
 
@@ -594,6 +622,10 @@ impl<'a> Emitter<'a> {
                 name: p.name.clone(),
                 value: format!("%{}", p.name),
                 ir_type: p_ir_ty,
+                // Parameters are SSA-direct: the param SSA name
+                // holds the value. `let mut` is the only thing
+                // that uses Stack storage today.
+                storage: LocalStorage::Ssa,
             });
         }
 
@@ -755,6 +787,10 @@ impl<'a> Emitter<'a> {
                 name: p.name.clone(),
                 value: format!("%{}", p.name),
                 ir_type: p_ir_ty,
+                // Parameters are SSA-direct: the param SSA name
+                // holds the value. `let mut` is the only thing
+                // that uses Stack storage today.
+                storage: LocalStorage::Ssa,
             });
         }
 
@@ -872,7 +908,7 @@ impl<'a> Emitter<'a> {
                 writeln!(&mut self.out, "  ret void").ok();
                 self.current_block_terminated = true;
             }
-            StmtKind::Let { name, ty, value, .. } => {
+            StmtKind::Let { name, ty, value, mutable } => {
                 let ir_ty = match ty {
                     Some(annotated) => self.lower_type(annotated).unwrap_or_else(|e| {
                         self.errors.push(e);
@@ -882,12 +918,42 @@ impl<'a> Emitter<'a> {
                 };
                 match self.emit_expr(value) {
                     Ok(v) => {
-                        let bind = self.bind_via_identity(&ir_ty, &v);
-                        self.locals.push(LocalBinding {
-                            name: name.clone(),
-                            value: bind,
-                            ir_type: ir_ty,
-                        });
+                        if *mutable {
+                            // Slice 12: `let mut name = …` —
+                            // allocate a stack slot and store the
+                            // initial value. Subsequent reads load
+                            // through the alloca pointer; subsequent
+                            // assigns store through it.
+                            let ptr = self.fresh_value();
+                            writeln!(
+                                &mut self.out,
+                                "  {ptr} = alloca {ir_ty}",
+                            )
+                            .ok();
+                            writeln!(
+                                &mut self.out,
+                                "  store {ir_ty} {v}, {ir_ty}* {ptr}",
+                            )
+                            .ok();
+                            self.locals.push(LocalBinding {
+                                name: name.clone(),
+                                value: ptr,
+                                ir_type: ir_ty,
+                                storage: LocalStorage::Stack,
+                            });
+                        } else {
+                            // Immutable `let` — slice-1 SSA-direct
+                            // path. The bind_via_identity helper
+                            // gives the binding a stable SSA name
+                            // that downstream code can reference.
+                            let bind = self.bind_via_identity(&ir_ty, &v);
+                            self.locals.push(LocalBinding {
+                                name: name.clone(),
+                                value: bind,
+                                ir_type: ir_ty,
+                                storage: LocalStorage::Ssa,
+                            });
+                        }
                     }
                     Err(e) => self.errors.push(e),
                 }
@@ -901,6 +967,8 @@ impl<'a> Emitter<'a> {
                             name: name.clone(),
                             value: bind,
                             ir_type: ir_ty,
+                            // `let :=` is always immutable per Decision #8.
+                            storage: LocalStorage::Ssa,
                         });
                     }
                     Err(e) => self.errors.push(e),
@@ -965,6 +1033,15 @@ impl<'a> Emitter<'a> {
             // scope: range sources only.
             StmtKind::Sigma { var, source, body } => {
                 if let Err(e) = self.emit_sigma(var, source, body) {
+                    self.errors.push(e);
+                }
+            }
+            // Slice 12: `name = expr;` — local mutable re-assignment.
+            // The resolver has already verified that `name` is
+            // `let mut`-declared, so the binding's storage is
+            // Stack (alloca pointer). Lowers to a single store.
+            StmtKind::Assign { name, value } => {
+                if let Err(e) = self.emit_local_assign(name, value) {
                     self.errors.push(e);
                 }
             }
@@ -1346,11 +1423,27 @@ impl<'a> Emitter<'a> {
             ExprKind::BoolLit(b) => Ok(if *b { "1".to_owned() } else { "0".to_owned() }),
             ExprKind::Path(segments) => {
                 if segments.len() == 1 {
-                    self.lookup_local(&segments[0])
-                        .map(str::to_owned)
-                        .ok_or_else(|| CodegenError::UnresolvedName {
+                    // Slice 12: dispatch on the binding's storage.
+                    // Ssa: the local's value IS the SSA name — return
+                    //      it directly (slice-1 path).
+                    // Stack: the local's value is an alloca pointer —
+                    //      emit a load through it.
+                    let lookup = self.lookup_local_with_storage(&segments[0]);
+                    match lookup {
+                        Some((value, _ir_ty, LocalStorage::Ssa)) => Ok(value),
+                        Some((ptr, ir_ty, LocalStorage::Stack)) => {
+                            let val = self.fresh_value();
+                            writeln!(
+                                &mut self.out,
+                                "  {val} = load {ir_ty}, {ir_ty}* {ptr}",
+                            )
+                            .ok();
+                            Ok(val)
+                        }
+                        None => Err(CodegenError::UnresolvedName {
                             name: segments[0].clone(),
-                        })
+                        }),
+                    }
                 } else {
                     Err(CodegenError::NotYetImplemented {
                         what: "multi-segment path expression",
@@ -1907,6 +2000,50 @@ impl<'a> Emitter<'a> {
     /// `<op>` (strict).
     ///
     /// v0.1 scope: range sources only (`lo..hi`, `lo..=hi`).
+    /// Slice 12: lower `name = expr;` to a single LLVM `store`
+    /// against the local's alloca pointer. The resolver has already
+    /// verified that `name` resolves to a `let mut` binding (which
+    /// always has [`LocalStorage::Stack`]); if for some reason the
+    /// binding is SSA-direct or missing, we surface a structured
+    /// error rather than silently emitting wrong IR.
+    ///
+    /// ```text
+    ///   <emit value> -> %v
+    ///   store <ir_ty> %v, <ir_ty>* %ptr
+    /// ```
+    fn emit_local_assign(
+        &mut self,
+        name: &str,
+        value: &Expr,
+    ) -> Result<(), CodegenError> {
+        let lookup = self.lookup_local_with_storage(name);
+        let (ptr, ir_ty) = match lookup {
+            Some((ptr, ir_ty, LocalStorage::Stack)) => (ptr, ir_ty),
+            Some((_, _, LocalStorage::Ssa)) => {
+                // Defensive: if codegen sees Assign on an SSA-direct
+                // binding, the resolver should have rejected it
+                // upstream. Surface a structured error so the user
+                // sees a meaningful message even if upstream gates
+                // are bypassed.
+                return Err(CodegenError::NotYetImplemented {
+                    what: "Assign on an immutable local (resolver should have caught this; please file a bug)",
+                });
+            }
+            None => {
+                return Err(CodegenError::UnresolvedName {
+                    name: name.to_owned(),
+                });
+            }
+        };
+        let v = self.emit_expr(value)?;
+        writeln!(
+            &mut self.out,
+            "  store {ir_ty} {v}, {ir_ty}* {ptr}",
+        )
+        .ok();
+        Ok(())
+    }
+
     /// Array sources (`sigma x in &arr`) need the slice-indexing
     /// infrastructure and land in a future slice.
     fn emit_sigma(
@@ -1998,6 +2135,9 @@ impl<'a> Emitter<'a> {
             name: var.to_owned(),
             value: i_name.clone(),
             ir_type: ir_ty.clone(),
+            // sigma loop variables are always immutable (the loop
+            // controls the iteration; the body cannot rebind it).
+            storage: LocalStorage::Ssa,
         });
 
         // Emit body statements. We don't reuse `emit_block` here
@@ -2451,19 +2591,29 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn lookup_local(&self, name: &str) -> Option<&str> {
-        // Search in reverse so inner-scope shadowing wins.
-        self.locals
-            .iter()
-            .rev()
-            .find_map(|b| if b.name == name { Some(b.value.as_str()) } else { None })
-    }
-
     fn lookup_local_ir_type(&self, name: &str) -> Option<String> {
         self.locals
             .iter()
             .rev()
             .find_map(|b| if b.name == name { Some(b.ir_type.clone()) } else { None })
+    }
+
+    /// Slice 12: look up a local and return its `(value, ir_type,
+    /// storage)` triple. Used by `ExprKind::Path` lowering to
+    /// dispatch on whether the binding is SSA-direct or stack-
+    /// allocated. Returns owned `String`s so callers don't need to
+    /// borrow `self` while emitting subsequent IR.
+    fn lookup_local_with_storage(
+        &self,
+        name: &str,
+    ) -> Option<(String, String, LocalStorage)> {
+        self.locals.iter().rev().find_map(|b| {
+            if b.name == name {
+                Some((b.value.clone(), b.ir_type.clone(), b.storage))
+            } else {
+                None
+            }
+        })
     }
 
     fn lower_return_type(&mut self, ret: Option<&TypeExpr>) -> String {
@@ -5075,6 +5225,280 @@ mod tests {
         assert_eq!(info.state_tag("A"), Some(0));
         assert_eq!(info.state_tag("B"), Some(1));
         assert_eq!(info.state_tag("C"), None);
+    }
+
+    // ─── Slice 12: local mutable re-assignment ───────────────────────────
+
+    #[test]
+    fn s12_let_mut_emits_alloca_and_initial_store() {
+        // `let mut x: u32 = 5u32;` lowers to `alloca i32` + `store
+        // i32 5, i32* %ptr`. Reads of `x` after this point load
+        // through the pointer.
+        let src = "@fn t() -> u32 { let mut x: u32 = 5u32; return x; }";
+        let ir = lower_str(src).expect("lower let-mut");
+        // Alloca for the stack slot.
+        assert!(
+            ir.contains("= alloca i32"),
+            "expected alloca i32; got:\n{ir}"
+        );
+        // Initial store of 5.
+        assert!(
+            ir.contains("store i32 5, i32*"),
+            "expected initial store; got:\n{ir}"
+        );
+        // Read on `return x` becomes a load.
+        assert!(
+            ir.contains("load i32, i32*"),
+            "expected load on read; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s12_immutable_let_keeps_ssa_direct_lowering() {
+        // `let x: u32 = 5u32;` (no `mut`) keeps the slice-1 path:
+        // no alloca, no load. The slice-1 `bind_via_identity`
+        // helper does emit an `add 0` to give the binding a stable
+        // SSA name, so the literal `5` survives as a constant
+        // operand of the add (not the literal of the return).
+        let src = "@fn t() -> u32 { let x: u32 = 5u32; return x; }";
+        let ir = lower_str(src).expect("lower immutable let");
+        assert!(
+            !ir.contains("alloca"),
+            "immutable let should not allocate; got:\n{ir}"
+        );
+        assert!(
+            !ir.contains("load i32"),
+            "immutable let should not load; got:\n{ir}"
+        );
+        // The bind_via_identity SSA name is what `ret` uses; `5`
+        // appears as the constant operand of the add.
+        assert!(
+            ir.contains("add i32 0, 5"),
+            "expected bind_via_identity add of 5; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s12_assign_emits_store_to_alloca() {
+        // `x = 7u32;` lowers to `store i32 7, i32* <ptr>`.
+        let src = "\
+            @fn t() -> u32 {\n  \
+              let mut x: u32 = 5u32;\n  \
+              x = 7u32;\n  \
+              return x;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower assign");
+        // Two stores: initial and assigned. Both go to the same
+        // alloca pointer.
+        assert!(
+            ir.contains("store i32 5, i32*"),
+            "expected initial store; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("store i32 7, i32*"),
+            "expected assignment store; got:\n{ir}"
+        );
+        assert_eq!(
+            ir.matches("store i32").count(),
+            2,
+            "expected exactly 2 stores; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s12_accumulator_pattern_in_sigma_body() {
+        // Slice 12 + slice 11 interaction: a `let mut` accumulator
+        // updated inside a sigma body. This is the canonical
+        // "sum of i for i in 0..N" pattern that wasn't expressible
+        // pre-slice-12.
+        let src = "\
+            @fn sum_to_n(n: u32) -> u32 {\n  \
+              let mut total: u32 = 0u32;\n  \
+              sigma i in 0u32..n {\n    \
+                total = total + i;\n  \
+              }\n  \
+              return total;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower accumulator pattern");
+        // Total has an alloca.
+        assert!(
+            ir.contains("alloca i32"),
+            "expected alloca for total; got:\n{ir}"
+        );
+        // Inside the body, total is loaded, added to sigma.i, then
+        // stored back.
+        assert!(
+            ir.contains("load i32, i32*"),
+            "expected load of total in body; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("add i32"),
+            "expected add for total + i; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("store i32"),
+            "expected store back to total; got:\n{ir}"
+        );
+        // Loop var is referenced inside the body.
+        assert!(
+            ir.contains("%sigma.i.0"),
+            "expected sigma loop var reference; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s12_assign_to_immutable_let_rejected_by_resolver() {
+        // `let x = 5; x = 7;` — the resolver should reject this
+        // with E0410 (AssignToImmutable).
+        let src = "@fn t() { let x: u32 = 5u32; x = 7u32; return; }";
+        let tokens = tokenize(src).expect("tokenize");
+        let program = parse(&tokens).expect("parse");
+        let result = resolve(&program);
+        assert!(
+            result.is_err(),
+            "expected resolver to reject assign-to-immutable"
+        );
+        if let Err(errs) = result {
+            let saw_e0410 = errs.iter().any(|e| {
+                let s = format!("{e}");
+                s.contains("E0410") && s.contains("immutable")
+            });
+            assert!(
+                saw_e0410,
+                "expected E0410 with 'immutable'; got {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn s12_assign_to_let_short_rejected_by_resolver() {
+        // `let x := 5; x = 7;` — short binding is always
+        // immutable; resolver rejects re-assignment.
+        let src = "@fn t() { let x := 5u32; x = 7u32; return; }";
+        let tokens = tokenize(src).expect("tokenize");
+        let program = parse(&tokens).expect("parse");
+        let result = resolve(&program);
+        assert!(
+            result.is_err(),
+            "expected resolver to reject assign-to-let-short"
+        );
+    }
+
+    #[test]
+    fn s12_assign_to_param_rejected_by_resolver() {
+        // Parameters are immutable from the body's perspective.
+        let src = "@fn t(x: u32) { x = 7u32; return; }";
+        let tokens = tokenize(src).expect("tokenize");
+        let program = parse(&tokens).expect("parse");
+        let result = resolve(&program);
+        assert!(
+            result.is_err(),
+            "expected resolver to reject assign-to-param"
+        );
+    }
+
+    #[test]
+    fn s12_assign_to_sigma_var_rejected_by_resolver() {
+        // sigma loop variables are immutable.
+        let src = "\
+            @fn t() {\n  \
+              sigma i in 0u32..4u32 {\n    \
+                i = 7u32;\n  \
+              }\n  \
+              return;\n\
+            }\n\
+        ";
+        let tokens = tokenize(src).expect("tokenize");
+        let program = parse(&tokens).expect("parse");
+        let result = resolve(&program);
+        assert!(
+            result.is_err(),
+            "expected resolver to reject assign-to-sigma-var"
+        );
+    }
+
+    #[test]
+    fn s12_assign_to_undefined_local_rejected_by_resolver() {
+        // `x = 5;` with no `x` in scope — UndefinedName.
+        let src = "@fn t() { x = 5u32; return; }";
+        let tokens = tokenize(src).expect("tokenize");
+        let program = parse(&tokens).expect("parse");
+        let result = resolve(&program);
+        assert!(
+            result.is_err(),
+            "expected resolver to reject undefined local"
+        );
+        if let Err(errs) = result {
+            let saw_undef = errs.iter().any(|e| {
+                let s = format!("{e}");
+                s.contains("E0402") && s.contains("undefined")
+            });
+            assert!(
+                saw_undef,
+                "expected E0402 undefined; got {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn s12_multiple_assigns_to_same_local() {
+        // Sequential reassignments emit one store per assign.
+        let src = "\
+            @fn t() -> u32 {\n  \
+              let mut x: u32 = 1u32;\n  \
+              x = 2u32;\n  \
+              x = 3u32;\n  \
+              return x;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower multiple assigns");
+        // Three stores: initial + two assigns.
+        assert_eq!(
+            ir.matches("store i32").count(),
+            3,
+            "expected 3 stores; got:\n{ir}"
+        );
+        // The final return loads through the alloca.
+        assert!(
+            ir.contains("load i32, i32*"),
+            "expected load on return; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s12_let_mut_does_not_affect_sibling_immutable_let() {
+        // A `let mut` doesn't change how a separate immutable
+        // `let` is lowered — they're independent bindings.
+        let src = "\
+            @fn t() -> u32 {\n  \
+              let a: u32 = 1u32;\n  \
+              let mut b: u32 = 2u32;\n  \
+              b = 3u32;\n  \
+              return a;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower mixed bindings");
+        // Exactly one alloca (for `b`), even though both bindings
+        // have the same IR type. `a` stays SSA-direct.
+        assert_eq!(
+            ir.matches("alloca i32").count(),
+            1,
+            "expected exactly one alloca; got:\n{ir}"
+        );
+        // Two stores (for b: initial + reassign).
+        assert_eq!(
+            ir.matches("store i32").count(),
+            2,
+            "expected exactly two stores (b only); got:\n{ir}"
+        );
+        // No load on the return path — `a` is SSA-direct so the
+        // bind_via_identity SSA name is returned without a load.
+        assert!(
+            !ir.contains("load i32"),
+            "immutable `a` must not need a load; got:\n{ir}"
+        );
     }
 
     // ─── Slice 11: sigma loops (Decision #14 / §5.8) ─────────────────────

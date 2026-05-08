@@ -1852,6 +1852,17 @@ impl<'a> Inferer<'a> {
                 let _ = self.infer_expr(ptr);
                 let _ = self.infer_expr(value);
             }
+            // Slice 12: `name = expr;` — local mutable re-assignment.
+            // We just type the RHS so any references inside it are
+            // recorded; the resolver already enforced mutability and
+            // existence of `name`. Type-mismatch checks (assigning a
+            // u32 to an i64-typed local) are deferred to a later
+            // slice that adds an explicit assignment-compatibility
+            // check; for now, codegen will surface a NotYetImplemented
+            // if the IR types mismatch.
+            StmtKind::Assign { value, .. } => {
+                let _ = self.infer_expr(value);
+            }
             // Decision #14 / §5.8: `sigma var in source { body }`.
             //
             // The loop variable's type is the range-source's element

@@ -1882,8 +1882,26 @@ impl<'t> Parser<'t> {
             TokenKind::Ident(_) if self.is_mutate_short_stmt() => {
                 self.parse_mutate_short_stmt(start)
             }
+            // Slice 12: `name = expr;` — local mutable re-assignment.
+            // Distinct from mutate-short by the absence of a `.` after
+            // the leading ident. Must be checked AFTER mutate-short
+            // to give that one priority on `Auto.field = …`.
+            TokenKind::Ident(_) if self.is_local_assign_stmt() => {
+                self.parse_local_assign_stmt(start)
+            }
             _ => self.parse_expr_stmt(start),
         }
+    }
+
+    /// Lookahead-only: returns true if the current position starts a
+    /// `name = expr;` local re-assignment per slice 12. Pattern is
+    /// `Ident =` with the assignment op being `=` exactly (compound
+    /// `+=` / `-=` / etc. on locals are deferred).
+    fn is_local_assign_stmt(&self) -> bool {
+        if !matches!(self.peek().kind, TokenKind::Ident(_)) {
+            return false;
+        }
+        matches!(self.peek_offset(1).kind, TokenKind::Eq)
     }
 
     /// Lookahead-only: returns true if the current position starts a
@@ -2128,6 +2146,20 @@ impl<'t> Parser<'t> {
         };
         Ok(Stmt {
             kind,
+            span: Span::new(start, close.end),
+        })
+    }
+
+    /// Parse `name = expr;` — local mutable re-assignment (slice 12).
+    /// Caller has already verified the lookahead via
+    /// [`Self::is_local_assign_stmt`].
+    fn parse_local_assign_stmt(&mut self, start: usize) -> Result<Stmt, ParseError> {
+        let (name, _) = self.expect_ident("local name on the left of `=`")?;
+        self.expect(TokenKind::Eq, "`=` after local name")?;
+        let value = self.parse_expr()?;
+        let close = self.expect(TokenKind::Semi, "`;` to terminate assignment statement")?;
+        Ok(Stmt {
+            kind: StmtKind::Assign { name, value },
             span: Span::new(start, close.end),
         })
     }
@@ -6315,6 +6347,45 @@ mod tests {
                 }
             }
             other => panic!("expected Fn at index 1, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn local_assign_basic_form() {
+        // `x = 5u32;` — single-ident LHS, expr RHS, semicolon.
+        let stmt = parse_stmt_str("x = 5u32;");
+        match &stmt.kind {
+            StmtKind::Assign { name, value } => {
+                assert_eq!(name, "x");
+                assert!(matches!(value.kind, ExprKind::IntLit(_)));
+            }
+            other => panic!("expected Assign, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn local_assign_does_not_collide_with_mutate_short() {
+        // `Auto.field = expr;` should still parse as MutateShort,
+        // not as Assign on `Auto`. The dispatch checks mutate-short
+        // first.
+        let stmt = parse_stmt_str("Counter.value = 5u32;");
+        assert!(
+            matches!(stmt.kind, StmtKind::MutateShort { .. }),
+            "expected MutateShort, got {:?}",
+            stmt.kind
+        );
+    }
+
+    #[test]
+    fn local_assign_with_complex_rhs() {
+        // RHS is an arbitrary expression, parsed via parse_expr.
+        let stmt = parse_stmt_str("total = total + i;");
+        match &stmt.kind {
+            StmtKind::Assign { name, value } => {
+                assert_eq!(name, "total");
+                assert!(matches!(value.kind, ExprKind::Binary { .. }));
+            }
+            other => panic!("expected Assign with binary RHS, got {:?}", other),
         }
     }
 

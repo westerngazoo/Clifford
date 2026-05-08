@@ -167,6 +167,29 @@ pub enum ResolveError {
         /// Byte offset of the reference.
         at: usize,
     },
+
+    /// A `name = expr;` local re-assignment (slice 12) targets a
+    /// binding that isn't `let mut`-mutable. Re-assignment is
+    /// rejected for:
+    /// - `let name = …` (immutable explicit `let`)
+    /// - `let name := …` (Decision #8 short binding; always immutable)
+    /// - `name: T` parameters (immutable by default; spec rejects
+    ///   `mut name: T` parameters too — params are always immutable
+    ///   from the body's perspective)
+    /// - `sigma name in …` loop variables (always immutable per
+    ///   §5.8 — the bound is fixed for the iteration)
+    ///
+    /// Diagnostics name the binding's flavour so the user knows
+    /// what to change.
+    #[error("E0410: cannot assign to `{name}` at byte {at}: it is {kind} (declare it with `let mut {name}: T = …` to allow re-assignment)")]
+    AssignToImmutable {
+        /// The binding being re-assigned.
+        name: String,
+        /// Human-readable description of the binding's flavour.
+        kind: &'static str,
+        /// Byte offset of the assignment statement.
+        at: usize,
+    },
 }
 
 /// Which kind of top-level item a [`Symbol`] refers to.
@@ -1065,6 +1088,57 @@ impl<'a> Walker<'a> {
                     self.walk_stmt(s);
                 }
                 self.pop_scope();
+            }
+            // Slice 12: `name = expr;` — local mutable re-assignment.
+            // Walk the RHS first so any references in it resolve in
+            // the OUTER scope (consistent with let-stmt semantics).
+            // Then check that `name` resolves to a mutable binding;
+            // surface E0410 if not.
+            StmtKind::Assign { name, value } => {
+                self.walk_expr(value);
+                let lookup = self.lookup_local(name);
+                match lookup {
+                    Some(b) => {
+                        let mutable = matches!(
+                            b.kind,
+                            LocalKind::Let { mutable: true, .. }
+                        );
+                        if !mutable {
+                            let kind_str = match b.kind {
+                                LocalKind::Let { mutable: false, .. } => {
+                                    "an immutable `let` binding"
+                                }
+                                LocalKind::LetShort => {
+                                    "a `let :=` short binding (always immutable)"
+                                }
+                                LocalKind::Param { .. } => {
+                                    "a function parameter (parameters are immutable)"
+                                }
+                                LocalKind::Sigma => {
+                                    "a `sigma` loop variable (always immutable)"
+                                }
+                                LocalKind::Let { mutable: true, .. } => {
+                                    unreachable!()
+                                }
+                            };
+                            self.errors.push(ResolveError::AssignToImmutable {
+                                name: name.clone(),
+                                kind: kind_str,
+                                at: stmt.span.start,
+                            });
+                        }
+                    }
+                    None => {
+                        // Name doesn't resolve to a local at all.
+                        // Surface as UndefinedName so the diagnostic
+                        // matches what the user gets for any other
+                        // reference to a missing local.
+                        self.errors.push(ResolveError::UndefinedName {
+                            name: name.clone(),
+                            at: stmt.span.start,
+                        });
+                    }
+                }
             }
             // `Stmt` is `#[non_exhaustive]`. Forward-compat: new statement
             // kinds default to "no body work." Add an explicit arm when the

@@ -7,6 +7,173 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 12: local mutable re-assignment (2026-05-15)
+
+Adds the missing piece between `let mut` (already parseable but
+codegen-unused) and the firmware patterns that need a stack-allocated
+mutable local: `name = expr;`. Closes the friction that blocked the
+`sum_signed_range` example in slice 11 and is the prerequisite for
+`if`/`match` (whose bodies need to mutate locals).
+
+**The headline shape — accumulator pattern that matches the spec's
+"bog-standard local" phrasing:**
+
+```clifford
+@fn sum_signed_range() -> i32 #mutates: [] {
+  let mut total: i32 = 0i32;
+  sigma i in -5i32..=5i32 {
+    total = total + i;
+  }
+  return total;
+}
+```
+
+→
+
+```llvm
+define i32 @sum_signed_range() {
+entry:
+  %tmp.0 = alloca i32                ; stack slot for `total`
+  store i32 0, i32* %tmp.0           ; let mut total = 0
+  %tmp.1 = sub i32 0, 5              ; lo = -5
+  br label %sigma.header.0
+sigma.header.0:
+  %sigma.i.0 = phi i32 [ %tmp.1, %entry ], [ %sigma.i_next.0, %sigma.body.0 ]
+  %sigma.cond.0 = icmp sle i32 %sigma.i.0, 5
+  br i1 %sigma.cond.0, label %sigma.body.0, label %sigma.exit.0
+sigma.body.0:
+  %tmp.2 = load i32, i32* %tmp.0     ; load total
+  %tmp.3 = add i32 %tmp.2, %sigma.i.0 ; total + i
+  store i32 %tmp.3, i32* %tmp.0      ; total = …
+  %sigma.i_next.0 = add nsw i32 %sigma.i.0, 1
+  br label %sigma.header.0
+sigma.exit.0:
+  %tmp.4 = load i32, i32* %tmp.0     ; return total
+  ret i32 %tmp.4
+}
+```
+
+The `let mut` triggers an `alloca`; every read of the local emits a
+`load` through the alloca pointer; every assignment emits a `store`.
+Immutable `let` bindings keep their slice-1 SSA-direct lowering — no
+behavioural change for code that doesn't use `mut`.
+
+**Pipeline changes (5 crates):**
+
+- **`clifford-ast`**: new `StmtKind::Assign { name, value }` variant.
+  Distinct from `Mutate` / `MutateShort` (which target automaton
+  fields). v0.1 scope: single-ident LHS only; tuple destructuring
+  and `local.field = …` deferred.
+- **`clifford-parser`**: new `parse_local_assign_stmt` recognises
+  `Ident = expr;`. Wired into `parse_stmt` dispatch AFTER the
+  mutate-short check so `Auto.field = expr;` continues to win
+  (mutate-short has a `.` between two idents). Three new tests
+  cover the basic form, no-collision-with-mutate-short, and
+  complex-RHS cases.
+- **`clifford-resolve`**: new `ResolveError::AssignToImmutable`
+  (E0410) with a description of which flavour of binding was
+  targeted (immutable `let`, `let :=`, parameter, `sigma`-loop
+  var). `walk_stmt` arm for `Assign` walks the RHS in the outer
+  scope (for free-ref resolution), then verifies the LHS resolves
+  to a `let mut` binding via `lookup_local`. UndefinedName for
+  unknown locals.
+- **`clifford-types`**: new `walk_stmt` arm types the RHS so any
+  references inside it are recorded; assignment-compatibility
+  checks (assigning a u32 to an i64 local) are deferred to a later
+  slice — codegen will surface a NotYetImplemented if the IR types
+  mismatch.
+- **`clifford-codegen`**: this slice's heavy lifting.
+
+**Codegen detail:**
+
+- New `LocalStorage { Ssa, Stack }` enum and a `storage` field on
+  `LocalBinding`. `Ssa` (the slice-1 default) means the binding's
+  `value` field IS the SSA name holding the value; `Stack` means
+  it's an alloca-produced pointer that reads/writes go through.
+- All five `LocalBinding` construction sites (params on `@fn` /
+  `#effect` / `#interrupt`, the sigma loop var, and the immutable
+  `let` / `let :=` paths) now record `storage: LocalStorage::Ssa`.
+  Only `let mut` records `LocalStorage::Stack`.
+- `StmtKind::Let` arm now branches on `*mutable`. For `let mut`:
+  - Emit `<ptr> = alloca <ir_ty>`
+  - Emit `store <ir_ty> <v>, <ir_ty>* <ptr>` for the initial value
+  - Push a `LocalBinding` with `storage = Stack` and the alloca
+    pointer as `value`.
+  For immutable `let`: keep the slice-1 `bind_via_identity` path
+  unchanged.
+- `ExprKind::Path` lowering now dispatches on `LocalStorage`:
+  - `Ssa`: return the SSA name directly (slice-1 path).
+  - `Stack`: emit `<val> = load <ir_ty>, <ir_ty>* <ptr>` and
+    return the loaded SSA name.
+- `StmtKind::Assign` arm calls new `emit_local_assign` which
+  looks up the binding's storage, emits the RHS, and emits
+  `store <ir_ty> <v>, <ir_ty>* <ptr>`. Defensive `NotYetImplemented`
+  if the binding is somehow SSA-direct (the resolver should have
+  rejected the case upstream; the defensive arm only fires if
+  upstream gates are bypassed).
+- New `lookup_local_with_storage` helper returns
+  `(value, ir_type, storage)` triple as owned strings so callers
+  don't borrow `self` while emitting follow-up IR. Replaces the
+  unused `lookup_local` (deleted).
+
+**Why the resolver enforces mutability rather than codegen:** the
+upstream gate is the right place — diagnostics there get the source
+span, the binding's `def_span`, and the original declaration kind
+in the AST. Codegen would have to plumb all that just to produce
+the same error. Routing the check through the resolver also keeps
+codegen free of policy decisions ("which binding kinds can be
+assigned?") — that lives entirely in the resolver's E0410 arm.
+
+**Deferred:**
+
+- Compound-assignment statements on locals (`x += 1u32;`,
+  `x &= 0xFFu32;`) — would need parser + AST + codegen work. The
+  workaround `x = x + 1u32;` works today.
+- Tuple destructuring (`(a, b) = …`).
+- Field-of-local assignment (`local.field = …`) — requires path-
+  expression LHS in the AST.
+- Assignment-compatibility check in the type checker (today only
+  surfaced indirectly via codegen IR-type mismatch).
+- Mem2reg / SROA optimisation hints — LLVM's standard passes do
+  the right thing, so this is purely cosmetic.
+
+**Tests added:** 3 parser + 11 codegen = **14 new tests**.
+
+*Parser (3):*
+- `local_assign_basic_form` — `x = 5u32;` parses correctly.
+- `local_assign_does_not_collide_with_mutate_short` —
+  `Counter.value = 5u32;` still parses as MutateShort.
+- `local_assign_with_complex_rhs` — `total = total + i;` parses
+  with a Binary RHS.
+
+*Codegen (11):*
+- `s12_let_mut_emits_alloca_and_initial_store` — alloca + store +
+  load on read.
+- `s12_immutable_let_keeps_ssa_direct_lowering` — no alloca, no
+  load; `bind_via_identity`'s `add 0, 5` survives.
+- `s12_assign_emits_store_to_alloca` — exactly two stores
+  (initial + assign).
+- `s12_accumulator_pattern_in_sigma_body` — the spec's bog-
+  standard accumulator pattern: `let mut total = 0; sigma i in 0..n
+  { total = total + i; }` lowers to load-add-store inside the body.
+- `s12_assign_to_immutable_let_rejected_by_resolver` — E0410.
+- `s12_assign_to_let_short_rejected_by_resolver` — E0410.
+- `s12_assign_to_param_rejected_by_resolver` — E0410.
+- `s12_assign_to_sigma_var_rejected_by_resolver` — E0410.
+- `s12_assign_to_undefined_local_rejected_by_resolver` — E0402.
+- `s12_multiple_assigns_to_same_local` — three sequential
+  assigns produce three stores plus a final load.
+- `s12_let_mut_does_not_affect_sibling_immutable_let` — exactly
+  one alloca, no loads on the immutable-`let` return path.
+
+Plus the `examples/buffer_init_sigma.cl` example was extended
+with a `sum_signed_range` effect demonstrating the canonical
+local-mut accumulator pattern. End-to-end smoke verified.
+
+Total codegen tests: **153** (142 pre-slice-12 + 11 new). Total
+parser tests: **238** (235 pre-slice-12 + 3 new). All green;
+clippy clean across the workspace.
+
 ### Added — Slice 11: sigma loops (Decision #14 / §5.8) (2026-05-14)
 
 The first language-feature slice that crosses the entire pipeline.
