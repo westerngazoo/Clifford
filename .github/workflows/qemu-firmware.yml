@@ -40,13 +40,16 @@ jobs:
 
       # clang ships with the LLVM ARM backend on Ubuntu 22.04+,
       # so no separate cross-binutils install is required for
-      # the cross-compile + link path. qemu-system-arm includes
-      # the lm3s6965evb board model.
-      - name: Install cross toolchain (clang + qemu-system-arm)
+      # the cross-compile path. We use `lld` (target-aware out
+      # of the box, no sysroot needed) for linking instead of
+      # the default ld.bfd which can't handle thumbv7m ELF.
+      # qemu-system-arm includes the lm3s6965evb board model.
+      - name: Install cross toolchain (clang + lld + qemu-system-arm)
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             clang \
+            lld \
             llvm \
             qemu-system-arm
 

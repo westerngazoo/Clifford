@@ -40,12 +40,16 @@ SECTIONS
     } > FLASH
 
     /* .data is initialized at boot by Reset_Handler copying
-     * from FLASH (`_data_load_start`) to SRAM (`_data_start`). */
-    .data : AT (LOADADDR(.text) + SIZEOF(.text) + SIZEOF(.rodata)) {
+     * from FLASH (`_data_load_start`) to SRAM (`_data_start`).
+     * `> SRAM AT > FLASH` is the canonical way to ask the linker
+     * to place the section's run-time address in SRAM and its
+     * load-time image in FLASH; we then capture the load address
+     * via `LOADADDR(.data)` for the startup copy. */
+    .data : {
         _data_start = .;
         *(.data*)
         _data_end = .;
-    } > SRAM
+    } > SRAM AT > FLASH
     _data_load_start = LOADADDR(.data);
 
     /* .bss is zeroed at boot by Reset_Handler. */

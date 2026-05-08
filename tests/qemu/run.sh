@@ -26,6 +26,19 @@ BUILD_DIR="${SCRIPT_DIR}/build"
 mkdir -p "${BUILD_DIR}"
 cd "${BUILD_DIR}"
 
+# ─── 0. Pre-flight: verify required tools are on PATH ─────────────────
+need() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        echo "error: required tool '$1' is not on PATH" >&2
+        echo "       install via 'apt install ${2:-$1}' on Ubuntu" >&2
+        exit 127
+    fi
+}
+need cargo            cargo
+need clang            clang
+need ld.lld           lld
+need qemu-system-arm  qemu-system-arm
+
 # ─── 1. Compile the Clifford source ───────────────────────────────────
 echo "==> cliffordc compile firmware_smoke.cl"
 (cd "${REPO_ROOT}" && cargo run --quiet -p clifford-cli -- \
@@ -46,13 +59,32 @@ CFLAGS=(
 )
 
 echo "==> clang ${TARGET} on .ll, .c sources"
-clang "${CFLAGS[@]}" -c "${BUILD_DIR}/firmware_smoke.ll" -o "${BUILD_DIR}/firmware_smoke.o"
-clang "${CFLAGS[@]}" -c "${SCRIPT_DIR}/startup.c"        -o "${BUILD_DIR}/startup.o"
-clang "${CFLAGS[@]}" -c "${SCRIPT_DIR}/harness.c"        -o "${BUILD_DIR}/harness.o"
+# cliffordc doesn't yet emit `target triple` / `target datalayout`
+# in the .ll header (deferred to a future slice with a CLI
+# `--target` flag). To keep clang from substituting the host's
+# datalayout — which would break struct layouts and pointer
+# arithmetic on Cortex-M — we prepend the canonical
+# thumbv7m-none-eabi triple + datalayout before compiling.
+TRIPLE='thumbv7m-none-eabi'
+DATALAYOUT='e-m:e-p:32:32-Fi8-i64:64-v128:64:128-a:0:32-n32-S64'
+{
+    echo 'target triple = "'"${TRIPLE}"'"'
+    echo 'target datalayout = "'"${DATALAYOUT}"'"'
+    cat "${BUILD_DIR}/firmware_smoke.ll"
+} > "${BUILD_DIR}/firmware_smoke.targeted.ll"
+
+clang "${CFLAGS[@]}" -c "${BUILD_DIR}/firmware_smoke.targeted.ll" -o "${BUILD_DIR}/firmware_smoke.o"
+clang "${CFLAGS[@]}" -c "${SCRIPT_DIR}/startup.c"                  -o "${BUILD_DIR}/startup.o"
+clang "${CFLAGS[@]}" -c "${SCRIPT_DIR}/harness.c"                  -o "${BUILD_DIR}/harness.o"
 
 # ─── 4. Link with the Cortex-M layout ─────────────────────────────────
+# Use lld via `-fuse-ld=lld`. The default linker (ld.bfd) on
+# Ubuntu doesn't understand thumbv7m ELF without a sysroot;
+# lld is target-aware out of the box and ships in the `lld`
+# apt package.
 echo "==> link app.elf"
 clang "${CFLAGS[@]}" \
+    -fuse-ld=lld \
     -T "${SCRIPT_DIR}/link.ld" \
     -Wl,--gc-sections \
     "${BUILD_DIR}/firmware_smoke.o" \
