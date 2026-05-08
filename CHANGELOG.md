@@ -7,6 +7,124 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — `clifford-ortho` v0.2-γ: `@sequential(A, B)` consumption (Decision #11) (2026-05-08)
+
+The verifier now consumes `@sequential(A, B);` top-level
+attributes per Decision #11. When the user declares two
+automatons sequential, the engine suppresses the orthogonality
+check for any pair where one callable touches `A` and the other
+touches `B`. Per spec §7.0.1 the assertion is *trusted* — the
+compiler does not verify that A and B truly never run
+concurrently.
+
+**The behaviour doc.** Because `@sequential` has subtle
+semantics — what counts as "touching" an automaton, what cases
+it doesn't help with, the relationship to v0.2-β's read-write
+detection — this slice ships
+**`docs/ortho-sequential-attribute.md`**: a focused behaviour
+note explaining what the attribute does, what it doesn't, the
+trust model, and worked examples. The doc is grounded in the
+actual implementation (every claim cross-references the helper
+in `crates/ortho/src/lib.rs`) and the test corpus
+(`sequential_attr_*` and `is_pair_sequential_*`).
+
+**Implementation:**
+
+- New `collect_sequential_pairs(program) -> HashSet<(String,
+  String)>` walks `Item::Sequential(_)` items and
+  canonicalises pairs to `(lo, hi)` alphabetical order so
+  `@sequential(A, B)` and `@sequential(B, A)` produce the same
+  entry per spec §2.6's symmetry.
+- New `node_touches(node, profiles)` returns the
+  `actual_automata` set for an effect or interrupt, treating
+  `@fn`s as touching nothing (they have no mutation profile).
+- New `is_pair_sequential(a, b, profiles, pairs)` walks the
+  cross-product of the two callables' touch sets against the
+  declared sequential pairs. Skips entries where the
+  automaton names match (same-automaton sequentiality is
+  meaningless per Decision #5 — automatons are inherently
+  self-sequential).
+- `verify` calls `is_pair_sequential` after `can_concur` and
+  before the wedge check; matching pairs are skipped silently.
+
+**What `@sequential` covers (per the behaviour doc):**
+
+- Two callables on different automatons that share a basis bit
+  (currently only possible for trait-basis bits in v0.2-α; will
+  matter for `#shared` fields in v0.7+ per Decision #21).
+- Documentary use: capturing the user's design intent that two
+  automatons run on disjoint scheduler tasks, even when the
+  basis bits are already disjoint.
+
+**What `@sequential` deliberately does NOT cover:**
+
+- Same-automaton concurrency. `@sequential(A, A)` is ignored
+  because automaton `A`'s transitions are inherently sequential
+  within `A` per Decision #5.
+- Read-only callables. A callable that only READS from `A`
+  doesn't have `A` in its `actual_automata` set, so
+  `@sequential` clauses involving `A` won't apply to it. The
+  SPSC consumer-side race that v0.2-β rejected on
+  `dual_uart_telemetry.cl` is exactly this case — the routes
+  to safety remain `#atomic` (§6.6) or `@snapshot` (Decision
+  #24 / ADR 0004), both of which are deferred.
+- Transitive sequentiality. `@sequential(A, B)` plus
+  `@sequential(B, C)` does not imply `@sequential(A, C)` —
+  each pair must be declared explicitly.
+
+**Files added:**
+
+- `docs/ortho-sequential-attribute.md` — the behaviour doc.
+- `examples/sequential_attribute_demo.cl` — small program
+  exercising the attribute. Compiles cleanly via the standard
+  CLI pipeline.
+
+**Tests added: 9 in ortho (36 → 45).**
+
+- `sequential_attr_suppresses_violation_between_two_automatons`
+  — disjoint + `@sequential` → still passes (no regression).
+- `sequential_attr_silences_violation_when_automatons_share_state`
+  — two effects on same automaton → already orthogonal via
+  Decision #5; `@sequential` is a no-op here.
+- `sequential_attr_suppresses_real_cross_automaton_interrupt_pair`
+  — effect on `A` + interrupt on `B` with `@sequential(A, B)` —
+  passes as expected.
+- `is_pair_sequential_returns_true_when_attribute_present` —
+  direct unit test on the helper.
+- `is_pair_sequential_handles_reverse_order_in_attribute` —
+  symmetry: `@sequential(B, A)` canonicalises to `(A, B)`.
+- `is_pair_sequential_returns_false_without_attribute`.
+- `sequential_attr_does_not_suppress_same_automaton_pair` —
+  `@sequential(C, C)` doesn't suppress real same-automaton
+  write-write races.
+- `collect_sequential_pairs_deduplicates_symmetric_declarations`.
+- `collect_sequential_pairs_handles_multiple_distinct_pairs`.
+
+**Pipeline regression checked.** All 6 prior examples plus the
+new `sequential_attribute_demo.cl` compile cleanly through
+the v0.2-γ verifier.
+
+**Deferred to subsequent ortho slices:**
+
+- **`#atomic: interrupt_critical` annotation** (§6.6).
+  Wraps a body in CLI/STI; turns the body's reads into safe
+  atomic ones for orthogonality purposes. Would unblock the
+  SPSC consumer-side pattern.
+- **`@snapshot Auto.field` codegen** (Decision #24 / ADR
+  0004). Lets foreground readers copy state into a private
+  local before reading.
+- **`#priority`-aware concurrency inference**. Currently the
+  verifier conservatively pairs every interrupt with every
+  other interrupt regardless of priority. A future slice could
+  use NVIC priority semantics to refine the matrix, reducing
+  the need for `@sequential` in many real programs.
+- **`#basis` override clauses** (Decision #4 rule 2).
+- **Property tests via `proptest`** per CLAUDE.md §4.1
+  (toolchain pin still blocks).
+
+Total ortho tests: **45** (36 pre-v0.2-γ + 9 new). Workspace
+clean; clippy clean.
+
 ### Added — `clifford-ortho` v0.2-β: read-write race detection (§7.2 graded algebra) (2026-05-08)
 
 Extends the §7 verifier from "write-write only" (v0.2-α) to the
