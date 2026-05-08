@@ -1,29 +1,47 @@
-// dual_uart_telemetry.cl — multi-producer telemetry buffer
+// dual_uart_telemetry.cl — multi-producer telemetry, ISR side
 //
 // Two UART RX interrupts (the producers) record incoming bytes into a
-// shared telemetry automaton. The foreground task (the consumer)
-// reads the totals and the most-recently-seen byte. The cross-context
-// handoff is correct by virtue of:
+// shared `Telemetry` automaton. Each ISR touches *strictly disjoint*
+// fields — `bytes_uartN` / `last_byte_uartN` — so the §7 GA
+// orthogonality engine proves no write-write race.
 //
-// 1. Decision #22 traits (publication ordering):
-//      producers: $ [Release] on each tally transition  →  fence release
-//      consumer:  $ [Acquire] on the drain effect       →  fence acquire
+// What this sample exercises (across slices 1-13):
+//   - register-block automatons + volatile MMIO reads       (slice 4)
+//   - multi-state automaton + state-tag dispatch            (slice 9)
+//   - transition `-> Dest` writes the destination tag       (slice 9)
+//   - $ [Release] memory-ordering fence on each tally       (Decision #22)
+//   - interrupt `section ".interrupts"` for vector-table    (slice 4)
+//   - cross-callable transition mangling (`#> tally_uartN`) (slice 4)
+//   - mutation sugar `+=` and `=`                           (slice 3)
+//   - integer cast (volatile-read u32, store low byte u8)   (slice 7)
 //
-// 2. Spec §7 GA orthogonality (write-write race freedom):
-//      The two ISRs touch *strictly disjoint* fields. Earlier drafts
-//      of this sample shared `bytes_total` and `last_byte` between
-//      producers — the §7 verifier (correctly) rejected that with
-//      E0520. Splitting into per-source `bytes_uartN` /
-//      `last_byte_uartN` makes the wedge-product non-zero and the
-//      program race-free under the engine's restricted Cl(0,0,n)
-//      algebra.
+// What this sample does NOT include (deliberately):
+//   - The foreground "drain" side. v0.2-β's read-write race detector
+//     (spec §7.2) correctly flags reads of `bytes_uartN` from
+//     foreground code as racing against the ISR writes — even with
+//     Acquire/Release publication ordering, the read of the memory
+//     cell itself races with the ISR's load-modify-store (a
+//     theoretical race that's benign on aligned 32-bit hardware but
+//     fails the conservative §7.2 check).
 //
-// The Release on the producer side publishes the new state-tag plus
-// every store that came before it; the Acquire on the consumer side
-// guarantees those stores are visible by the time `drain` reads them.
-// This is the standard one-way handoff — equivalent to the
-// publish-then-acquire pattern in a SPSC ring buffer, scaled to two
-// producers because the two UART ISRs touch disjoint counters.
+//     A SAFE drain-side requires either:
+//       (a) `#atomic: interrupt_critical` on the drain effect (CLI/STI
+//           wrapper) — implementation deferred to a future slice.
+//       (b) `@snapshot Auto.field` (Decision #24 / ADR 0004) to copy
+//           the field into a private local before reading — parser
+//           ships in v0.2-α; codegen lowering is a future slice.
+//
+//     Until either lands, the foreground reader pattern is:
+//       - Disable interrupts manually (via inline asm, future).
+//       - Read the counters.
+//       - Re-enable interrupts.
+//     This sample documents the producer side in isolation.
+//
+// Earlier drafts of this sample also shared `bytes_total` and
+// `last_byte` between producers — both the v0.1 (write-write) and
+// v0.2-β (read-write) verifiers rejected that. The current shape
+// — strictly disjoint per-source fields — is what the engine
+// proves race-free.
 //
 // What this sample exercises end-to-end (across slices 1-10):
 //   - register-block automatons + volatile MMIO reads          (slice 4)
@@ -108,37 +126,6 @@
     Telemetry.bytes_uart2 += 1u32;
     Telemetry.last_byte_uart2 = (Uart2.rx_data as u8);
   }
-}
-
-
-// ─── Foreground consumer ────────────────────────────────────────────
-//
-// `drain_total` returns the SUM across both per-source counters,
-// computed at read time. The Acquire fence pairs with the Release
-// on every producer transition, so any byte tallied before this
-// call is guaranteed to be reflected in the sum.
-
-#effect drain_total() -> u32 #mutates: [Telemetry] $ [Acquire] {
-  return Telemetry.bytes_uart1 + Telemetry.bytes_uart2;
-}
-
-// Read the most recent byte from each source. The consumer chooses
-// which is "newer" by checking the corresponding counter (or by
-// pre-deciding which UART to drain).
-#effect drain_last_uart1() -> u8 #mutates: [Telemetry] $ [Acquire] {
-  return Telemetry.last_byte_uart1;
-}
-
-#effect drain_last_uart2() -> u8 #mutates: [Telemetry] $ [Acquire] {
-  return Telemetry.last_byte_uart2;
-}
-
-// Read which state we're in. Useful for "have we seen anything yet?"
-// — without `if` we can't branch on this in source, but the consumer
-// can compare it against the integer tag on the host side (Empty=0,
-// NonEmpty=1).
-#effect drain_state() -> u32 #mutates: [Telemetry] $ [Acquire] {
-  return Telemetry@state;
 }
 
 
