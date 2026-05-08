@@ -78,3 +78,19 @@
   }
   return;
 }
+
+
+// ─── Local mut accumulator inside a sigma loop (slice 12) ───────────
+//
+// Sum the integers from -5 to 5 inclusive. Demonstrates:
+//   - signed-range lowering (`icmp sle`, `add nsw`)            (slice 11)
+//   - local mut accumulator with `let mut` + reassignment      (slice 12)
+//   - load-add-store of the local on every iteration           (slice 12)
+
+#effect sum_signed_range() -> i32 #mutates: [] {
+  let mut total: i32 = 0i32;
+  sigma i in -5i32..=5i32 {
+    total = total + i;
+  }
+  return total;
+}
