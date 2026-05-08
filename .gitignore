@@ -26,6 +26,9 @@ Cargo.lock.bak
 /scratch
 /local
 
+# QEMU firmware-test build outputs
+/tests/qemu/build
+
 # Insta snapshot drafts (committed snapshots are the .snap files; the .new are pending)
 **/*.snap.new
 

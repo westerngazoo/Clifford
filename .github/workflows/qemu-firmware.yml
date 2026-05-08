@@ -1,0 +1,60 @@
+name: QEMU firmware smoke
+
+# Run the bare-metal Cortex-M3 firmware integration test:
+# cliffordc compiles `tests/qemu/firmware_smoke.cl`, clang
+# cross-compiles to thumbv7m-none-eabi, the result is linked with
+# the C harness/startup against the QEMU lm3s6965evb memory map,
+# and qemu-system-arm runs it under semihosting. The harness
+# reports its exit code via SYS_EXIT_EXTENDED so a failed
+# functional check propagates back to CI.
+#
+# Tests slices 1-13 collectively: function definitions, integer
+# arithmetic + comparisons, sigma loops, let-mut accumulators,
+# if/else, bitwise + shift ops. Any regression in codegen that
+# produces invalid IR or wrong runtime behavior fails this job.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  qemu-smoke:
+    name: cortex-m3 lm3s6965evb
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (pinned)
+        run: rustup show
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-qemu-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # clang ships with the LLVM ARM backend on Ubuntu 22.04+,
+      # so no separate cross-binutils install is required for
+      # the cross-compile + link path. qemu-system-arm includes
+      # the lm3s6965evb board model.
+      - name: Install cross toolchain (clang + qemu-system-arm)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang \
+            llvm \
+            qemu-system-arm
+
+      - name: Build cliffordc (release)
+        # Release build keeps the qemu run-time low; the cliffordc
+        # invocation inside run.sh uses `cargo run --quiet` which
+        # picks up this build via the cargo cache.
+        run: cargo build --release -p clifford-cli
+
+      - name: Run firmware smoke
+        run: bash tests/qemu/run.sh
