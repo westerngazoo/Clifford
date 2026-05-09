@@ -291,6 +291,18 @@ struct Emitter<'a> {
     /// `emit_atomic_exit_unmask_if_pending` at every exit site;
     /// cleared at end-of-callable.
     pending_atomic_exit_unmask: bool,
+    /// Slice 17: stack of currently-open `sigma` loops.
+    /// Each entry holds the loop's `(back_edge_label,
+    /// exit_label)`. `break;` emits `br label %<exit>`;
+    /// `continue;` emits `br label %<back_edge>` so the
+    /// increment runs (going straight to the header would
+    /// re-enter the loop with the SAME iteration index — an
+    /// infinite loop). The back-edge label is a synthetic
+    /// `sigma.continue.<id>` block that performs the
+    /// increment and jumps to the header. Reset in
+    /// `reset_per_function_state`; pushed/popped by
+    /// `emit_sigma`.
+    sigma_loop_stack: Vec<(String, String)>,
     /// Errors collected across the whole program.
     errors: Vec<CodegenError>,
 }
@@ -412,6 +424,7 @@ impl<'a> Emitter<'a> {
             next_label_id: 0,
             current_block_terminated: false,
             pending_atomic_exit_unmask: false,
+            sigma_loop_stack: Vec::new(),
             errors: Vec::new(),
         }
     }
@@ -772,6 +785,7 @@ impl<'a> Emitter<'a> {
         self.current_block = "entry".to_owned();
         self.current_block_terminated = false;
         self.pending_atomic_exit_unmask = false;
+        self.sigma_loop_stack.clear();
     }
 
     fn emit_fn(&mut self, decl: &FnDecl) {
@@ -1144,6 +1158,37 @@ impl<'a> Emitter<'a> {
             StmtKind::Sigma { var, source, body } => {
                 if let Err(e) = self.emit_sigma(var, source, body) {
                     self.errors.push(e);
+                }
+            }
+            // Slice 17: `break;` and `continue;` for sigma loops.
+            // The resolver has already enforced lexical nesting
+            // (E0411 outside any loop). Codegen branches to the
+            // innermost loop's exit / continue label and marks
+            // the current block terminated so the surrounding
+            // emit walker treats subsequent statements as dead.
+            StmtKind::Break => {
+                if let Some((_, exit_label)) = self.sigma_loop_stack.last().cloned() {
+                    writeln!(&mut self.out, "  br label %{exit_label}").ok();
+                    self.current_block_terminated = true;
+                } else {
+                    // Resolver should have caught this; emit a
+                    // structured error so the user sees something
+                    // concrete if upstream gates are bypassed.
+                    self.errors.push(CodegenError::NotYetImplemented {
+                        what: "`break` outside a sigma loop (resolver should have caught this; please file a bug)",
+                    });
+                }
+            }
+            StmtKind::Continue => {
+                if let Some((continue_label, _)) =
+                    self.sigma_loop_stack.last().cloned()
+                {
+                    writeln!(&mut self.out, "  br label %{continue_label}").ok();
+                    self.current_block_terminated = true;
+                } else {
+                    self.errors.push(CodegenError::NotYetImplemented {
+                        what: "`continue` outside a sigma loop (resolver should have caught this; please file a bug)",
+                    });
                 }
             }
             // Slice 12: `name = expr;` — local mutable re-assignment.
@@ -2122,11 +2167,13 @@ impl<'a> Emitter<'a> {
     ///   <emit lo and hi>
     ///   br label %sigma.header.<id>
     /// sigma.header.<id>:
-    ///   %sigma.i.<id> = phi <ty> [ %lo, %<pred> ], [ %sigma.i_next.<id>, %sigma.body.<id> ]
+    ///   %sigma.i.<id> = phi <ty> [ %lo, %<pred> ], [ %sigma.i_next.<id>, %sigma.continue.<id> ]
     ///   %sigma.cond.<id> = icmp <op> <ty> %sigma.i.<id>, %hi
     ///   br i1 %sigma.cond.<id>, label %sigma.body.<id>, label %sigma.exit.<id>
     /// sigma.body.<id>:
     ///   ; <body, with var bound to %sigma.i.<id>>
+    ///   br label %sigma.continue.<id>            ; natural fall-through (suppressed if body terminated)
+    /// sigma.continue.<id>:                        ; entry point for `continue;` statements (slice 17)
     ///   %sigma.i_next.<id> = add nuw <ty> %sigma.i.<id>, 1
     ///   br label %sigma.header.<id>
     /// sigma.exit.<id>:
@@ -2200,21 +2247,22 @@ impl<'a> Emitter<'a> {
         self.current_block = then_label.clone();
         self.current_block_terminated = false;
         let then_scope = self.locals.len();
-        let mut then_returned = false;
+        // Slice 17: drive termination off `current_block_terminated`
+        // so any terminator (return / break / continue / unreachable)
+        // stops the body cleanly. Pre-slice-17 only checked
+        // `Return(_)`, which let `break;` followed by dead code
+        // double-terminate the basic block.
         for s in &then_block.stmts {
-            if then_returned {
+            if self.current_block_terminated {
                 break;
             }
             self.emit_stmt(s);
-            if matches!(s.kind, StmtKind::Return(_)) {
-                then_returned = true;
-            }
         }
         self.locals.truncate(then_scope);
         // Branch to exit if the then-block didn't already terminate
-        // (e.g. via `return`). A nested `if`/`sigma` may have moved
-        // current_block to its own merge/exit; we still emit the
-        // jump from THERE to our exit, which is correct.
+        // (e.g. via `return`/`break`/`continue`). A nested `if`/`sigma`
+        // may have moved current_block to its own merge/exit; we
+        // still emit the jump from THERE to our exit, which is correct.
         if !self.current_block_terminated {
             writeln!(&mut self.out, "  br label %{exit_label}").ok();
         }
@@ -2226,15 +2274,11 @@ impl<'a> Emitter<'a> {
             self.current_block = else_lbl.clone();
             self.current_block_terminated = false;
             let else_scope = self.locals.len();
-            let mut else_returned = false;
             for s in &else_blk.stmts {
-                if else_returned {
+                if self.current_block_terminated {
                     break;
                 }
                 self.emit_stmt(s);
-                if matches!(s.kind, StmtKind::Return(_)) {
-                    else_returned = true;
-                }
             }
             self.locals.truncate(else_scope);
             if !self.current_block_terminated {
@@ -2333,10 +2377,18 @@ impl<'a> Emitter<'a> {
         // Allocate fresh label IDs for this loop. SSA-name conflicts
         // across nested sigmas are avoided because each loop has its
         // own `<id>` suffix.
+        //
+        // Slice 17 added the separate `sigma.continue.<id>` block:
+        // the body's natural fall-through and any `continue;`
+        // statement both branch to it, and the increment + back-
+        // edge live there. This keeps the body block free of the
+        // back-edge (so `continue;` doesn't have to duplicate the
+        // increment) and gives `break;` a clean exit-label target.
         let id = self.next_label_id;
         self.next_label_id += 1;
         let header_label = format!("sigma.header.{id}");
         let body_label = format!("sigma.body.{id}");
+        let continue_label = format!("sigma.continue.{id}");
         let exit_label = format!("sigma.exit.{id}");
         let i_name = format!("%sigma.i.{id}");
         let i_next_name = format!("%sigma.i_next.{id}");
@@ -2346,12 +2398,14 @@ impl<'a> Emitter<'a> {
         writeln!(&mut self.out, "  br label %{header_label}").ok();
 
         // Header block: phi + condition + conditional branch.
+        // Phi's body-incoming edge is from `continue`, NOT `body`,
+        // because that's where the increment happens.
         writeln!(&mut self.out, "{header_label}:").ok();
         self.current_block = header_label.clone();
         self.current_block_terminated = false;
         writeln!(
             &mut self.out,
-            "  {i_name} = phi {ir_ty} [ {lo_val}, %{pred_block} ], [ {i_next_name}, %{body_label} ]",
+            "  {i_name} = phi {ir_ty} [ {lo_val}, %{pred_block} ], [ {i_next_name}, %{continue_label} ]",
         )
         .ok();
         let cmp_op = match (signed, inclusive) {
@@ -2371,8 +2425,11 @@ impl<'a> Emitter<'a> {
         )
         .ok();
 
-        // Body block: bind the loop variable, emit body statements,
-        // then the increment and back-edge.
+        // Body block: bind the loop variable, emit body statements.
+        // The natural fall-through branches to `continue` (which
+        // performs the increment + back-edge); `break;` /
+        // `continue;` statements branch directly to exit /
+        // continue respectively.
         writeln!(&mut self.out, "{body_label}:").ok();
         self.current_block = body_label.clone();
         self.current_block_terminated = false;
@@ -2392,60 +2449,67 @@ impl<'a> Emitter<'a> {
             storage: LocalStorage::Ssa,
         });
 
+        // Slice 17: push this loop's (continue, exit) labels onto
+        // the stack so nested `break;` / `continue;` statements
+        // resolve to the innermost loop. Pop after the body.
+        self.sigma_loop_stack
+            .push((continue_label.clone(), exit_label.clone()));
+
         // Emit body statements. We don't reuse `emit_block` here
         // because we need to inject the back-edge ourselves and
-        // we need to detect whether the body terminated (a `return`
-        // mid-body would terminate `sigma.body.<id>` and the
-        // back-edge would be invalid).
-        let mut body_returned = false;
+        // we need to detect whether the body terminated (a `return`,
+        // `break;`, or `continue;` mid-body terminates `sigma.body.<id>`
+        // and the fall-through-to-continue branch would be invalid).
+        // Slice 17 uses `current_block_terminated` directly so that
+        // any terminating statement (return / break / continue /
+        // unreachable) stops the body emission cleanly.
         for stmt in &body.stmts {
-            if body_returned {
-                break; // dead code after return
+            if self.current_block_terminated {
+                break; // dead code after a terminator
             }
             self.emit_stmt(stmt);
-            if matches!(stmt.kind, StmtKind::Return(_)) {
-                body_returned = true;
-            }
         }
 
         // Pop loop-scope locals.
         self.locals.truncate(scope_marker);
+        // Pop the loop's (continue, exit) labels — outer loops
+        // (if any) are restored as the new innermost.
+        self.sigma_loop_stack.pop();
 
-        // Back-edge: emit the increment + branch unless the body's
-        // current block was terminated by a `return` (or an inner
-        // `unreachable`). For nested sigmas, current_block now
-        // points at the inner loop's exit block — that's still a
-        // valid open block, so the back-edge correctly closes it.
+        // Body fall-through: branch to the continue block (which
+        // handles the increment + back-edge). Suppressed if the
+        // body's current block was terminated by `return`,
+        // `break;`, `continue;`, or an inner `unreachable`. For
+        // nested sigmas, current_block now points at the inner
+        // loop's exit block — that's still open, so the
+        // fall-through branch correctly closes it.
         if !self.current_block_terminated {
-            let one_op = if signed { "add nsw" } else { "add nuw" };
-            writeln!(
-                &mut self.out,
-                "  {i_next_name} = {one_op} {ir_ty} {i_name}, 1",
-            )
-            .ok();
-            writeln!(&mut self.out, "  br label %{header_label}").ok();
-        } else {
-            // Body returned. The header still has a phi referencing
-            // %sigma.i_next.<id>, which doesn't exist now — emit a
-            // synthetic unreachable definition so the IR verifies.
-            // Note: a body that always returns is structurally
-            // identical to a guarded early-exit; LLVM's DCE will
-            // collapse the loop entirely. The `unreachable` here
-            // satisfies LLVM's SSA-form requirement.
-            //
-            // We materialize i_next via `add` of `i` + 0 wrapped in
-            // an unreachable block so the phi resolves.
-            //
-            // Future slice: skip the back-edge entirely and rewrite
-            // the phi to drop the body-incoming edge — cleaner IR.
-            writeln!(
-                &mut self.out,
-                "  {i_next_name} = {} {ir_ty} {i_name}, 0",
-                if signed { "add nsw" } else { "add nuw" },
-            )
-            .ok();
-            writeln!(&mut self.out, "  br label %{header_label}").ok();
+            writeln!(&mut self.out, "  br label %{continue_label}").ok();
         }
+
+        // Continue block: increment + back-edge to header. This is
+        // where `continue;` statements branch to as well.
+        writeln!(&mut self.out, "{continue_label}:").ok();
+        self.current_block = continue_label.clone();
+        self.current_block_terminated = false;
+        let one_op = if signed { "add nsw" } else { "add nuw" };
+        writeln!(
+            &mut self.out,
+            "  {i_next_name} = {one_op} {ir_ty} {i_name}, 1",
+        )
+        .ok();
+        writeln!(&mut self.out, "  br label %{header_label}").ok();
+
+        // Slice 17 design note: pre-slice-17 had the back-edge
+        // in the body block, with a `synthetic i_next = add 0`
+        // workaround when a body terminated via `return`. The
+        // continue-block restructure makes that workaround
+        // unnecessary: the increment + back-edge always
+        // reachable via the continue label (which the body's
+        // fall-through, an explicit `continue;`, or both jump
+        // to). A body that always `return`s leaves the continue
+        // block with no predecessors — LLVM's DCE collapses it
+        // along with the rest of the loop.
 
         // Exit block: subsequent statements emit here.
         writeln!(&mut self.out, "{exit_label}:").ok();
@@ -6197,29 +6261,238 @@ mod tests {
         );
     }
 
+    // ─── Slice 17: break / continue inside sigma loops ───────────────────
+
+    #[test]
+    fn break_emits_branch_to_sigma_exit_label() {
+        // `break;` inside a sigma body emits `br label %sigma.exit.<id>`
+        // and terminates the current basic block.
+        let src = "\
+            @fn t() {\n  \
+              sigma i in 0u32..10u32 {\n    \
+                break;\n  \
+              }\n  \
+              return;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower break");
+        // The sigma body must include a `br label %sigma.exit.0`
+        // emitted by the break statement.
+        assert!(
+            ir.contains("br label %sigma.exit.0"),
+            "expected break to branch to sigma.exit.0; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn continue_emits_branch_to_sigma_continue_label() {
+        // `continue;` inside a sigma body emits a `br label
+        // %sigma.continue.<id>` so the increment runs.
+        let src = "\
+            @fn t() {\n  \
+              sigma i in 0u32..10u32 {\n    \
+                continue;\n  \
+              }\n  \
+              return;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower continue");
+        // We expect at least TWO branches to sigma.continue.0:
+        // one from the (terminated) body via the explicit
+        // `continue;` and one from the body's natural
+        // fall-through-suppression (which doesn't fire because
+        // the body terminated). So exactly one explicit branch
+        // from the continue stmt.
+        assert!(
+            ir.contains("br label %sigma.continue.0"),
+            "expected continue to branch to sigma.continue.0; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn break_in_nested_sigma_targets_innermost_loop() {
+        // Two nested sigma loops; the `break;` in the inner
+        // body should target the INNER loop's exit label, not
+        // the outer's.
+        let src = "\
+            @fn t() {\n  \
+              sigma i in 0u32..4u32 {\n    \
+                sigma j in 0u32..4u32 {\n      \
+                  break;\n    \
+                }\n  \
+              }\n  \
+              return;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower nested-break");
+        // The inner loop has id 1 (outer is 0). `break` should
+        // target sigma.exit.1.
+        assert!(
+            ir.contains("\nsigma.exit.1:\n"),
+            "expected inner exit label; got:\n{ir}"
+        );
+        // The break emits `br label %sigma.exit.1` (innermost).
+        let break_count = ir.matches("br label %sigma.exit.1").count();
+        assert!(
+            break_count >= 1,
+            "expected at least one branch to inner exit; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn break_inside_if_inside_sigma_targets_loop_not_if() {
+        // The `break;` is wrapped in an `if`. The if-block's
+        // exit label is `if.exit.<id>`, but break should target
+        // the SIGMA's exit, not the if's.
+        let src = "\
+            @fn t() {\n  \
+              sigma i in 0u32..10u32 {\n    \
+                if true { break; }\n  \
+              }\n  \
+              return;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower break-in-if");
+        // The break should branch to sigma.exit.<n>, not
+        // if.exit.<n>. The exact ID depends on emission order
+        // — sigma is allocated before the inner if.
+        assert!(
+            ir.contains("br label %sigma.exit.0"),
+            "expected break to branch to sigma.exit.0 (not if.exit.*); got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn break_outside_sigma_rejected_by_resolver() {
+        // `break;` at the top of an @fn body is invalid.
+        // Resolver enforces with E0411; lower_str panics on
+        // resolve errors so we exercise the resolver directly.
+        let src = "@fn t() { break; }";
+        let tokens = tokenize(src).expect("tokenize");
+        let program = parse(&tokens).expect("parse");
+        let result = resolve(&program);
+        assert!(
+            result.is_err(),
+            "expected resolver to reject break outside sigma"
+        );
+        if let Err(errs) = result {
+            let saw_e0411 = errs.iter().any(|e| {
+                let s = format!("{e}");
+                s.contains("E0411") && s.contains("break")
+            });
+            assert!(
+                saw_e0411,
+                "expected E0411 with `break` mentioned; got {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn continue_outside_sigma_rejected_by_resolver() {
+        let src = "@fn t() { continue; }";
+        let tokens = tokenize(src).expect("tokenize");
+        let program = parse(&tokens).expect("parse");
+        let result = resolve(&program);
+        assert!(result.is_err());
+        if let Err(errs) = result {
+            let saw_e0411 = errs.iter().any(|e| {
+                let s = format!("{e}");
+                s.contains("E0411") && s.contains("continue")
+            });
+            assert!(
+                saw_e0411,
+                "expected E0411 with `continue` mentioned; got {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn break_with_local_mut_acc_can_early_exit() {
+        // Realistic firmware shape: scan an array-typed field
+        // for the first non-zero entry and break out. The
+        // accumulator pattern combines slice-12 (`let mut`),
+        // slice-13 (`if`), slice-11 (sigma), and slice-17
+        // (break).
+        let src = "\
+            @fn first_nonzero_index(n: u32) -> u32 {\n  \
+              let mut found: u32 = 0u32;\n  \
+              sigma i in 0u32..n {\n    \
+                if i > 3u32 {\n      \
+                  found = i;\n      \
+                  break;\n    \
+                }\n  \
+              }\n  \
+              return found;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower first_nonzero pattern");
+        // Branch to the sigma exit lives somewhere after the
+        // `if` then-branch.
+        assert!(
+            ir.contains("br label %sigma.exit.0"),
+            "expected break branch; got:\n{ir}"
+        );
+        // The accumulator's alloca + final load on return.
+        assert!(
+            ir.contains("alloca i32"),
+            "expected found's alloca; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("load i32, i32*"),
+            "expected load on return; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn body_after_break_is_dead_code() {
+        // A statement after `break;` is dead. emit_block should
+        // skip it (current_block_terminated is true after the
+        // break's br).
+        let src = "\
+            @fn t() {\n  \
+              sigma i in 0u32..10u32 {\n    \
+                break;\n    \
+                let _x: u32 = i;\n  \
+              }\n  \
+              return;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower break+dead");
+        // The dead `let _x` should NOT have lowered — no `add`
+        // or alloca for it.
+        assert!(
+            !ir.contains("add i32 0, %sigma.i.0"),
+            "expected dead let to be skipped; got:\n{ir}"
+        );
+    }
+
     // ─── Slice 11: sigma loops (Decision #14 / §5.8) ─────────────────────
 
     #[test]
     fn s11_sigma_basic_half_open_emits_loop_cfg() {
         // `sigma i in 0u32..4u32 { … }` — canonical counted loop.
-        // Verifies the three-block CFG (header / body / exit), the
-        // phi node, the unsigned half-open compare (`ult`), and the
-        // increment back-edge.
+        // Updated for slice-17 four-block CFG (header / body /
+        // continue / exit). The continue block holds the
+        // increment + back-edge so `continue;` statements have
+        // a clean target; the phi reads from `%sigma.continue.0`
+        // for the body-incoming edge.
         let src = "@fn loop_test() { sigma i in 0u32..4u32 { } return; }";
         let ir = lower_str(src).expect("lower sigma half-open");
-        // Three labels, each at column 0 (block headers).
+        // Four labels, each at column 0.
         assert!(ir.contains("\nsigma.header.0:\n"), "missing header label; got:\n{ir}");
         assert!(ir.contains("\nsigma.body.0:\n"), "missing body label; got:\n{ir}");
+        assert!(ir.contains("\nsigma.continue.0:\n"), "missing continue label; got:\n{ir}");
         assert!(ir.contains("\nsigma.exit.0:\n"), "missing exit label; got:\n{ir}");
         // Branch into the header from entry.
         assert!(
             ir.contains("br label %sigma.header.0"),
             "missing entry-to-header branch; got:\n{ir}"
         );
-        // Phi: %sigma.i.0 = phi i32 [ 0, %entry ], [ %sigma.i_next.0, %sigma.body.0 ]
+        // Phi: body-incoming label is `continue`, not `body`,
+        // because the increment lives in the continue block now.
         assert!(
-            ir.contains("%sigma.i.0 = phi i32 [ 0, %entry ], [ %sigma.i_next.0, %sigma.body.0 ]"),
-            "missing phi for i; got:\n{ir}"
+            ir.contains("%sigma.i.0 = phi i32 [ 0, %entry ], [ %sigma.i_next.0, %sigma.continue.0 ]"),
+            "missing phi (slice-17 shape with continue label); got:\n{ir}"
         );
         // Unsigned half-open compare.
         assert!(
@@ -6231,14 +6504,23 @@ mod tests {
             ir.contains("br i1 %sigma.cond.0, label %sigma.body.0, label %sigma.exit.0"),
             "missing conditional branch; got:\n{ir}"
         );
-        // Increment + back-edge.
+        // Increment lives in the continue block.
         assert!(
             ir.contains("%sigma.i_next.0 = add nuw i32 %sigma.i.0, 1"),
             "missing add nuw increment; got:\n{ir}"
         );
+        // Three branches into the header: entry pre-loop +
+        // body-fall-through-to-continue + continue back-edge.
+        // Actually: entry-to-header + continue-to-header. The
+        // body-to-continue branch goes to continue, not header.
         assert!(
             ir.matches("br label %sigma.header.0").count() >= 2,
             "expected entry + back-edge branches into header; got:\n{ir}"
+        );
+        // Body falls through to continue.
+        assert!(
+            ir.contains("br label %sigma.continue.0"),
+            "expected body fall-through to continue; got:\n{ir}"
         );
     }
 

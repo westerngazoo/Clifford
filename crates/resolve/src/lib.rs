@@ -190,6 +190,24 @@ pub enum ResolveError {
         /// Byte offset of the assignment statement.
         at: usize,
     },
+
+    /// A `break;` or `continue;` statement appears outside a
+    /// `sigma` loop body. Per spec §5.8 the keywords are only
+    /// valid inside loops; using them at function top level
+    /// (or inside an `if` / `#mutate` block that isn't itself
+    /// inside a loop) is a hard error.
+    ///
+    /// Lexical nesting is tracked by the resolver via a loop-
+    /// depth counter that increments when entering a `Sigma`
+    /// body and decrements on exit. `break;` / `continue;`
+    /// outside any loop fires this diagnostic.
+    #[error("E0411: `{keyword}` outside a loop body at byte {at} (only valid inside a `sigma` loop)")]
+    KeywordOutsideLoop {
+        /// `"break"` or `"continue"`.
+        keyword: &'static str,
+        /// Byte offset of the offending statement.
+        at: usize,
+    },
 }
 
 /// Which kind of top-level item a [`Symbol`] refers to.
@@ -571,6 +589,7 @@ pub fn resolve(program: &Program) -> Result<Resolution, Vec<ResolveError>> {
         errors: Vec::new(),
         scopes: Vec::new(),
         enclosing: None,
+        loop_depth: 0,
     };
 
     for item in &program.items {
@@ -661,6 +680,13 @@ struct Walker<'a> {
     /// `Self` resolution (transition bodies) and `#> proc` Transition-context
     /// lookup (effects/interrupts via `#mutates`).
     enclosing: Option<EnclosingContext>,
+    /// Slice 17: depth of the currently-open `sigma` loop nest.
+    /// Incremented when entering a `Sigma` body, decremented on
+    /// exit. `break;` / `continue;` are valid iff `loop_depth > 0`;
+    /// otherwise `E0411 KeywordOutsideLoop` fires. The depth is
+    /// per-callable (reset implicitly because each callable is
+    /// walked separately with a fresh body).
+    loop_depth: u32,
 }
 
 /// Body-context information needed by `#> proc` resolution and by `Self`
@@ -1084,10 +1110,35 @@ impl<'a> Walker<'a> {
                     kind: LocalKind::Sigma,
                     def_span: stmt.span,
                 });
+                // Slice 17: increment loop depth so `break;` /
+                // `continue;` in the body resolve. Decrement on
+                // exit. Nested sigmas stack naturally because the
+                // counter is monotone in/out.
+                self.loop_depth += 1;
                 for s in &body.stmts {
                     self.walk_stmt(s);
                 }
+                self.loop_depth -= 1;
                 self.pop_scope();
+            }
+            // Slice 17: `break;` / `continue;` — only valid
+            // lexically nested inside a `sigma` body. Otherwise
+            // E0411.
+            StmtKind::Break => {
+                if self.loop_depth == 0 {
+                    self.errors.push(ResolveError::KeywordOutsideLoop {
+                        keyword: "break",
+                        at: stmt.span.start,
+                    });
+                }
+            }
+            StmtKind::Continue => {
+                if self.loop_depth == 0 {
+                    self.errors.push(ResolveError::KeywordOutsideLoop {
+                        keyword: "continue",
+                        at: stmt.span.start,
+                    });
+                }
             }
             // Slice 13: `if cond { … } else { … }` statement form.
             // The condition resolves in the OUTER scope; each branch

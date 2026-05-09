@@ -1915,6 +1915,11 @@ impl<'t> Parser<'t> {
             }
             // Decision #14 / §5.8 sigma loop: `sigma var in lo..hi { body }`.
             TokenKind::KwSigma => self.parse_sigma_stmt(start),
+            // Slice 17: `break;` / `continue;` for sigma loops.
+            // Both must be lexically nested inside a `sigma`
+            // body — the resolver enforces that, not the parser.
+            TokenKind::KwBreak => self.parse_break_stmt(start),
+            TokenKind::KwContinue => self.parse_continue_stmt(start),
             // Slice 13: `if cond { … } else { … }` statement form.
             TokenKind::KwIf => self.parse_if_stmt(start),
             // Mutation sugar (Decision #15): `Auto.field <op>= expr;` — must
@@ -2259,6 +2264,28 @@ impl<'t> Parser<'t> {
     /// v0.1 scope: single-ident loop variable only. The
     /// `(index, value)` pattern from §5.8 lands when array sources
     /// arrive.
+    /// Parse `break;` per slice 17. The keyword + semicolon is
+    /// the entire syntax; lexical nesting (must be inside a
+    /// `sigma` loop) is enforced by the resolver, not the parser.
+    fn parse_break_stmt(&mut self, start: usize) -> Result<Stmt, ParseError> {
+        self.advance(); // `break`
+        let close = self.expect(TokenKind::Semi, "`;` to terminate `break` statement")?;
+        Ok(Stmt {
+            kind: StmtKind::Break,
+            span: Span::new(start, close.end),
+        })
+    }
+
+    /// Parse `continue;` per slice 17. Mirrors `parse_break_stmt`.
+    fn parse_continue_stmt(&mut self, start: usize) -> Result<Stmt, ParseError> {
+        self.advance(); // `continue`
+        let close = self.expect(TokenKind::Semi, "`;` to terminate `continue` statement")?;
+        Ok(Stmt {
+            kind: StmtKind::Continue,
+            span: Span::new(start, close.end),
+        })
+    }
+
     fn parse_sigma_stmt(&mut self, start: usize) -> Result<Stmt, ParseError> {
         self.advance(); // `sigma`
         let (var, _) = self.expect_ident("loop variable name after `sigma`")?;
@@ -6542,6 +6569,41 @@ mod tests {
             }
             other => panic!("expected Assign with binary RHS, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn break_stmt_parses_as_unit() {
+        let stmt = parse_stmt_str("break;");
+        assert!(matches!(stmt.kind, StmtKind::Break));
+    }
+
+    #[test]
+    fn continue_stmt_parses_as_unit() {
+        let stmt = parse_stmt_str("continue;");
+        assert!(matches!(stmt.kind, StmtKind::Continue));
+    }
+
+    #[test]
+    fn break_inside_sigma_body_parses() {
+        let stmt = parse_stmt_str("sigma i in 0u32..10u32 { break; }");
+        match &stmt.kind {
+            StmtKind::Sigma { body, .. } => {
+                assert_eq!(body.stmts.len(), 1);
+                assert!(matches!(body.stmts[0].kind, StmtKind::Break));
+            }
+            other => panic!("expected Sigma, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn break_without_semicolon_errors() {
+        // Sanity: forgetting the semicolon yields a parse error.
+        let err = parse_str("@fn t() { break }").expect_err("expected parse error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("`;`") || msg.contains("Semi"),
+            "expected error to mention `;`; got: {msg}"
+        );
     }
 
     #[test]

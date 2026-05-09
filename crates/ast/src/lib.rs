@@ -1331,6 +1331,34 @@ pub enum StmtKind {
         else_block: Option<Block>,
     },
 
+    /// `break;` — early exit from the innermost enclosing
+    /// `sigma` loop. Resolver enforces lexical nesting (E0411
+    /// outside a loop). Codegen emits a `br label %sigma.exit.<id>`
+    /// to the loop's exit block; the body's basic block is
+    /// terminated.
+    ///
+    /// v0.2-ι scope: only valid inside `sigma` loops. A future
+    /// slice may extend to `loop`/`while` once those keywords
+    /// have AST nodes.
+    Break,
+
+    /// `continue;` — skip to the next iteration of the
+    /// innermost enclosing `sigma` loop. Resolver enforces
+    /// lexical nesting (E0411 outside a loop). Codegen emits
+    /// a `br label %sigma.header.<id>` to the loop's header
+    /// block, bypassing the back-edge increment in the body.
+    ///
+    /// **Important caveat (v0.2-ι):** for `sigma` loops the
+    /// header is the phi+compare site; jumping back to the
+    /// header without going through the body's increment
+    /// would re-enter the loop with the SAME iteration index
+    /// — an infinite loop. Codegen routes `continue` through
+    /// the back-edge label (which performs the increment)
+    /// rather than directly to the header. See
+    /// `crates/codegen/src/lib.rs::emit_sigma` for the
+    /// emission shape.
+    Continue,
+
     /// `name = expr;` — local mutable re-assignment.
     ///
     /// Distinct from `Mutate` / `MutateShort` which target
