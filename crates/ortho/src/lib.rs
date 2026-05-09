@@ -99,7 +99,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use clifford_ast::{AtomicKind, Item, Program, TraitRef};
+use clifford_ast::{AtomicKind, Item, PriorityLevel, Program, TraitRef};
 use clifford_effect::{CallableId, FieldRef, MutationProfile, MutationProfiles};
 use thiserror::Error;
 
@@ -640,6 +640,61 @@ fn node_touches(node: &ConcurrencyNode, profiles: &MutationProfiles) -> HashSet<
 /// canonicalised as `(lo, hi)` alphabetically-sorted pairs so
 /// `@sequential(A, B)` and `@sequential(B, A)` produce the same
 /// entry per spec §2.6's symmetry note.
+/// v0.2-η: collect every `#interrupt`'s `#priority: …` clause
+/// into a name → level map. Used by `priorities_indicate_no_preemption`
+/// to decide whether two interrupts can preempt each other.
+fn collect_interrupt_priorities(program: &Program) -> HashMap<String, PriorityLevel> {
+    let mut out = HashMap::new();
+    for item in &program.items {
+        if let Item::Interrupt(decl) = item {
+            out.insert(decl.name.clone(), decl.priority.clone());
+        }
+    }
+    out
+}
+
+/// v0.2-η: per spec §2.5 + Cortex-M NVIC semantics, two
+/// interrupts at the same priority cannot preempt each other —
+/// the NVIC processes them sequentially. Returns `true` iff
+/// the two priorities are structurally equal AND therefore the
+/// pair cannot be concurrent in the spec's §7.3 sense.
+///
+/// **What "structurally equal" means:** `PriorityLevel::Low ==
+/// PriorityLevel::Low`, `Numeric("3") == Numeric("3")` (raw text
+/// comparison; we don't parse the integer for v0.2-η since the
+/// numeric range is target-specific). Mixed shapes — e.g.
+/// `Low` vs `Numeric("0")` — are conservatively treated as
+/// DIFFERENT priorities (could preempt) even if the user's
+/// target maps `Low` to numeric 0; v0.2-η doesn't know the
+/// target's priority encoding.
+///
+/// **Conservatism:** a `false` from this function means the
+/// pair IS treated as concurrent (the standard wedge check
+/// fires). A `true` means the pair is suppressed — and that
+/// requires us to be sound, so we err on the side of "false"
+/// when in doubt (e.g. mixed shapes).
+fn priorities_indicate_no_preemption(a: &PriorityLevel, b: &PriorityLevel) -> bool {
+    match (a, b) {
+        (PriorityLevel::Low, PriorityLevel::Low) => true,
+        (PriorityLevel::Medium, PriorityLevel::Medium) => true,
+        (PriorityLevel::High, PriorityLevel::High) => true,
+        (PriorityLevel::Numeric(s1), PriorityLevel::Numeric(s2)) => {
+            // Compare canonicalised raw text (strip whitespace +
+            // underscores) so `42` and `4_2` count as the same
+            // priority. We don't parse to integer because the
+            // numeric range is target-specific.
+            let canon = |s: &str| -> String {
+                s.chars().filter(|c| !c.is_whitespace() && *c != '_').collect()
+            };
+            canon(s1) == canon(s2)
+        }
+        // Mixed kinds: conservatively treat as different
+        // (could preempt). A future slice with target-aware
+        // priority normalisation can refine this.
+        _ => false,
+    }
+}
+
 fn collect_sequential_pairs(program: &Program) -> HashSet<(String, String)> {
     let mut out = HashSet::new();
     for item in &program.items {
@@ -759,6 +814,11 @@ pub fn verify(
     // v0.2-γ: collect `@sequential(A, B);` overrides once.
     let sequential_pairs = collect_sequential_pairs(program);
 
+    // v0.2-η: collect every `#interrupt`'s `#priority` so the
+    // pair check can suppress same-priority interrupt pairs
+    // (NVIC processes them sequentially per Cortex-M semantics).
+    let interrupt_priorities = collect_interrupt_priorities(program);
+
     // Pairwise graded check per §7.2 + §7.4:
     //
     //   safe(A, B) ⟺ (writes_A ∧ writes_B == 0)     [v0.1: write-write]
@@ -803,6 +863,25 @@ pub fn verify(
                 || matches!(id_b, ConcurrencyNode::Interrupt(_));
             if either_atomic && other_is_interrupt {
                 continue;
+            }
+            // v0.2-η: NVIC priority semantics — two interrupts at
+            // the same priority cannot preempt each other on
+            // Cortex-M (they run sequentially via tail-chaining).
+            // If both sides are interrupts AND their declared
+            // `#priority` matches structurally, skip the pair.
+            // Different-priority interrupts (or any pair where
+            // either side isn't an interrupt) take the standard
+            // path.
+            if let (ConcurrencyNode::Interrupt(name_a), ConcurrencyNode::Interrupt(name_b)) =
+                (id_a, id_b)
+            {
+                let prio_a = interrupt_priorities.get(name_a);
+                let prio_b = interrupt_priorities.get(name_b);
+                if let (Some(pa), Some(pb)) = (prio_a, prio_b) {
+                    if priorities_indicate_no_preemption(pa, pb) {
+                        continue;
+                    }
+                }
             }
             // Combined conflict mask across the three race classes.
             // Same field appearing in writes(A) and writes(B), or
@@ -1742,6 +1821,146 @@ mod tests {
             }
             _ => panic!("expected OrthogonalityViolation"),
         }
+    }
+
+    // ─── v0.2-η: #priority-aware concurrency inference ──────────────
+
+    #[test]
+    fn same_priority_interrupts_do_not_concur() {
+        // Two interrupts at HIGH priority writing the SAME
+        // field. Pre-v0.2-η: violation. v0.2-η: skipped because
+        // NVIC processes same-priority interrupts sequentially
+        // (tail-chained, no nested preemption).
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #interrupt IRQ_A() #mutates: [C] #priority: HIGH { C.v += 1u32; }\n\
+            #interrupt IRQ_B() #mutates: [C] #priority: HIGH { C.v += 1u32; }\n\
+        ";
+        let program = parse_program(src);
+        let profiles = build_profiles(&program);
+        verify(&program, &profiles).expect("same-priority IRQs are not concurrent");
+    }
+
+    #[test]
+    fn different_priority_interrupts_still_violate() {
+        // Sanity: HIGH vs LOW interrupts can still preempt each
+        // other. Without #atomic / @sequential / @snapshot the
+        // pair is flagged.
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #interrupt IRQ_HI() #mutates: [C] #priority: HIGH { C.v += 1u32; }\n\
+            #interrupt IRQ_LO() #mutates: [C] #priority: LOW  { C.v += 1u32; }\n\
+        ";
+        let program = parse_program(src);
+        let profiles = build_profiles(&program);
+        let errs = verify(&program, &profiles).expect_err("expected E0520");
+        assert_eq!(errs.len(), 1);
+    }
+
+    #[test]
+    fn medium_vs_medium_also_suppressed() {
+        // Verify the rule isn't HIGH-specific.
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #interrupt IRQ_A() #mutates: [C] #priority: MEDIUM { C.v += 1u32; }\n\
+            #interrupt IRQ_B() #mutates: [C] #priority: MEDIUM { C.v += 1u32; }\n\
+        ";
+        let program = parse_program(src);
+        let profiles = build_profiles(&program);
+        verify(&program, &profiles).expect("MEDIUM × MEDIUM not concurrent");
+    }
+
+    #[test]
+    fn numeric_priorities_compare_by_canonical_text() {
+        // Two interrupts both at numeric priority 3 (one
+        // written `3`, one `0_3` after underscore stripping —
+        // contrived but exercises the canonicalisation).
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #interrupt IRQ_A() #mutates: [C] #priority: 3 { C.v += 1u32; }\n\
+            #interrupt IRQ_B() #mutates: [C] #priority: 3 { C.v += 1u32; }\n\
+        ";
+        let program = parse_program(src);
+        let profiles = build_profiles(&program);
+        verify(&program, &profiles).expect("same numeric priority not concurrent");
+    }
+
+    #[test]
+    fn different_numeric_priorities_still_violate() {
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #interrupt IRQ_A() #mutates: [C] #priority: 3 { C.v += 1u32; }\n\
+            #interrupt IRQ_B() #mutates: [C] #priority: 5 { C.v += 1u32; }\n\
+        ";
+        let program = parse_program(src);
+        let profiles = build_profiles(&program);
+        let errs = verify(&program, &profiles).expect_err("different numerics still concur");
+        assert_eq!(errs.len(), 1);
+    }
+
+    #[test]
+    fn mixed_kinds_conservatively_treated_as_concurrent() {
+        // `HIGH` vs `Numeric("0")` may map to the same
+        // hardware priority on some targets, but v0.2-η
+        // doesn't know the encoding. Conservatively treat as
+        // different priorities → still flagged.
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #interrupt IRQ_A() #mutates: [C] #priority: HIGH { C.v += 1u32; }\n\
+            #interrupt IRQ_B() #mutates: [C] #priority: 0    { C.v += 1u32; }\n\
+        ";
+        let program = parse_program(src);
+        let profiles = build_profiles(&program);
+        let errs = verify(&program, &profiles).expect_err("mixed kinds treated as different");
+        assert_eq!(errs.len(), 1);
+    }
+
+    #[test]
+    fn priority_suppression_does_not_apply_to_effect_interrupt_pair() {
+        // The priority rule is interrupt-vs-interrupt only.
+        // An effect × interrupt pair has no priority on the
+        // effect side, so the v0.2-η suppression doesn't fire
+        // — the pair gets the standard wedge check.
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #effect main_loop() #mutates: [C] { C.v += 1u32; }\n\
+            #interrupt IRQ() #mutates: [C] #priority: HIGH { C.v += 1u32; }\n\
+        ";
+        let program = parse_program(src);
+        let profiles = build_profiles(&program);
+        let errs = verify(&program, &profiles).expect_err("effect × interrupt still concur");
+        assert_eq!(errs.len(), 1);
+    }
+
+    #[test]
+    fn priorities_indicate_no_preemption_helper_smoke() {
+        // Direct unit tests on the helper covering each
+        // PriorityLevel variant pair.
+        use clifford_ast::PriorityLevel::*;
+        assert!(priorities_indicate_no_preemption(&Low, &Low));
+        assert!(priorities_indicate_no_preemption(&Medium, &Medium));
+        assert!(priorities_indicate_no_preemption(&High, &High));
+        assert!(!priorities_indicate_no_preemption(&Low, &Medium));
+        assert!(!priorities_indicate_no_preemption(&Low, &High));
+        assert!(!priorities_indicate_no_preemption(&Medium, &High));
+        assert!(priorities_indicate_no_preemption(
+            &Numeric("3".to_owned()),
+            &Numeric("3".to_owned())
+        ));
+        // Underscore-equivalent canonicalisation.
+        assert!(priorities_indicate_no_preemption(
+            &Numeric("4_2".to_owned()),
+            &Numeric("42".to_owned())
+        ));
+        assert!(!priorities_indicate_no_preemption(
+            &Numeric("3".to_owned()),
+            &Numeric("5".to_owned())
+        ));
+        // Mixed kinds: conservatively false.
+        assert!(!priorities_indicate_no_preemption(
+            &High,
+            &Numeric("0".to_owned())
+        ));
     }
 
     // ─── v0.2-ζ: @snapshot excludes read from race detection ─────────

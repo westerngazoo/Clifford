@@ -7,6 +7,117 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — `clifford-ortho` v0.2-η: `#priority`-aware concurrency inference (2026-05-08)
+
+The §7.3 inference now consults each `#interrupt`'s declared
+`#priority: …` clause. Two interrupts at the **same** priority
+cannot preempt each other on Cortex-M's NVIC (they process via
+tail-chaining, no nested vectoring) — so the verifier suppresses
+the pair. Different-priority interrupts still take the standard
+wedge check.
+
+This **reduces the conservative false-positive rate** on
+realistic firmware: many drivers put related ISRs on the same
+priority specifically so they don't preempt each other; v0.2-η
+respects that.
+
+**Concrete change.** Pre-v0.2-η:
+
+```clifford
+// Two ISRs at the SAME priority writing the same field.
+#interrupt USART1_IRQ() #mutates: [C] #priority: HIGH { C.v += 1u32; }
+#interrupt USART2_IRQ() #mutates: [C] #priority: HIGH { C.v += 1u32; }
+
+// → error[ortho]: E0520 (false positive — NVIC processes them sequentially)
+```
+
+Post-v0.2-η: same source compiles cleanly. The pair-check
+matrix consults priorities and skips matches.
+
+**Why this is sound.** ARM v7-M ARM B1.5: when an exception
+handler at priority N is running, only an exception with
+strictly higher priority (numerically lower) can preempt it.
+Same-priority interrupts remain pending until the running
+handler returns. Therefore the two handlers' bodies execute
+**strictly sequentially** — no concurrency, no race. This holds
+on every Cortex-M variant and on RISC-V's PLIC under the
+standard level-priority configuration.
+
+**Implementation (`crates/ortho/src/lib.rs`):**
+
+- New `collect_interrupt_priorities(program) -> HashMap<String, PriorityLevel>`
+  walks `Item::Interrupt` items and indexes each by name.
+- New `priorities_indicate_no_preemption(a, b) -> bool`:
+  - `Low/Low`, `Medium/Medium`, `High/High` → `true`.
+  - `Numeric(s1)/Numeric(s2)` → canonicalised string equality
+    (whitespace + `_` separators stripped).
+  - **Mixed kinds (e.g. `High` vs `Numeric("0")`) → `false`
+    conservatively.** The target's priority encoding isn't
+    known at this layer; a future target-aware slice can
+    refine.
+- `verify` consults the map only when both sides of a pair
+  are `ConcurrencyNode::Interrupt`. The check runs after the
+  `@sequential` and `#atomic` overrides and before the wedge
+  check.
+
+**Companion behaviour doc:** `docs/ortho-priority-aware-inference.md`
+(~190 lines) covers the matrix, the soundness argument, the
+concrete before/after, the conservative mixed-kind rule, and
+the choice-of-attribute decision flow.
+
+**The full safety-attribute deck for the SPSC pattern:**
+
+| Pattern | When |
+|---|---|
+| `#priority: …` (matched) | Two interrupts on the same NVIC priority — automatic, no annotation needed beyond the existing `#priority` clauses |
+| `@sequential(A, B);` | Different priorities + scheduler-guaranteed non-concurrency |
+| `#atomic: interrupt_critical;` | Multi-field consistency under preemption |
+| `@snapshot Auto.field` | Single primitive field read under preemption |
+
+The four together cover the realistic firmware safety surface.
+
+**Tests added: 8 in ortho (56 → 64).**
+
+- `same_priority_interrupts_do_not_concur` — the canonical
+  win (HIGH × HIGH on same field).
+- `different_priority_interrupts_still_violate` — sanity that
+  the rule is priority-conditional.
+- `medium_vs_medium_also_suppressed` — not HIGH-specific.
+- `numeric_priorities_compare_by_canonical_text` — canonical
+  numeric matching.
+- `different_numeric_priorities_still_violate`.
+- `mixed_kinds_conservatively_treated_as_concurrent` — the
+  HIGH vs Numeric("0") corner case.
+- `priority_suppression_does_not_apply_to_effect_interrupt_pair`
+  — interrupt-only.
+- `priorities_indicate_no_preemption_helper_smoke` — direct
+  unit tests on every variant pair.
+
+**Pipeline regression checked.** All 7 examples pass through
+v0.2-η unchanged (no example currently has two same-priority
+ISRs touching shared fields, so the suppression doesn't fire
+on existing samples — but it's there when needed).
+
+**Deferred:**
+
+- **Target-aware priority normalisation**: parse `--target`
+  and map `HIGH/MEDIUM/LOW` to the target's numeric encoding
+  so mixed-kind comparisons can match. v0.2-η stays
+  conservative.
+- **Priority-band asymmetric inference**: even different-
+  priority pairs could be analysed (only the lower-priority
+  handler can be preempted; the higher one is never the
+  preemptee). The spec's §7.3 model is symmetric; refining
+  would let us suppress more pairs at the cost of more
+  careful analysis.
+- **NMI handling**: non-maskable interrupts preempt
+  everything, including same-priority handlers. v0.2-η
+  treats every declared `#interrupt` uniformly; NMI is
+  currently outside the proof boundary.
+
+Total ortho tests: **64** (56 + 8). Workspace clean; clippy
+clean.
+
 ### Added — `@snapshot Auto.field` codegen + verifier exclusion (v0.2-ζ) (2026-05-08)
 
 End-to-end implementation of Decision #24 / ADR 0004's
