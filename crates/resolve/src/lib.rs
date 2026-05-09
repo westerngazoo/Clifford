@@ -208,6 +208,53 @@ pub enum ResolveError {
         /// Byte offset of the offending statement.
         at: usize,
     },
+
+    /// **E0412 FlushOnNonStaged.** A `#flush Name;` statement
+    /// names an automaton that was declared without the
+    /// `#staged` modifier.
+    ///
+    /// `#flush` is meaningful **only** for `#staged` automata
+    /// (Decision #12): the verb commits a shadow-state snapshot
+    /// into live state. For a non-staged automaton there is no
+    /// shadow — every `#mutate` already targets live state — so
+    /// the verb has no observable behaviour and is almost
+    /// certainly a misuse. The fix is either to add `#staged`
+    /// to the automaton declaration, or to remove the `#flush`.
+    ///
+    /// Companion to E0413 below — together they cover the two
+    /// resolver-side validation gates for `#flush`.
+    #[error(
+        "E0412: `#flush {automaton}` targets a non-staged automaton at byte {at} \
+         (only `#staged #automaton` declarations have shadow state to commit; \
+         add `#staged` to the declaration or remove the `#flush`)"
+    )]
+    FlushOnNonStaged {
+        /// The automaton named in the offending `#flush`.
+        automaton: String,
+        /// Byte offset of the offending statement.
+        at: usize,
+    },
+
+    /// **E0413 FlushOfUnknownAutomaton.** A `#flush Name;`
+    /// statement references a name that does not resolve to any
+    /// `#automaton` declaration in the program.
+    ///
+    /// Distinct from E0412 (which is "the name resolves but the
+    /// automaton isn't `#staged`"): E0413 is the structural
+    /// "the name doesn't resolve at all (or resolves to a
+    /// non-automaton)" failure. Surfacing them as different
+    /// codes lets users disambiguate "I forgot the modifier"
+    /// from "I typoed the name."
+    #[error(
+        "E0413: `#flush {automaton}` names an unknown automaton at byte {at} \
+         (no `#automaton {automaton} {{ … }}` declaration is in scope)"
+    )]
+    FlushOfUnknownAutomaton {
+        /// The unresolved name written after `#flush`.
+        automaton: String,
+        /// Byte offset of the offending statement.
+        at: usize,
+    },
 }
 
 /// Which kind of top-level item a [`Symbol`] refers to.
@@ -635,12 +682,19 @@ struct AutomatonMeta {
     /// The span lets `BindingRef::Proc` point back at the transition's
     /// declaration site.
     transitions: HashMap<String, HashMap<String, Span>>,
+    /// Map: automaton name → `true` if declared `#staged #automaton …`
+    /// per Decision #12. Used by [`Walker::lookup_automaton_staged`]
+    /// to validate `#flush Name;` statements (E0412 / E0413).
+    /// Absence in the map → "no automaton with that name" (E0413);
+    /// presence with `false` → "exists but not staged" (E0412).
+    staged: HashMap<String, bool>,
 }
 
 fn build_automaton_meta(program: &Program) -> AutomatonMeta {
     let mut fields: HashMap<String, HashSet<String>> = HashMap::new();
     let mut hidden_fields: HashMap<String, HashSet<String>> = HashMap::new();
     let mut transitions: HashMap<String, HashMap<String, Span>> = HashMap::new();
+    let mut staged: HashMap<String, bool> = HashMap::new();
     for item in &program.items {
         if let Item::Automaton(decl) = item {
             let f: HashSet<String> = decl.fields.iter().map(|f| f.name.clone()).collect();
@@ -658,12 +712,14 @@ fn build_automaton_meta(program: &Program) -> AutomatonMeta {
             fields.insert(decl.name.clone(), f);
             hidden_fields.insert(decl.name.clone(), h);
             transitions.insert(decl.name.clone(), t);
+            staged.insert(decl.name.clone(), decl.staged);
         }
     }
     AutomatonMeta {
         fields,
         hidden_fields,
         transitions,
+        staged,
     }
 }
 
@@ -929,6 +985,17 @@ impl<'a> Walker<'a> {
         });
     }
 
+    /// Returns the `staged` flag of the named automaton, or `None`
+    /// if `name` does not refer to any automaton in the program.
+    ///
+    /// Used by [`StmtKind::Flush`] resolution to discriminate
+    /// E0413 (unknown automaton) from E0412 (exists but not
+    /// `#staged`). Does **not** push errors or record bindings —
+    /// the caller is responsible for choosing the diagnostic.
+    fn lookup_automaton_staged(&self, name: &str) -> Option<bool> {
+        self.automaton_meta.staged.get(name).copied()
+    }
+
     /// Verify that a name resolves to an `#automaton` symbol. Used by
     /// `Mutate`, `MutateShort`, and `StateRead`. Records the resolution as
     /// a [`BindingRef::TopLevel`] under `at` on success; pushes
@@ -1138,6 +1205,36 @@ impl<'a> Walker<'a> {
                         keyword: "continue",
                         at: stmt.span.start,
                     });
+                }
+            }
+            // Slice 18 (Decision #12): `#flush Name;` — commit
+            // a `#staged` automaton's shadow state. Two checks:
+            //   1. Name resolves to an `Item::Automaton`.
+            //   2. The resolved automaton has `staged == true`.
+            // (1) failure → E0413 FlushOfUnknownAutomaton;
+            // (2) failure → E0412 FlushOnNonStaged. The
+            // mutation-profile check (must appear in `#mutates:`)
+            // is handled later in the effect-checker phase, not
+            // here, since the resolver doesn't yet have the
+            // enclosing callable's profile in hand.
+            StmtKind::Flush { automaton } => {
+                match self.lookup_automaton_staged(automaton) {
+                    Some(true) => {
+                        // Happy path — staged automaton,
+                        // flush is well-formed.
+                    }
+                    Some(false) => {
+                        self.errors.push(ResolveError::FlushOnNonStaged {
+                            automaton: automaton.clone(),
+                            at: stmt.span.start,
+                        });
+                    }
+                    None => {
+                        self.errors.push(ResolveError::FlushOfUnknownAutomaton {
+                            automaton: automaton.clone(),
+                            at: stmt.span.start,
+                        });
+                    }
                 }
             }
             // Slice 13: `if cond { … } else { … }` statement form.
@@ -2921,5 +3018,95 @@ mod tests {
             saw,
             "expected E0407 for @snapshot of hidden field from @fn; got {errors:?}"
         );
+    }
+
+    // ─── Slice 18: `#flush` resolution (Decision #12, E0412 / E0413) ─────
+
+    #[test]
+    fn flush_on_staged_automaton_resolves() {
+        // Happy path: `#flush S;` where `S` is `#staged` is well-
+        // formed at resolve-time. No errors, no special binding —
+        // the resolver records nothing for the flush itself
+        // (codegen consults the AST directly to find the target).
+        let src = "\
+            #staged #automaton S { v: u32; } \
+            #effect commit() #mutates: [S] { #flush S; return; }\
+        ";
+        let res = resolve_str(src).expect("should resolve");
+        // No bindings produced for the flush stmt itself.
+        let _ = res;
+    }
+
+    #[test]
+    fn flush_on_non_staged_automaton_is_e0412() {
+        // The automaton exists but isn't `#staged` — flushing it
+        // is meaningless and must surface as E0412.
+        let src = "\
+            #automaton P { v: u32; } \
+            #effect commit() #mutates: [P] { #flush P; return; }\
+        ";
+        let errors = resolve_str(src).expect_err("expected FlushOnNonStaged");
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            ResolveError::FlushOnNonStaged { automaton, .. } if automaton == "P"
+        ));
+        assert!(saw, "expected E0412 FlushOnNonStaged for `P`; got {errors:?}");
+    }
+
+    #[test]
+    fn flush_of_unknown_automaton_is_e0413() {
+        // The flush target doesn't resolve to any automaton —
+        // E0413 (distinct from E0412 which is "exists but not
+        // staged"). Nothing else in the program declares `Bogus`.
+        let src = "\
+            #automaton Real { v: u32; } \
+            #effect commit() #mutates: [Real] { #flush Bogus; return; }\
+        ";
+        let errors = resolve_str(src).expect_err("expected FlushOfUnknownAutomaton");
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            ResolveError::FlushOfUnknownAutomaton { automaton, .. }
+                if automaton == "Bogus"
+        ));
+        assert!(
+            saw,
+            "expected E0413 FlushOfUnknownAutomaton for `Bogus`; got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn flush_naming_a_fn_is_e0413_not_e0412() {
+        // The name `H` exists in the program but as an `@fn`, not
+        // an automaton — the meta-table only indexes automata, so
+        // lookup_automaton_staged returns None → E0413.
+        let src = "\
+            @fn H() { return; } \
+            #effect commit() #mutates: [] { #flush H; return; }\
+        ";
+        let errors = resolve_str(src).expect_err("expected FlushOfUnknownAutomaton");
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            ResolveError::FlushOfUnknownAutomaton { automaton, .. } if automaton == "H"
+        ));
+        assert!(
+            saw,
+            "expected E0413 (not E0412) when name is an @fn; got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn flush_inside_sigma_body_resolves() {
+        // Flushing inside a sigma loop body is permitted — the
+        // resolver doesn't constrain *where* a flush appears,
+        // only *what* it targets. Sanity check the new arm
+        // composes cleanly with sigma's loop_depth bookkeeping.
+        let src = "\
+            #staged #automaton S { v: u32; } \
+            #effect commit_n(n: u32) #mutates: [S] { \
+                sigma _i in 0u32..n { #flush S; } \
+                return; \
+            }\
+        ";
+        let _ = resolve_str(src).expect("flush inside sigma should resolve");
     }
 }

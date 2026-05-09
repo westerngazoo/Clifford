@@ -251,7 +251,27 @@ pub struct AutomatonDecl {
     pub fields: Vec<AutomatonField>,
     /// Named `#transition` blocks in source order.
     pub transitions: Vec<TransitionDecl>,
-    /// Source span covering `#automaton Name { … }` end-to-end.
+    /// `#staged` modifier per Decision #12 (deferred-mutation
+    /// automata). When `true`, every `#mutate Name { … }` and
+    /// `Name.field <op>= …` write inside transitions/effects/
+    /// interrupts targets a *shadow* copy of the field set; the
+    /// shadow is committed into the live state by an explicit
+    /// `#flush Name;` statement (see [`StmtKind::Flush`]). When
+    /// `false`, mutations write directly to the live state (the
+    /// pre-Decision-#12 v0.1 behaviour).
+    ///
+    /// Order-independent with the other prefix attributes — the
+    /// parser accepts `#staged #automaton Foo { … }` as the only
+    /// surface form for v0.2 (single token of prefix). The GA
+    /// orthogonality engine treats `#staged` automata identically
+    /// to non-staged ones (timing of commit doesn't change which
+    /// fields a callable touches), so no §7 changes are required.
+    pub staged: bool,
+    /// Source span covering `#automaton Name { … }` (excluding
+    /// any `#staged` prefix, which is already represented via
+    /// [`Self::staged`]). Renames and prefix additions reuse the
+    /// same span so error messages stay anchored on the
+    /// `#automaton` keyword.
     pub span: Span,
 }
 
@@ -1359,6 +1379,38 @@ pub enum StmtKind {
     /// emission shape.
     Continue,
 
+    /// `#flush Name;` — commit a `#staged` automaton's shadow
+    /// state into its live state (Decision #12, v0.2).
+    ///
+    /// Resolver enforces three checks:
+    /// 1. `Name` resolves to an `Item::Automaton`.
+    /// 2. The resolved automaton has `staged == true`. Flushing a
+    ///    non-staged automaton is **E0412** `FlushOnNonStaged` —
+    ///    the construct is meaningless for direct-write automata.
+    /// 3. The enclosing callable's `#mutates: [...]` profile
+    ///    includes `Name` (a flush is a write to live state, so
+    ///    the standard mutation-profile check applies). Reuses the
+    ///    existing E0408 `MutationOutsideProfile` if violated.
+    ///
+    /// **Codegen contract:** every `#staged` automaton is allocated
+    /// twice — `@Name` for live state and `@Name$shadow` for the
+    /// pending writes. `#flush Name;` lowers to a `memcpy.inline`
+    /// from `@Name$shadow` to `@Name`. v0.2 emits the memcpy on
+    /// its own basic block; firmware that needs the commit to be
+    /// interrupt-safe wraps the `#flush` in a `#atomic:
+    /// interrupt_critical;` callable (the existing v0.2-ε
+    /// codegen already produces `cpsid i` / `cpsie i` around
+    /// such bodies).
+    ///
+    /// v0.2 scope: a single bare ident target. Composite paths
+    /// (`#flush A.sub;`) and multi-flush forms (`#flush A, B;`)
+    /// are not in scope and would parse as the same surface
+    /// extension when designed.
+    Flush {
+        /// The `#staged` automaton being committed.
+        automaton: String,
+    },
+
     /// `name = expr;` — local mutable re-assignment.
     ///
     /// Distinct from `Mutate` / `MutateShort` which target
@@ -1483,6 +1535,7 @@ mod tests {
             states: None,
             fields: Vec::new(),
             transitions: Vec::new(),
+            staged: false,
             span: Span::new(0, 14),
         });
         assert_eq!(a.layer(), Layer::Imperative);

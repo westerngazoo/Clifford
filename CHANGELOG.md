@@ -7,6 +7,133 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 18: `#staged` automaton + `#flush` (Decision #12) (2026-05-09)
+
+Implements **Decision #12** (deferred-mutation automata),
+previously listed as "designed; deferred to v0.2." A
+`#staged #automaton Foo { … }` modifier allocates an
+additional shadow global of identical type; every `#mutate
+Foo { … }` and `Foo.field <op>= …` write inside any
+callable is redirected to the shadow; an explicit
+`#flush Foo;` statement commits the shadow into live state
+via a single `llvm.memcpy`. Reads (`Foo.field`,
+`@snapshot Foo.field`) continue to come from live state, so
+no consumer ever observes a half-built update.
+
+The orthogonality engine is **untouched**: `#staged` only
+changes *when* writes become observable, not *which fields*
+a callable touches. Per Decision #12, "the GA engine treats
+`#staged` automata identically to non-staged ones for
+orthogonality (timing doesn't change field overlap)."
+
+**Surface syntax:**
+
+```clifford
+#staged #automaton Pose { x: i32; y: i32; theta: i32; }
+
+#interrupt EncoderTick() #mutates: [Pose] #priority: HIGH
+  #atomic: interrupt_critical;
+{
+  #mutate Pose { x = 100i32, y = 200i32, theta = 45i32 };
+  #flush Pose;          // commit shadow → live atomically
+  return;
+}
+
+@fn read_x() -> i32 $ [Readable] {
+  return @snapshot Pose.x;   // always sees the most recent commit
+}
+```
+
+**Pipeline changes:**
+
+- **AST (`crates/ast/src/lib.rs`):** new `staged: bool`
+  field on `AutomatonDecl`; new
+  `StmtKind::Flush { automaton: String }` variant.
+- **Lexer:** already had `KwHashStaged` and `KwHashFlush`
+  reserved (the spec called them "reserved keywords for
+  v0.2"); slice 18 just consumes them.
+- **Parser (`crates/parser/src/lib.rs`):** new
+  `KwHashStaged` arm in `parse_item` that consumes the
+  modifier and dispatches to `parse_automaton_decl(start,
+  /*staged=*/ true)`. The `#staged` keyword is reserved
+  for `#automaton` only — any other follower is a parse
+  error citing Decision #12. New `parse_flush_stmt`
+  consumes `#flush <Ident> ;` from `parse_stmt`. Six new
+  parser tests cover staged-on / staged-off, the
+  `#staged` + non-`#automaton` rejection, and the three
+  `#flush` shapes.
+- **Resolver (`crates/resolve/src/lib.rs`):** new
+  `staged: HashMap<String, bool>` side table on
+  `AutomatonMeta`; new `lookup_automaton_staged` helper.
+  `StmtKind::Flush` resolution emits **E0412
+  `FlushOnNonStaged`** if the target exists but isn't
+  `#staged`, **E0413 `FlushOfUnknownAutomaton`** if the
+  target doesn't resolve to any automaton (distinct from
+  E0412 so users can disambiguate "I forgot the modifier"
+  from "I typoed the name"). Five new resolver tests.
+- **Codegen (`crates/codegen/src/lib.rs`):**
+  - `AutomatonInfo` gains an `is_staged: bool` field and
+    a `write_global()` helper that returns either
+    `@<Name>.shadow` (staged) or `@<Name>.state` (default).
+  - `emit_automaton_state_structs` emits the second
+    `@<Name>.shadow = global %struct.<Name>
+    zeroinitializer` global for staged automata only.
+  - The three write paths (`emit_field_store`,
+    `emit_indexed_field_store`, the transition-exit
+    state-tag write in `emit_exit_fence_if_pending`)
+    consult `write_global()` so writes are correctly
+    routed to the shadow. Reads continue to use
+    `@<Name>.state` unconditionally — the shadow is for
+    pending writes only.
+  - New `emit_staged_intrinsics_if_needed` emits
+    `declare void @llvm.memcpy.p0.p0.i64(i8*, i8*, i64,
+    i1)` once at module scope iff the program contains at
+    least one `#staged` automaton (so non-staged programs
+    are byte-identical to pre-slice-18 output).
+  - New `emit_flush(automaton)` lowers `#flush Name;` to
+    bitcasts of both globals to `i8*`, computes the
+    struct size via the GEP-on-null idiom (target-pointer-
+    width-agnostic), then issues the `llvm.memcpy` call.
+    Eight new codegen tests cover shadow-emission,
+    write-redirection, read-from-live preservation,
+    flush-memcpy shape, multi-state tag-write redirection,
+    and the no-staged → no-intrinsic invariant.
+
+**Sample:** `examples/staged_pose_handoff.cl` — the
+canonical "ISR builds up a complete pose update under
+`#atomic: interrupt_critical;`, then flushes" pattern. The
+generated IR shows two ISRs writing into `@Pose.shadow`,
+the `cpsid i` / `cpsie i` mask wrapping the bodies, the
+`llvm.memcpy` flush call, and three `@fn`-side
+`@snapshot Pose.{x,y,theta}` readers reading from
+`@Pose.state`. A non-staged sibling automaton (`Counter`)
+in the same file demonstrates that the codegen leaves
+unstaged automata's IR unchanged.
+
+**What's deliberately NOT in this slice:**
+
+- **No `#flush` profile check.** The resolver doesn't yet
+  enforce that `#flush A;` requires `A` in the enclosing
+  callable's `#mutates: [...]` profile. The existing
+  effect-checker enforces this for `#mutate`; extending
+  the same check to `#flush` is a one-line follow-up
+  slice once the helper is reused.
+- **No reads-from-shadow.** v0.2 always reads from live.
+  A `@shadow Pose.x` operator that explicitly reads the
+  pending value (useful for "did the ISR start an
+  update?" patterns) is a future slice if a real firmware
+  pattern demands it.
+- **No partial flushes.** `#flush Pose;` commits the
+  whole struct. A `#flush Pose { x, y };` per-field form
+  is a possible future surface but the v0.2 firmware
+  patterns don't seem to need it.
+- **Register-block automata can't be `#staged`** at
+  codegen time — the combination falls back to direct
+  MMIO (no shadow makes sense for memory-mapped
+  hardware). A future parse-time error can lift this to
+  an explicit rejection if firmware patterns prove the
+  combination is always wrong.
+
 ### Added — Slice 17: `break` and `continue` for `sigma` loops (2026-05-09)
 
 Two new statement keywords let a sigma-loop body short-circuit

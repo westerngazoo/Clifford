@@ -276,7 +276,25 @@ impl<'t> Parser<'t> {
             TokenKind::KwAtType => self.parse_type_decl(lead.span.start).map(Item::Type),
             TokenKind::KwAtTrait => self.parse_trait_decl(lead.span.start).map(Item::Trait),
             TokenKind::KwHashAutomaton => {
-                self.parse_automaton_decl(lead.span.start).map(Item::Automaton)
+                self.parse_automaton_decl(lead.span.start, false).map(Item::Automaton)
+            }
+            // Decision #12 (v0.2): `#staged` is an item-level prefix on
+            // `#automaton`. Consume it here, then dispatch to
+            // `parse_automaton_decl` with `staged = true`. The `#staged`
+            // keyword is reserved for `#automaton` only; any other follower
+            // is a parse error.
+            TokenKind::KwHashStaged => {
+                let start = lead.span.start;
+                self.advance(); // `#staged`
+                let next = self.peek().clone();
+                if !matches!(next.kind, TokenKind::KwHashAutomaton) {
+                    return Err(ParseError::Expected {
+                        expected: "`#automaton` after `#staged` modifier (Decision #12)",
+                        found: next.kind,
+                        at: next.span.start,
+                    });
+                }
+                self.parse_automaton_decl(start, true).map(Item::Automaton)
             }
             TokenKind::KwHashEffect => {
                 self.parse_effect_decl(lead.span.start).map(Item::Effect)
@@ -361,7 +379,11 @@ impl<'t> Parser<'t> {
     /// parse time (E0210) because they're a clear-cut grammatical mistake;
     /// reordering them later doesn't change semantics, but writing two of
     /// the same one is always wrong.
-    fn parse_automaton_decl(&mut self, start: usize) -> Result<AutomatonDecl, ParseError> {
+    fn parse_automaton_decl(
+        &mut self,
+        start: usize,
+        staged: bool,
+    ) -> Result<AutomatonDecl, ParseError> {
         self.advance(); // `#automaton`
         let (name, _) = self.expect_ident("automaton name after `#automaton`")?;
         self.expect(TokenKind::LBrace, "`{` to open automaton body")?;
@@ -433,6 +455,7 @@ impl<'t> Parser<'t> {
             states,
             fields,
             transitions,
+            staged,
             span: Span::new(start, close.end),
         })
     }
@@ -1920,6 +1943,10 @@ impl<'t> Parser<'t> {
             // body — the resolver enforces that, not the parser.
             TokenKind::KwBreak => self.parse_break_stmt(start),
             TokenKind::KwContinue => self.parse_continue_stmt(start),
+            // Slice 18 (Decision #12): `#flush Name;` — commit a
+            // `#staged` automaton's shadow state. The resolver
+            // checks that `Name` is a staged automaton (E0412).
+            TokenKind::KwHashFlush => self.parse_flush_stmt(start),
             // Slice 13: `if cond { … } else { … }` statement form.
             TokenKind::KwIf => self.parse_if_stmt(start),
             // Mutation sugar (Decision #15): `Auto.field <op>= expr;` — must
@@ -2282,6 +2309,26 @@ impl<'t> Parser<'t> {
         let close = self.expect(TokenKind::Semi, "`;` to terminate `continue` statement")?;
         Ok(Stmt {
             kind: StmtKind::Continue,
+            span: Span::new(start, close.end),
+        })
+    }
+
+    /// Parse `#flush Name;` per slice 18 (Decision #12).
+    ///
+    /// Surface form is exactly `#flush <Ident> ;` — a single bare
+    /// automaton name. Composite paths (`#flush A.sub;`) and
+    /// multi-target forms (`#flush A, B;`) are deliberately not in
+    /// scope for v0.2; if firmware patterns demand them, that's a
+    /// future surface extension. The resolver enforces that the
+    /// named automaton has `staged == true` (E0412); the parser
+    /// only checks the grammar.
+    fn parse_flush_stmt(&mut self, start: usize) -> Result<Stmt, ParseError> {
+        self.advance(); // `#flush`
+        let (automaton, _) =
+            self.expect_ident("automaton name after `#flush` (Decision #12)")?;
+        let close = self.expect(TokenKind::Semi, "`;` to terminate `#flush` statement")?;
+        Ok(Stmt {
+            kind: StmtKind::Flush { automaton },
             span: Span::new(start, close.end),
         })
     }
@@ -6604,6 +6651,99 @@ mod tests {
             msg.contains("`;`") || msg.contains("Semi"),
             "expected error to mention `;`; got: {msg}"
         );
+    }
+
+    // ─── Slice 18: `#staged` automaton + `#flush` stmt (Decision #12) ─────
+
+    #[test]
+    fn unprefixed_automaton_is_not_staged() {
+        // Sanity: existing `#automaton Name { … }` form continues
+        // to parse with `staged = false`, no surface change.
+        let p = parse_str("#automaton C { v: u32; }").unwrap();
+        let a = auto(&p, 0);
+        assert!(!a.staged, "unprefixed automaton must not be staged");
+        assert_eq!(a.name, "C");
+    }
+
+    #[test]
+    fn staged_automaton_sets_flag() {
+        // `#staged #automaton Name { … }` lifts the flag.
+        let p = parse_str("#staged #automaton C { v: u32; }").unwrap();
+        let a = auto(&p, 0);
+        assert!(a.staged, "expected #staged flag to be set");
+        assert_eq!(a.name, "C");
+    }
+
+    #[test]
+    fn staged_without_automaton_errors() {
+        // `#staged` is reserved for `#automaton` only — anything
+        // else (a fn, a trait, etc.) is a parse error citing
+        // Decision #12.
+        let err = parse_str("#staged @fn t() { return; }")
+            .expect_err("expected parse error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("#automaton") || msg.contains("Decision #12"),
+            "expected error to mention #automaton; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn flush_stmt_parses_with_target() {
+        // `#flush Name;` — single-ident target, semicolon-terminated.
+        let stmt = parse_stmt_str("#flush Counter;");
+        match &stmt.kind {
+            StmtKind::Flush { automaton } => {
+                assert_eq!(automaton, "Counter");
+            }
+            other => panic!("expected Flush, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn flush_without_target_errors() {
+        // `#flush ;` — missing automaton ident.
+        let err = parse_str("@fn t() { #flush ; }").expect_err("expected parse error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("automaton name") || msg.contains("Ident"),
+            "expected error to mention automaton name; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn flush_without_semicolon_errors() {
+        // `#flush Name` — missing `;`.
+        let err = parse_str("@fn t() { #flush Counter }")
+            .expect_err("expected parse error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("`;`") || msg.contains("Semi"),
+            "expected error to mention `;`; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn flush_inside_effect_body_parses() {
+        // `#flush Counter;` lives inside a `#effect` body. Smoke
+        // test: the surrounding effect parses, the flush is the
+        // sole statement (plus the trailing return).
+        let p = parse_str(
+            "#effect commit() #mutates: [Counter] { #flush Counter; return; }",
+        )
+        .unwrap();
+        match &p.items[0] {
+            Item::Effect(decl) => {
+                assert_eq!(decl.body.stmts.len(), 2);
+                match &decl.body.stmts[0].kind {
+                    StmtKind::Flush { automaton } => {
+                        assert_eq!(automaton, "Counter");
+                    }
+                    other => panic!("expected Flush stmt, got {:?}", other),
+                }
+            }
+            other => panic!("expected Effect, got {:?}", other),
+        }
     }
 
     #[test]
