@@ -397,6 +397,12 @@ pub struct TransitionDecl {
     /// `clifford-types` and consumed by codegen / `cliffordc audit` /
     /// certification. The orthogonality engine ignores them.
     pub trait_list: Vec<TraitRef>,
+    /// `#atomic: <kind>` clause per §6.6 (v0.2-δ). `None` if no
+    /// `#atomic` clause appears in source. On a `#transition`
+    /// the atomicity is per-invocation: every `#> name()` call
+    /// site enters the atomic scope for the duration of the
+    /// body.
+    pub atomic: Option<AtomicKind>,
     /// Transition body — sequence of statements per §2.6.
     pub body: Block,
     /// Source span covering `#transition name (-> Dest)? $ [...]? { … }`
@@ -429,6 +435,12 @@ pub struct EffectDecl {
     /// `$ [...]` clause appears in source. See [`TransitionDecl::trait_list`]
     /// for predeclared trait set and consumer responsibilities.
     pub trait_list: Vec<TraitRef>,
+    /// `#atomic: <kind>` clause per §6.6 (v0.2-δ). `None` if no
+    /// `#atomic` clause appears in source. Consumed by
+    /// `clifford-ortho` to suppress concurrency pairs and by a
+    /// future codegen slice to emit target-specific
+    /// interrupt-disable wrapping.
+    pub atomic: Option<AtomicKind>,
     /// Effect body — sequence of statements.
     pub body: Block,
     /// Source span covering the full declaration end-to-end.
@@ -463,10 +475,48 @@ pub struct InterruptDecl {
     /// relevant on `#interrupt`s for `Hardware` / `Realtime` classification
     /// and for memory-ordering markers (`Acquire` / `Release` / `SeqCst`).
     pub trait_list: Vec<TraitRef>,
+    /// `#atomic: <kind>` clause per §6.6 (v0.2-δ). `None` if no
+    /// `#atomic` clause appears in source. On an `#interrupt` this
+    /// has limited utility (interrupts already mask their own
+    /// priority on entry) but is parsed for symmetry with
+    /// `#effect` and to allow an interrupt to assert it masks
+    /// ALL other interrupts for the duration of its body.
+    pub atomic: Option<AtomicKind>,
     /// Interrupt handler body — sequence of statements.
     pub body: Block,
     /// Source span covering the full declaration.
     pub span: Span,
+}
+
+/// `#atomic: <kind>` clause per §6.6.
+///
+/// Asserts that the body executes atomically with respect to the
+/// named scope. The clause is consumed by:
+///
+/// - **`clifford-ortho` (§7):** suppresses orthogonality pairs
+///   between the atomic callable and any callable in the masked
+///   scope (e.g. `interrupt_critical` masks all `#interrupt`s).
+/// - **`clifford-codegen` (future slice):** wraps the body in
+///   target-specific intrinsics (`cpsid i` / `cpsie i` on
+///   Cortex-M for `interrupt_critical`).
+///
+/// v0.2-δ scope: `InterruptCritical` is recognised end-to-end.
+/// Other kinds (`MulticoreCritical`) are reserved for v0.7+ when
+/// Decision #21's lock machinery lands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AtomicKind {
+    /// `#atomic: interrupt_critical` — body runs with all maskable
+    /// interrupts disabled (CLI/STI on Cortex-M, equivalent on
+    /// other targets).
+    InterruptCritical,
+    /// `#atomic: multicore_critical` — body holds an inter-core
+    /// lock for its duration. Reserved for Decision #21 (v0.7+);
+    /// parsed but not yet consumed by ortho or codegen.
+    MulticoreCritical,
+    /// `#atomic: <user_ident>` — user-defined atomicity scope.
+    /// Parsed verbatim; downstream consumers decide what it means.
+    Custom(String),
 }
 
 /// `#priority: LOW | MEDIUM | HIGH | <integer>` per §2.5.
