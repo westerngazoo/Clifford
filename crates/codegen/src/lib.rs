@@ -186,6 +186,12 @@ pub fn lower(
     // rather than a global state variable.
     emitter.emit_automaton_state_structs(program);
 
+    // Slice 18 (Decision #12): if any automaton is `#staged`, the
+    // `#flush` lowering will need `@llvm.memcpy.p0.p0.i64`. Emit
+    // the declaration once at module scope so every flush site is
+    // a plain `call` with no per-site declaration.
+    emitter.emit_staged_intrinsics_if_needed(program);
+
     // Pass 3: emit one LLVM function per @fn / #effect / #interrupt /
     // #transition. Order is preserved from source so callers see
     // callees declared first when source orders them naturally; LLVM
@@ -340,6 +346,25 @@ struct AutomatonInfo {
     /// `zeroinitializer` so the initial state needs no special
     /// emission.
     state_tags: Vec<(String, u32)>,
+    /// Slice 18 (Decision #12): `true` if the source declared this
+    /// automaton with the `#staged` modifier. Two consequences:
+    ///
+    /// 1. State emission produces **two** globals:
+    ///    `@<Name>.state` (live) and `@<Name>.shadow` (pending).
+    /// 2. `#mutate` and mutation-sugar writes target the shadow
+    ///    global instead of the live one. Reads (`Name.field`,
+    ///    `@snapshot Name.field`) continue to come from live
+    ///    state — the shadow's purpose is to buffer pending
+    ///    writes until an explicit `#flush Name;` commits them
+    ///    by `memcpy`'ing shadow → live.
+    ///
+    /// Register-block automatons cannot be `#staged` (no shadow
+    /// makes sense for MMIO); the parser does not currently
+    /// reject the combination, so the emitter falls back to
+    /// direct-MMIO behaviour for register-block + `#staged`
+    /// (a future slice can lift this to a parse-time error if
+    /// firmware patterns prove the combination is always wrong).
+    is_staged: bool,
 }
 
 impl AutomatonInfo {
@@ -370,6 +395,26 @@ impl AutomatonInfo {
         self.state_tags
             .iter()
             .find_map(|(n, tag)| if n == state_name { Some(*tag) } else { None })
+    }
+
+    /// Slice 18 (Decision #12): the LLVM global symbol that
+    /// receives **writes** to this automaton's fields. For
+    /// `#staged` automata this is `@<Name>.shadow`; for the
+    /// default direct-write case (and for register-block
+    /// automata, which never have a shadow because they are
+    /// MMIO) this is `@<Name>.state`.
+    ///
+    /// Used by `emit_field_store`, `emit_indexed_field_store`,
+    /// and the transition tag-write sites — every code path
+    /// that emits a `store` against the live state struct must
+    /// route through this helper so that staged-automaton
+    /// writes are buffered.
+    fn write_global(&self) -> String {
+        if self.is_staged && !self.is_register_block {
+            format!("@{}.shadow", self.name)
+        } else {
+            format!("@{}.state", self.name)
+        }
     }
 }
 
@@ -496,6 +541,7 @@ impl<'a> Emitter<'a> {
                         is_register_block,
                         base_address,
                         state_tags,
+                        is_staged: decl.staged,
                     },
                 );
                 // Slice 4: record transition→owner mapping so
@@ -555,8 +601,130 @@ impl<'a> Emitter<'a> {
                 name = decl.name,
             )
             .ok();
+            // Slice 18 (Decision #12): `#staged` automata get a
+            // second global of identical type — the *shadow*
+            // — into which `#mutate` writes are redirected. The
+            // shadow stays consistent with the live struct's
+            // initial zero state so a flush issued before any
+            // intervening mutation is a memcpy of zeros (no-op
+            // semantically; the user gets uniform behaviour
+            // across the program lifecycle). Multi-state
+            // automatons include the i32 state tag in the
+            // shadow too — the v0.2 semantics is "shadow ==
+            // pending replacement of the entire state struct";
+            // a future refinement could shadow only user fields
+            // but the cost is non-trivial (separate types) and
+            // the wins are minor for the firmware patterns this
+            // serves.
+            if decl.staged {
+                writeln!(
+                    &mut self.out,
+                    "@{name}.shadow = global %struct.{name} zeroinitializer",
+                    name = decl.name,
+                )
+                .ok();
+            }
             writeln!(&mut self.out).ok();
         }
+    }
+
+    /// Slice 18 (Decision #12): emit the `@llvm.memcpy` declaration
+    /// once at module scope iff the program contains at least one
+    /// `#staged` automaton. Skipping the declaration when no flush
+    /// can possibly be emitted keeps non-staged programs' IR byte-
+    /// identical to pre-slice-18 output.
+    ///
+    /// We use `@llvm.memcpy.p0.p0.i64` (i8\* dest, i8\* src, i64
+    /// length, i1 isvolatile). The opaque-pointer form
+    /// (`p0.p0` = ptr-to-ptr) is the LLVM-15+ canonical spelling;
+    /// the `i64` length keeps the same intrinsic across 32-bit and
+    /// 64-bit targets (the high bits are zero on 32-bit and LLVM
+    /// truncates to the target pointer width internally).
+    fn emit_staged_intrinsics_if_needed(&mut self, program: &Program) {
+        let any_staged = program.items.iter().any(|item| {
+            matches!(item, Item::Automaton(decl) if decl.staged && decl.address.is_none())
+        });
+        if !any_staged {
+            return;
+        }
+        writeln!(
+            &mut self.out,
+            "declare void @llvm.memcpy.p0.p0.i64(i8*, i8*, i64, i1)",
+        )
+        .ok();
+        writeln!(&mut self.out).ok();
+    }
+
+    /// Slice 18 (Decision #12): lower `#flush Name;` to a memcpy
+    /// from `@Name.shadow` to `@Name.state`.
+    ///
+    /// The byte length is computed at IR-time via the
+    /// `getelementptr (T\* null, 1) -> ptrtoint -> i64` idiom so
+    /// the lowering is target-pointer-width-agnostic and doesn't
+    /// require us to know the struct's layout in bytes. LLVM
+    /// constant-folds this to a literal at the IR-to-machine
+    /// translation step, so there's no runtime cost.
+    ///
+    /// Returns `CodegenError::UnresolvedName` if `automaton` is
+    /// not in the registry (the resolver should have caught this
+    /// upstream as E0413; the error here is a defence in depth).
+    /// Returns `CodegenError::NotYetImplemented` if the named
+    /// automaton is not `#staged` (resolver-side E0412 should
+    /// have caught this; same defence-in-depth posture).
+    fn emit_flush(&mut self, automaton: &str) -> Result<(), CodegenError> {
+        let info = self.automatons.get(automaton).ok_or_else(|| {
+            CodegenError::UnresolvedName {
+                name: automaton.to_owned(),
+            }
+        })?;
+        if !info.is_staged {
+            return Err(CodegenError::NotYetImplemented {
+                what: "`#flush` on a non-staged automaton (resolver should have caught this; please file a bug)",
+            });
+        }
+        if info.is_register_block {
+            return Err(CodegenError::NotYetImplemented {
+                what: "`#flush` on a register-block automaton (no shadow exists; the combination is undefined for v0.2)",
+            });
+        }
+
+        // Compute the struct size via the GEP-on-null idiom. LLVM
+        // constant-folds the result to the literal byte count.
+        let size_ptr = self.fresh_value();
+        writeln!(
+            &mut self.out,
+            "  {size_ptr} = getelementptr %struct.{automaton}, %struct.{automaton}* null, i32 1",
+        )
+        .ok();
+        let size_int = self.fresh_value();
+        writeln!(
+            &mut self.out,
+            "  {size_int} = ptrtoint %struct.{automaton}* {size_ptr} to i64",
+        )
+        .ok();
+
+        // Bitcast both globals to i8* (the memcpy intrinsic takes
+        // i8* arguments). For LLVM-15+ opaque pointers these are
+        // formal no-ops but we keep the bitcast spelling for
+        // compatibility with the older typed-pointer dialect.
+        let dst_ptr = self.fresh_value();
+        writeln!(
+            &mut self.out,
+            "  {dst_ptr} = bitcast %struct.{automaton}* @{automaton}.state to i8*",
+        )
+        .ok();
+        let src_ptr = self.fresh_value();
+        writeln!(
+            &mut self.out,
+            "  {src_ptr} = bitcast %struct.{automaton}* @{automaton}.shadow to i8*",
+        )
+        .ok();
+        writeln!(
+            &mut self.out,
+            "  call void @llvm.memcpy.p0.p0.i64(i8* {dst_ptr}, i8* {src_ptr}, i64 {size_int}, i1 false) ; #flush {automaton} (Decision #12)",
+        )
+        .ok();
+        Ok(())
     }
 
     /// Emit one LLVM function per `#effect` declaration. Effects are
@@ -987,10 +1155,22 @@ impl<'a> Emitter<'a> {
         if let Some((auto, tag)) = self.pending_transition_tag_write.clone() {
             // Stage 1: pointer to the state-tag field (LLVM index 0
             // for multi-state automatons by construction).
+            //
+            // Slice 18 (Decision #12): for `#staged` automata the
+            // tag write is part of the deferred-mutation set —
+            // route it to the shadow global so a `#flush` commits
+            // both field updates AND the destination state tag in
+            // one memcpy. This preserves the "atomic commit"
+            // invariant for staged transitions.
+            let target_global = self
+                .automatons
+                .get(&auto)
+                .map(|info| info.write_global())
+                .unwrap_or_else(|| format!("@{auto}.state"));
             let tag_ptr = self.fresh_value();
             writeln!(
                 &mut self.out,
-                "  {tag_ptr} = getelementptr %struct.{auto}, %struct.{auto}* @{auto}.state, i32 0, i32 0",
+                "  {tag_ptr} = getelementptr %struct.{auto}, %struct.{auto}* {target_global}, i32 0, i32 0",
             )
             .ok();
             // Stage 2: store the destination tag.
@@ -1213,6 +1393,30 @@ impl<'a> Emitter<'a> {
                     self.errors.push(e);
                 }
             }
+            // Slice 18 (Decision #12): `#flush Name;` — commit a
+            // `#staged` automaton's shadow into its live state.
+            // Resolver has already verified the target is a
+            // `#staged` automaton (E0412 / E0413), so we just
+            // emit the memcpy here. Lowering shape:
+            //
+            //   call void @llvm.memcpy.p0.p0.i64(
+            //       i8* bitcast (%struct.Name* @Name.state to i8*),
+            //       i8* bitcast (%struct.Name* @Name.shadow to i8*),
+            //       i64 ptrtoint (%struct.Name* getelementptr
+            //           (%struct.Name, %struct.Name* null, i32 1)
+            //           to i64),
+            //       i1 false
+            //   )
+            //
+            // The `getelementptr null, 1` idiom yields the struct's
+            // size in bytes without us having to know the target
+            // pointer width. The trailing `i1 false` is the
+            // `isvolatile` argument.
+            StmtKind::Flush { automaton } => {
+                if let Err(e) = self.emit_flush(automaton) {
+                    self.errors.push(e);
+                }
+            }
             other => {
                 self.errors.push(CodegenError::NotYetImplemented {
                     what: stmt_kind_name(other),
@@ -1316,10 +1520,18 @@ impl<'a> Emitter<'a> {
         // Stage 1: pointer to the array field itself.
         let field_ptr = match loc {
             FieldLocation::Struct { idx } => {
+                // Slice 18 (Decision #12): writes to a `#staged`
+                // automaton are redirected to its shadow global;
+                // see [`AutomatonInfo::write_global`].
+                let target_global = self
+                    .automatons
+                    .get(automaton)
+                    .map(|info| info.write_global())
+                    .unwrap_or_else(|| format!("@{automaton}.state"));
                 let p = self.fresh_value();
                 writeln!(
                     &mut self.out,
-                    "  {p} = getelementptr %struct.{automaton}, %struct.{automaton}* @{automaton}.state, i32 0, i32 {idx}",
+                    "  {p} = getelementptr %struct.{automaton}, %struct.{automaton}* {target_global}, i32 0, i32 {idx}",
                 )
                 .ok();
                 p
@@ -1366,10 +1578,18 @@ impl<'a> Emitter<'a> {
     ) {
         match loc {
             FieldLocation::Struct { idx } => {
+                // Slice 18 (Decision #12): writes to a `#staged`
+                // automaton are redirected to its shadow global;
+                // see [`AutomatonInfo::write_global`].
+                let target_global = self
+                    .automatons
+                    .get(automaton)
+                    .map(|info| info.write_global())
+                    .unwrap_or_else(|| format!("@{automaton}.state"));
                 let ptr = self.fresh_value();
                 writeln!(
                     &mut self.out,
-                    "  {ptr} = getelementptr {struct_name}, {struct_name}* @{automaton}.state, i32 0, i32 {idx}",
+                    "  {ptr} = getelementptr {struct_name}, {struct_name}* {target_global}, i32 0, i32 {idx}",
                 )
                 .ok();
                 writeln!(&mut self.out, "  store {ir_ty} {value}, {ir_ty}* {ptr}").ok();
@@ -5704,6 +5924,7 @@ mod tests {
             is_register_block: false,
             base_address: 0,
             state_tags: vec![],
+            is_staged: false,
         };
         assert_eq!(info.llvm_field_index(0), 0);
         assert_eq!(info.llvm_field_index(3), 3);
@@ -5720,6 +5941,7 @@ mod tests {
             is_register_block: false,
             base_address: 0,
             state_tags: vec![("A".to_owned(), 0), ("B".to_owned(), 1)],
+            is_staged: false,
         };
         assert!(info.is_multi_state());
         assert_eq!(info.llvm_field_index(0), 1);
@@ -7282,5 +7504,180 @@ mod tests {
                 "missing `{needle}` in IR; got:\n{ir}"
             );
         }
+    }
+
+    // ─── Slice 18: `#staged` automaton + `#flush` (Decision #12) ─────────
+
+    #[test]
+    fn s18_staged_automaton_emits_shadow_global() {
+        // A `#staged #automaton` produces TWO global state instances:
+        // `@<Name>.state` (live) and `@<Name>.shadow` (pending writes).
+        // Both are zero-initialised so the program lifecycle starts
+        // with the shadow == live invariant.
+        let src = "#staged #automaton C { v: u32; }";
+        let ir = lower_str(src).expect("lower staged automaton");
+        assert!(
+            ir.contains("@C.state = global %struct.C zeroinitializer"),
+            "expected live global @C.state; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("@C.shadow = global %struct.C zeroinitializer"),
+            "expected shadow global @C.shadow; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s18_unstaged_automaton_emits_no_shadow_global() {
+        // Pre-slice-18 IR shape is preserved for non-staged
+        // automata: only `@<Name>.state`, no shadow.
+        let src = "#automaton C { v: u32; }";
+        let ir = lower_str(src).expect("lower plain automaton");
+        assert!(
+            ir.contains("@C.state = global %struct.C zeroinitializer"),
+            "expected live global @C.state; got:\n{ir}"
+        );
+        assert!(
+            !ir.contains("@C.shadow"),
+            "non-staged automaton must not emit a shadow; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s18_mutate_short_on_staged_writes_to_shadow() {
+        // `Counter.value = 5u32;` against a `#staged` automaton must
+        // GEP into `@Counter.shadow`, NOT `@Counter.state`. The
+        // pre-slice-18 IR would have hit `.state` directly.
+        let src = "\
+            #staged #automaton Counter { value: u32; }\n\
+            #effect set() #mutates: [Counter] { Counter.value = 5u32; }\n\
+        ";
+        let ir = lower_str(src).expect("lower staged write");
+        assert!(
+            ir.contains("@Counter.shadow"),
+            "expected write to target @Counter.shadow; got:\n{ir}"
+        );
+        // The store itself must reference a pointer derived from
+        // shadow, so the GEP appears in the effect body.
+        assert!(
+            ir.contains("getelementptr %struct.Counter, %struct.Counter* @Counter.shadow"),
+            "expected GEP via @Counter.shadow; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s18_mutate_block_on_staged_writes_to_shadow() {
+        // Bulk-form `#mutate Counter { value = 7u32 }` likewise
+        // routes through the shadow global.
+        let src = "\
+            #staged #automaton Counter { value: u32; }\n\
+            #effect set() #mutates: [Counter] { #mutate Counter { value = 7u32 }; }\n\
+        ";
+        let ir = lower_str(src).expect("lower staged #mutate");
+        assert!(
+            ir.contains("getelementptr %struct.Counter, %struct.Counter* @Counter.shadow"),
+            "#mutate on staged automaton must GEP into shadow; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s18_field_read_on_staged_still_reads_live() {
+        // Reads continue to come from `@<Name>.state` (live)
+        // regardless of staged vs. non-staged. The shadow is for
+        // pending WRITES only — readers see consistent committed
+        // state.
+        let src = "\
+            #staged #automaton Counter { value: u32; }\n\
+            @fn observe() -> u32 { return Counter.value; }\n\
+        ";
+        let ir = lower_str(src).expect("lower staged read");
+        assert!(
+            ir.contains("getelementptr %struct.Counter, %struct.Counter* @Counter.state"),
+            "read of Counter.value must come from live @Counter.state; got:\n{ir}"
+        );
+        // The read path must NOT touch shadow.
+        assert!(
+            !ir.contains("@Counter.shadow, i32 0, i32 0"),
+            "read path must not GEP into shadow; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s18_flush_emits_memcpy_shadow_to_state() {
+        // `#flush Counter;` lowers to a memcpy from the shadow to
+        // the live global. The intrinsic declaration appears at
+        // module scope (emitted once for the whole module).
+        let src = "\
+            #staged #automaton Counter { value: u32; }\n\
+            #effect commit() #mutates: [Counter] { #flush Counter; return; }\n\
+        ";
+        let ir = lower_str(src).expect("lower flush");
+        // Module-level intrinsic decl.
+        assert!(
+            ir.contains("declare void @llvm.memcpy.p0.p0.i64(i8*, i8*, i64, i1)"),
+            "expected llvm.memcpy decl; got:\n{ir}"
+        );
+        // Bitcasts of both globals to i8* (one for dest, one for src).
+        assert!(
+            ir.contains("bitcast %struct.Counter* @Counter.state to i8*"),
+            "expected dest bitcast of @Counter.state; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("bitcast %struct.Counter* @Counter.shadow to i8*"),
+            "expected src bitcast of @Counter.shadow; got:\n{ir}"
+        );
+        // The memcpy call itself.
+        assert!(
+            ir.contains("call void @llvm.memcpy.p0.p0.i64"),
+            "expected memcpy call; got:\n{ir}"
+        );
+        // GEP-on-null size idiom for target-pointer-width
+        // independence.
+        assert!(
+            ir.contains("getelementptr %struct.Counter, %struct.Counter* null, i32 1"),
+            "expected GEP-on-null size idiom; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s18_no_flush_no_intrinsic_decl() {
+        // Unsurprisingly: a program without any `#staged`
+        // automaton must not pollute the IR with the memcpy
+        // declaration. Keeps non-staged programs byte-identical
+        // to pre-slice-18 output.
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #effect set() #mutates: [C] { C.v = 1u32; }\n\
+        ";
+        let ir = lower_str(src).expect("lower non-staged program");
+        assert!(
+            !ir.contains("@llvm.memcpy"),
+            "non-staged program must not declare memcpy; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s18_multi_state_staged_tag_write_targets_shadow() {
+        // For a multi-state `#staged` automaton, the destination-
+        // state tag write at transition exit must also route
+        // through the shadow so a flush commits both field
+        // updates AND the new state tag atomically.
+        let src = "\
+            #staged #automaton M { #states: [A, B]; v: u32;\n\
+              #transition flip -> B { M.v = 99u32; }\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower staged multi-state");
+        // Tag write (`store i32 1, i32* %tmp.X`) must appear
+        // after a GEP into `@M.shadow` at LLVM idx 0.
+        assert!(
+            ir.contains("getelementptr %struct.M, %struct.M* @M.shadow, i32 0, i32 0"),
+            "expected tag-write GEP into @M.shadow; got:\n{ir}"
+        );
+        // The value write is at user idx 0 → LLVM idx 1
+        // (multi-state shifts user fields by one).
+        assert!(
+            ir.contains("getelementptr %struct.M, %struct.M* @M.shadow, i32 0, i32 1"),
+            "expected value-write GEP into @M.shadow at idx 1; got:\n{ir}"
+        );
     }
 }
