@@ -94,3 +94,48 @@
   }
   return total;
 }
+
+
+// ─── Early-exit and skip-iteration patterns (slice 17) ──────────────
+//
+// `break` and `continue` inside sigma bodies. Resolver enforces
+// that both keywords appear inside a sigma loop (E0411 otherwise).
+// Codegen emits `br label %sigma.exit.<id>` for break and
+// `br label %sigma.continue.<id>` for continue, where the
+// continue block holds the iteration-variable increment so the
+// loop advances cleanly.
+//
+// `first_index_past` returns the first index strictly greater
+// than `threshold`, or `n` if no such index exists (sentinel
+// "not found"). The `break;` short-circuits the scan once we
+// find a match — the canonical "early exit when a buffer
+// position is reached" firmware pattern. Demonstrates:
+//   - `break;` early-exit out of the innermost sigma         (slice 17)
+//   - `let mut` accumulator + reassignment                   (slice 12)
+//   - `if` inside sigma + comparison                         (slice 13)
+
+@fn first_index_past(n: u32, threshold: u32) -> u32 {
+  let mut found: u32 = n;
+  sigma i in 0u32..n {
+    if i > threshold {
+      found = i;
+      break;
+    }
+  }
+  return found;
+}
+
+// `count_skipping_low` counts how many indices in `0..n` are
+// strictly greater than `low`, using `continue;` to skip the
+// "low" indices instead of negating the predicate. Demonstrates:
+//   - `continue;` skip-iteration                             (slice 17)
+//   - accumulator updated only on the kept indices           (slice 12)
+
+@fn count_skipping_low(n: u32, low: u32) -> u32 {
+  let mut kept: u32 = 0u32;
+  sigma i in 0u32..n {
+    if i <= low { continue; }
+    kept = kept + 1u32;
+  }
+  return kept;
+}

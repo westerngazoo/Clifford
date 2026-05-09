@@ -7,6 +7,111 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 17: `break` and `continue` for `sigma` loops (2026-05-09)
+
+Two new statement keywords let a sigma-loop body short-circuit
+or skip an iteration, closing the firmware ergonomics gap of
+"early-exit when a buffer position is reached" patterns
+without forcing a sentinel-encoded re-roll. Both keywords are
+unit statements (`break;`, `continue;`) and apply to the
+**innermost enclosing** sigma loop.
+
+**Surface syntax:**
+
+```clifford
+@fn first_index_past(n: u32, threshold: u32) -> u32 {
+  let mut found: u32 = n;
+  sigma i in 0u32..n {
+    if i > threshold { found = i; break; }
+  }
+  return found;
+}
+
+@fn count_skipping_low(n: u32, low: u32) -> u32 {
+  let mut kept: u32 = 0u32;
+  sigma i in 0u32..n {
+    if i <= low { continue; }
+    kept = kept + 1u32;
+  }
+  return kept;
+}
+```
+
+**Pipeline changes:**
+
+- **AST (`crates/ast/src/lib.rs`):** new
+  `StmtKind::Break` and `StmtKind::Continue` unit variants
+  alongside `Sigma`. Span is the keyword's source location;
+  the parser does not store a target label (no labelled
+  loops in v0.2).
+- **Parser (`crates/parser/src/lib.rs`):**
+  `parse_break_stmt` / `parse_continue_stmt` consume the
+  keyword + `;`. Dispatched from `parse_stmt` on `KwBreak` /
+  `KwContinue`. Four parser tests cover happy-path, sigma
+  body, and the missing-semicolon error.
+- **Resolver (`crates/resolve/src/lib.rs`):** new
+  `loop_depth: u32` Walker field. `StmtKind::Sigma` walking
+  increments the depth around the body and decrements after.
+  `Break` / `Continue` arms reject `loop_depth == 0` with
+  **E0411 `KeywordOutsideLoop`**, citing the keyword by name
+  in the error message.
+- **Codegen (`crates/codegen/src/lib.rs`):** sigma's emitter
+  now produces a **four-block CFG** — `header / body /
+  continue / exit` — with the iteration-variable increment
+  living in the new `sigma.continue.<id>` block. The phi's
+  body-incoming label is `%sigma.continue.<id>` (was
+  `%sigma.body.<id>`), giving `continue;` a clean back-edge
+  target without re-emitting the increment. A new
+  `sigma_loop_stack: Vec<(continue_label, exit_label)>`
+  field on `Emitter` is pushed on sigma entry / popped on
+  exit; `Break` / `Continue` arms read the top of the stack
+  and emit `br label %sigma.exit.<id>` or `br label
+  %sigma.continue.<id>` respectively, then mark
+  `current_block_terminated = true`. Body-statement
+  iteration switched from a `Return(_)`-only check to
+  reading `current_block_terminated` so any terminator
+  (return / break / continue) suppresses dead-code
+  emission. Same fix applied pre-emptively to `emit_if`'s
+  then-block and else-block loops.
+
+**Tests added (8 codegen + 4 parser + 1 resolver):**
+
+- `break_emits_branch_to_sigma_exit_label`
+- `continue_emits_branch_to_sigma_continue_label`
+- `break_in_nested_sigma_targets_innermost_loop`
+- `break_inside_if_inside_sigma_targets_loop_not_if`
+- `break_outside_sigma_rejected_by_resolver` (E0411)
+- `continue_outside_sigma_rejected_by_resolver` (E0411)
+- `break_with_local_mut_acc_can_early_exit`
+- `body_after_break_is_dead_code`
+- Parser: `break_stmt_parses_as_unit`,
+  `continue_stmt_parses_as_unit`,
+  `break_inside_sigma_body_parses`,
+  `break_without_semicolon_errors`
+- The existing
+  `s11_sigma_basic_half_open_emits_loop_cfg` was updated to
+  expect the slice-17 four-block CFG (phi reads from
+  `%sigma.continue.<id>`, new `sigma.continue.<id>:` label).
+
+**Sample:** `examples/buffer_init_sigma.cl` extended with
+two `@fn`s — `first_index_past` (break) and
+`count_skipping_low` (continue) — that compile through to
+LLVM IR with the expected branches.
+
+**What's deliberately NOT in this slice:**
+
+- **No labelled loops.** Both keywords always target the
+  innermost loop. A labelled syntax (`'outer: sigma …`,
+  `break 'outer;`) is a future slice if the firmware
+  patterns warrant it.
+- **No `break <expr>;`.** Sigma loops are pure iteration in
+  v0.2; they have no value. A loop-as-expression form
+  belongs to a different design conversation.
+- **No effect-side checks.** Break/continue are local
+  control-flow inside one effect/transition body; they
+  don't change the function's mutation profile or interact
+  with the ortho engine.
+
 ### Added — `clifford-ortho` v0.2-θ: transition-side `#atomic` inheritance (delegated-ISR pattern) (2026-05-08)
 
 The verifier now recognises the canonical "delegated ISR"
