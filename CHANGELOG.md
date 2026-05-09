@@ -7,6 +7,135 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — `clifford-ortho` v0.2-θ: transition-side `#atomic` inheritance (delegated-ISR pattern) (2026-05-08)
+
+The verifier now recognises the canonical "delegated ISR"
+shape: an interrupt (or effect) whose body is exactly one
+`#>` call to a `#atomic: interrupt_critical;` callee
+**inherits atomicity** from that callee. The pair-check
+treats the inheriting caller as if it were directly
+`#atomic`, suppressing pairs against other interrupts.
+
+Closes the v0.2-δ documented gap that transition-side
+`#atomic` was parsed but not consumed by the verifier. The
+runtime side (codegen v0.2-ε) was already correct — calling
+into the atomic body emits `cpsid i` / `cpsie i`. v0.2-θ makes
+the verifier acknowledge that.
+
+**The pattern that now works:**
+
+```clifford
+#automaton C { v: u32; w: u32;
+  #transition handle #atomic: interrupt_critical; {
+    C.v = 1u32;
+    C.w = 2u32;
+  }
+}
+
+#interrupt SysTick() #mutates: [C] #priority: HIGH {
+  #> handle();   // body = exactly one #> call → inherits atomic
+}
+
+#effect drain() -> u32 #mutates: [C] {
+  let _x: u32 = C.v + C.w;  // would race pre-v0.2-θ; safe now
+  return _x;
+}
+```
+
+**The inheritance rule (deliberately strict):**
+
+- The caller's body must consist of **exactly one** statement.
+- That statement must be a `#> name();` proc-call to a callee
+  declared `#atomic: interrupt_critical;`.
+- A trailing `return;` (no value) is permitted and filtered
+  out before the count.
+
+Anything else — direct mutation, non-atomic call,
+let-binding that reads automaton state, `if`/`sigma` block —
+prevents inheritance. Those statements could expose racy
+operations BEFORE the atomic callee enters its masked region.
+The strict rule keeps the soundness claim tight; richer
+inheritance (multi-statement bodies, atomic-on-call-site
+rather than per-callable) is a future slice with its own
+analysis.
+
+**Implementation (`crates/ortho/src/lib.rs`):**
+
+- New `collect_atomic_callable_names(program) -> HashSet<String>`
+  walks every `Item::Effect` / `Item::Interrupt` /
+  `Item::Automaton.transitions` and indexes each callable
+  declared `#atomic: interrupt_critical;` by name. Effects,
+  interrupts, and transitions are recorded uniformly so
+  inheritance works whichever kind the callee is.
+- New `body_inherits_atomic_from_proc_call(body,
+  &atomic_callables) -> bool` filters trailing `return;` and
+  asserts the remaining single statement is a `ProcCall`
+  whose name is in the atomic-callable set.
+- `verify`'s node-collection now ORs the inheritance check
+  into the per-node `is_atomic` flag for `Effect` and
+  `Interrupt` nodes (only when not already directly atomic;
+  no double-counting). Downstream pair-check is unchanged —
+  the existing v0.2-δ "if either side is atomic AND the
+  other is interrupt → suppress" logic now also fires for
+  inherited-atomic.
+
+**Companion behaviour-doc update.**
+`docs/ortho-atomic-attribute.md` gains a "Delegated-ISR
+inheritance" section explaining the rule, why it's strict,
+the worked example, and the implementation refs. The matrix
+row for `#atomic transition × #interrupt` flips from `❌
+(today)` to `✅ via inheritance (v0.2-θ)`.
+
+**Tests added: 10 new in ortho (64 → 74).**
+
+End-to-end via `verify`:
+- `delegated_isr_inherits_atomic_from_transition_callee` —
+  the canonical pattern: interrupt body = single `#>` call
+  to atomic transition; foreground reader doesn't race.
+- `delegated_isr_with_explicit_return_still_inherits` —
+  trailing `return;` filtered out.
+- `body_with_multiple_statements_does_not_inherit` —
+  conservatism: any extra statement kills inheritance.
+- `body_calling_non_atomic_transition_does_not_inherit` —
+  the callee must itself be `#atomic`.
+- `already_atomic_callable_unaffected_by_inheritance_check`
+  — direct atomic still wins regardless of body shape.
+
+Direct unit tests on the helpers:
+- `body_inherits_atomic_helper_smoke_one_stmt_call`.
+- `body_inherits_atomic_helper_returns_false_on_empty_body`.
+- `body_inherits_atomic_helper_returns_false_when_callee_not_in_set`.
+- `collect_atomic_callable_names_finds_all_three_decl_kinds`
+  (effect + interrupt + transition).
+- `collect_atomic_callable_names_excludes_non_atomic`.
+
+**Pipeline regression checked.** All 7 examples pass through
+v0.2-θ unchanged — none currently use the delegated-ISR
+shape, so the inheritance check returns `false` for every
+existing callable. The slice is forward-looking: it accepts
+patterns that pre-v0.2-θ users would have had to refactor
+into directly-`#atomic` callables.
+
+**Deferred:**
+
+- **Multi-statement atomic-block inheritance**: e.g. a body
+  like `#> step_one(); #> step_two();` where both callees
+  are atomic. Today this fails the one-statement rule even
+  though atomicity could plausibly compose. A future slice
+  could lift this with careful analysis (the gap between the
+  two atomic calls is technically interruptible).
+- **Atomic-on-call-site**: a syntax like
+  `#> proc() #atomic;` to mark individual call sites
+  atomic without changing the callee declaration. Not in
+  the current spec.
+- **Iterative closure**: `#> foo()` where `foo()` is
+  inheritance-atomic from `#> bar()` etc. The strict
+  one-hop rule doesn't iterate; richer chains need explicit
+  `#atomic` on the leaf.
+
+Total ortho tests: **74** (64 + 10). Workspace clean; clippy
+clean. Behaviour doc updated.
+
 ### Added — `clifford-ortho` v0.2-η: `#priority`-aware concurrency inference (2026-05-08)
 
 The §7.3 inference now consults each `#interrupt`'s declared
