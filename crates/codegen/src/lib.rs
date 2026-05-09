@@ -1583,6 +1583,22 @@ impl<'a> Emitter<'a> {
             // `Self.value` (`obj` is `Path([Self])` inside a
             // `#transition` body) resolves to the enclosing owner.
             ExprKind::FieldAccess { obj, field } => self.emit_field_access(obj, field),
+            // v0.2-ζ: `@snapshot Auto.field` — Decision #24 / ADR
+            // 0004 boundary-crossing read. Lowers to the same IR
+            // as `Auto.field` (a single load); the safety
+            // semantics — that this read is owned, immutable from
+            // this point on, and acceptable to race with a single-
+            // word write — is upstream of codegen. The verifier
+            // (clifford-effect's read walker) excludes snapshots
+            // from `actual_reads` so the v0.2-β read-write check
+            // doesn't fire.
+            //
+            // v0.2-ζ MVP supports primitive fields only. Compound
+            // (struct / array) snapshots would tear at the load
+            // level; surface NotYetImplemented for those.
+            ExprKind::Snapshot { automaton, field } => {
+                self.emit_snapshot(automaton, field)
+            }
             // Slice 5: indexed read on an automaton-array field.
             // `Counter.buf[3]` parses as
             // `Index { obj: FieldAccess(Path([Counter]), "buf"), index: 3 }`.
@@ -2521,14 +2537,29 @@ impl<'a> Emitter<'a> {
                 });
             }
         };
+        self.emit_field_access_by_name(&auto_name, field)
+    }
 
+    /// v0.2-ζ refactor: lower a field read against a resolved
+    /// automaton name. Used by both `emit_field_access` (the
+    /// `Auto.field` / `Self.field` expression form) and the
+    /// `Snapshot` arm in `emit_expr` (the `@snapshot Auto.field`
+    /// form). The two surface forms produce the same IR — the
+    /// difference is upstream: `clifford-effect`'s read walker
+    /// excludes `@snapshot` from `actual_reads` so the verifier
+    /// treats it as race-free per ADR 0004.
+    fn emit_field_access_by_name(
+        &mut self,
+        auto_name: &str,
+        field: &str,
+    ) -> Result<String, CodegenError> {
         // Slice 4 split: register-block field reads use volatile
         // load at `inttoptr (i64 base+offset to T*)`; non-register-
         // block reads use the slice-3 GEP+load shape.
         let (is_register_block, abs_addr_or_idx, ir_ty) = {
-            let info = self.automatons.get(&auto_name).ok_or_else(|| {
+            let info = self.automatons.get(auto_name).ok_or_else(|| {
                 CodegenError::UnresolvedName {
-                    name: auto_name.clone(),
+                    name: auto_name.to_owned(),
                 }
             })?;
             let (idx, ir_ty, offset) = info
@@ -2595,6 +2626,73 @@ impl<'a> Emitter<'a> {
             .ok();
             Ok(val)
         }
+    }
+
+    /// v0.2-ζ: lower `@snapshot Auto.field` (Decision #24 / ADR
+    /// 0004). Resolves the automaton name (with `Self` mapping
+    /// to the enclosing transition's owner if applicable), then
+    /// rejects the snapshot if the field's IR type is not a
+    /// single-word primitive (`i8` / `i16` / `i32` / `i64` / `i1`).
+    /// Compound fields (`{T1, T2, …}` structs, `[N x T]` arrays,
+    /// pointer fields) would tear at the load level and can't
+    /// satisfy the snapshot-and-decide guarantee that ADR 0004
+    /// assumes; surface a structured `NotYetImplemented` for
+    /// those.
+    ///
+    /// For primitive fields, the IR is identical to a regular
+    /// `Auto.field` read — a single GEP+load (or volatile load
+    /// for register-block fields). The "snapshot" semantic is
+    /// upstream of codegen: `clifford-effect`'s read walker
+    /// excludes snapshots from `actual_reads`, so the v0.2-β
+    /// graded check doesn't pair the snapshot site against any
+    /// concurrent write.
+    fn emit_snapshot(
+        &mut self,
+        automaton: &str,
+        field: &str,
+    ) -> Result<String, CodegenError> {
+        // Resolve `Self` to the enclosing automaton if we're
+        // inside a transition (the transition resolver upstream
+        // accepts `@snapshot Self.field` per spec).
+        let auto_name: String = if automaton == "Self" {
+            self.enclosing_owner
+                .clone()
+                .ok_or(CodegenError::NotYetImplemented {
+                    what: "@snapshot Self.field outside a #transition body",
+                })?
+        } else {
+            automaton.to_owned()
+        };
+
+        // v0.2-ζ MVP: reject non-primitive fields. The snapshot-
+        // and-decide guarantee depends on the load being a single
+        // hardware instruction; aggregate types load as multiple
+        // ops and would tear concurrently with a write.
+        let ir_ty = self
+            .automatons
+            .get(&auto_name)
+            .and_then(|info| {
+                info.fields.iter().find_map(|(n, t, _)| {
+                    if n == field {
+                        Some(t.clone())
+                    } else {
+                        None
+                    }
+                })
+            })
+            .ok_or_else(|| CodegenError::UnresolvedName {
+                name: format!("{auto_name}.{field}"),
+            })?;
+        if !is_primitive_ir_ty_for_snapshot(&ir_ty) {
+            return Err(CodegenError::NotYetImplemented {
+                what: "@snapshot of non-primitive field (compound types tear at the load level; future slice may add memcpy-snapshot)",
+            });
+        }
+
+        // Delegate to the regular field-access lowering. The
+        // snapshot semantic is purely upstream (verifier excludes
+        // it from actual_reads); the IR is the same load.
+        self.emit_field_access_by_name(&auto_name, field)
     }
 
     /// Emit an SSA-binding identity instruction so a value gets a
@@ -3057,6 +3155,15 @@ enum FieldLocation {
 /// `"0xFF"` etc., possibly with `_` separators) to a `u64` value.
 /// Decimal literals are also accepted as a defensive convenience.
 /// Returns `None` if the literal is malformed.
+/// v0.2-ζ: True iff the IR type is a single-word primitive that
+/// loads atomically on every supported target. Used by
+/// `emit_snapshot` to reject `@snapshot` on compound types,
+/// where a single source-level read maps to multiple loads that
+/// would tear under concurrent write.
+fn is_primitive_ir_ty_for_snapshot(ir_ty: &str) -> bool {
+    matches!(ir_ty, "i1" | "i8" | "i16" | "i32" | "i64")
+}
+
 /// v0.2-ε: kind-name for diagnostics + IR comments. Used by both
 /// the entry-mask emitter (to label which kind of atomicity
 /// triggered the wrapping) and the unmask-pending check.
@@ -6376,6 +6483,129 @@ mod tests {
         assert!(
             body_pos < store_pos && store_pos < back_edge_pos,
             "store must be between body label and back-edge; got:\n{ir}"
+        );
+    }
+
+    // ─── v0.2-ζ: @snapshot Auto.field codegen (Decision #24 / ADR 0004) ─
+
+    #[test]
+    fn snapshot_lowers_to_same_load_as_field_access() {
+        // `@snapshot Counter.value` produces the same IR as
+        // `Counter.value` — a single GEP+load. The "snapshot"
+        // semantic is upstream of codegen.
+        let src = "\
+            #automaton Counter { value: u32; }\n\
+            #effect drain() -> u32 #mutates: [Counter] {\n  \
+              return @snapshot Counter.value;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower @snapshot");
+        // The IR should contain a GEP + load on Counter.value
+        // (LLVM idx 0 for monoid Counter).
+        assert!(
+            ir.contains("getelementptr %struct.Counter, %struct.Counter* @Counter.state, i32 0, i32 0"),
+            "expected struct-field GEP for snapshot; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("load i32, i32*"),
+            "expected i32 load for snapshot; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn snapshot_on_register_block_field_emits_volatile_load() {
+        // `@snapshot Mmio.field` on a register-block automaton
+        // lowers to a volatile load at the absolute MMIO address —
+        // same as a regular `Mmio.field` read on a register block.
+        let src = "\
+            #automaton Mmio { #address: 0x4000_0000; status: u32 #offset: 0x00; }\n\
+            #effect probe() -> u32 #mutates: [Mmio] { return @snapshot Mmio.status; }\n\
+        ";
+        let ir = lower_str(src).expect("lower mmio snapshot");
+        assert!(
+            ir.contains("load volatile i32, i32* inttoptr (i64 1073741824 to i32*)"),
+            "expected volatile load at MMIO address for snapshot; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn snapshot_self_inside_transition_resolves_owner() {
+        // `@snapshot Self.field` inside a transition resolves
+        // to the enclosing automaton, same as `Self.field` does.
+        let src = "\
+            #automaton Counter { value: u32;\n  \
+              #transition observe { let _x: u32 = @snapshot Self.value; return; }\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower @snapshot Self");
+        assert!(
+            ir.contains("getelementptr %struct.Counter, %struct.Counter* @Counter.state, i32 0, i32 0"),
+            "expected GEP via Counter (Self resolution); got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn snapshot_compound_field_returns_e0810() {
+        // `@snapshot` on a compound (array) field should be
+        // rejected — multi-load lowering would tear under
+        // concurrent write, breaking the snapshot guarantee.
+        let src = "\
+            #automaton Counter { buf: [u8; 64]; }\n\
+            #effect drain() #mutates: [Counter] {\n  \
+              let _x: u8 = @snapshot Counter.buf;\n  \
+              return;\n\
+            }\n\
+        ";
+        let errors = lower_str(src).expect_err("expected NotYetImplemented for compound snapshot");
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            CodegenError::NotYetImplemented { what }
+                if what.contains("non-primitive")
+        ));
+        assert!(
+            saw,
+            "expected NotYetImplemented(non-primitive); got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn snapshot_on_unknown_automaton_rejected_by_resolver() {
+        // `@snapshot Nope.field` where `Nope` isn't an automaton
+        // — the resolver catches it before codegen gets a chance.
+        // We exercise the resolver directly because lower_str
+        // panics on resolve failures.
+        let src = "@fn t() -> u32 { return @snapshot Nope.x; }";
+        let tokens = tokenize(src).expect("tokenize");
+        let program = parse(&tokens).expect("parse");
+        let result = resolve(&program);
+        assert!(
+            result.is_err(),
+            "expected resolver to reject @snapshot on unknown automaton"
+        );
+    }
+
+    #[test]
+    fn snapshot_inside_arithmetic_composes() {
+        // `@snapshot` is an expression; it should compose inside
+        // arithmetic (the snapshot-and-decide pattern's core
+        // use case).
+        let src = "\
+            #automaton T { a: u32; b: u32; }\n\
+            #effect sum() -> u32 #mutates: [T] {\n  \
+              return @snapshot T.a + @snapshot T.b;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower snapshot in binary op");
+        // Two loads (one per snapshot), one add of their
+        // SSA results.
+        assert_eq!(
+            ir.matches("load i32").count(),
+            2,
+            "expected 2 loads (one per snapshot); got:\n{ir}"
+        );
+        assert!(
+            ir.contains("add i32"),
+            "expected add of snapshot results; got:\n{ir}"
         );
     }
 

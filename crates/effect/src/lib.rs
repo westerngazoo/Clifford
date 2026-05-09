@@ -994,22 +994,32 @@ fn walk_expr_for_reads(
             walk_expr_for_reads(ptr, resolution, enclosing_owner, out);
             walk_expr_for_reads(n, resolution, enclosing_owner, out);
         }
-        // `Snapshot { automaton, field }` is `@snapshot Auto.field` —
-        // semantically a read of that field per Decision #24 / ADR
-        // 0004. Treat it as a read for the §7.2 algebra.
-        ExprKind::Snapshot { automaton, field } => {
-            let owner = if automaton == "Self" {
-                enclosing_owner.map(str::to_owned)
-            } else {
-                Some(automaton.clone())
-            };
-            if let Some(o) = owner {
-                out.reads.insert(FieldRef {
-                    automaton: o,
-                    field: field.clone(),
-                });
-            }
-        }
+        // `Snapshot { automaton, field }` is `@snapshot Auto.field`
+        // per Decision #24 / ADR 0004.
+        //
+        // **v0.2-ζ change**: snapshot reads are NOT recorded in
+        // `actual_reads`. The snapshot-and-decide pattern (spec
+        // §7.2 closing note 3) makes the read race-free at the
+        // hardware level — for primitive single-word fields on
+        // aligned 32-bit targets, the load is a single
+        // instruction; the racer either reads the old or the new
+        // value, never torn. Codegen restricts `@snapshot` to
+        // primitive fields (compound types would tear and surface
+        // a structured error), so by the time a snapshot reaches
+        // the verifier we know the read is atomic at the
+        // instruction level.
+        //
+        // Excluding snapshots from `actual_reads` is the missing
+        // half of the §7.2 graded check: writers `actual_writes`
+        // still get the full race check against ordinary reads,
+        // but the user's `@snapshot` annotation tells the engine
+        // "I've taken responsibility for the load atomicity at
+        // this site."
+        //
+        // The receiver expression and field name aren't walked
+        // recursively because `automaton`/`field` are bare
+        // identifiers in the AST, not nested expressions.
+        ExprKind::Snapshot { .. } => {}
         // `Auto@state` reads the state-tag — for v0.2-β we treat
         // this as a read of an implicit "tag" pseudo-field of the
         // automaton. Today the tag isn't a named field in the

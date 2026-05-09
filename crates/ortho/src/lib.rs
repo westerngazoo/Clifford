@@ -1744,6 +1744,105 @@ mod tests {
         }
     }
 
+    // ─── v0.2-ζ: @snapshot excludes read from race detection ─────────
+
+    #[test]
+    fn snapshot_read_does_not_trigger_race_with_concurrent_write() {
+        // The dual_uart_telemetry case: drain effect reads a
+        // counter via @snapshot while an interrupt writes it.
+        // Without @snapshot v0.2-β rejects (reads ∧ writes ≠ 0);
+        // with @snapshot v0.2-ζ accepts because the snapshot
+        // walker excludes the read from `actual_reads`.
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #effect drain() -> u32 #mutates: [C] {\n  \
+              return @snapshot C.v;\n\
+            }\n\
+            #interrupt Tally() #mutates: [C] #priority: HIGH { C.v += 1u32; }\n\
+        ";
+        let program = parse_program(src);
+        let profiles = build_profiles(&program);
+        verify(&program, &profiles).expect("@snapshot should make this race-free");
+    }
+
+    #[test]
+    fn snapshot_in_arithmetic_remains_race_free() {
+        // The canonical "snapshot-and-decide" pattern:
+        // `@snapshot a + @snapshot b`. Both reads are excluded
+        // from the race check; the arithmetic happens on already-
+        // captured SSA values.
+        let src = "\
+            #automaton T { a: u32; b: u32; }\n\
+            #effect sum() -> u32 #mutates: [T] {\n  \
+              return @snapshot T.a + @snapshot T.b;\n\
+            }\n\
+            #interrupt IRQ() #mutates: [T] #priority: HIGH { T.a += 1u32; }\n\
+        ";
+        let program = parse_program(src);
+        let profiles = build_profiles(&program);
+        verify(&program, &profiles).expect("@snapshot arithmetic is race-free");
+    }
+
+    #[test]
+    fn plain_read_still_triggers_race_with_snapshot_alternative() {
+        // Sanity: the same source as
+        // `snapshot_read_does_not_trigger_race_with_concurrent_write`
+        // but with a PLAIN read. v0.2-β rejects → v0.2-ζ
+        // confirms snapshot is the difference-maker.
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #effect drain() -> u32 #mutates: [C] {\n  \
+              return C.v;\n\
+            }\n\
+            #interrupt Tally() #mutates: [C] #priority: HIGH { C.v += 1u32; }\n\
+        ";
+        let program = parse_program(src);
+        let profiles = build_profiles(&program);
+        let errs = verify(&program, &profiles).expect_err("plain read still races");
+        assert_eq!(errs.len(), 1);
+    }
+
+    #[test]
+    fn snapshot_does_not_protect_writes() {
+        // A subtle point: `@snapshot` only annotates a READ. A
+        // callable that writes to an automaton field is still
+        // race-checked normally. This is just sanity — it would
+        // be very wrong to silently skip writes.
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #effect bump() #mutates: [C] { C.v = 1u32; }\n\
+            #interrupt Tally() #mutates: [C] #priority: HIGH { C.v = 2u32; }\n\
+        ";
+        let program = parse_program(src);
+        let profiles = build_profiles(&program);
+        let errs = verify(&program, &profiles).expect_err("two writes still race");
+        assert_eq!(errs.len(), 1);
+    }
+
+    #[test]
+    fn snapshot_self_inside_transition_excluded_from_reads() {
+        // `@snapshot Self.field` inside a transition. The
+        // snapshot walker maps `Self` to the enclosing owner
+        // (same as plain reads), so the exclusion applies
+        // correctly.
+        //
+        // This test is contrived because transitions aren't
+        // direct concurrency nodes per §7.3, but it documents
+        // that the resolver path is consistent.
+        let src = "\
+            #automaton C { v: u32;\n  \
+              #transition observe { let _x: u32 = @snapshot Self.v; return; }\n\
+            }\n\
+            #effect drain() -> u32 #mutates: [C] {\n  \
+              return @snapshot C.v;\n\
+            }\n\
+            #interrupt IRQ() #mutates: [C] #priority: HIGH { C.v = 1u32; }\n\
+        ";
+        let program = parse_program(src);
+        let profiles = build_profiles(&program);
+        verify(&program, &profiles).expect("@snapshot Self.field excluded too");
+    }
+
     #[test]
     fn multiple_violations_all_reported() {
         let src = "\

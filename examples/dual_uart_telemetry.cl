@@ -15,27 +15,30 @@
 //   - mutation sugar `+=` and `=`                           (slice 3)
 //   - integer cast (volatile-read u32, store low byte u8)   (slice 7)
 //
-// The foreground drain side uses `#atomic: interrupt_critical;`
-// (v0.2-δ) to mask all interrupts during the body. The §7.2
-// graded engine sees the attribute and suppresses the read-write
-// race pair against the ISR producers — the masked body cannot
-// be preempted, so the read is serialised with the ISR's
-// load-modify-store.
+// The foreground drain side uses `@snapshot Auto.field`
+// (v0.2-ζ, Decision #24 / ADR 0004) to take owned copies of the
+// per-source counters. The §7.2 graded engine excludes
+// `@snapshot` reads from `actual_reads` because the
+// snapshot-and-decide pattern (spec §7.2 closing note 3) makes
+// each read a single atomic load on aligned 32-bit hardware —
+// the racer either sees the old or the new value, never torn.
 //
-// **Soundness gap as of v0.2-δ (documented):** the verifier
-// trusts `#atomic` for race-freedom reasoning, but codegen does
-// NOT yet emit the runtime wrapping (`cpsid i` / `cpsie i` on
-// Cortex-M). The IR carries a comment marker; the actual
-// interrupt-disable instructions land in a follow-up slice. A
-// binary built today with `#atomic` does NOT mask interrupts
-// at runtime. The verifier's safety proof IS valid for the
-// program as written; the runtime gap is purely on the
-// emission side.
+// `@snapshot` is the lighter-weight alternative to
+// `#atomic: interrupt_critical;` for the SPSC consumer-side
+// case. Both are spec-supported routes:
+//   - `#atomic`: masks interrupts for the duration; useful for
+//     multi-field consistency across non-atomic operations.
+//   - `@snapshot`: per-read atomic copy; cheaper, no interrupt
+//     latency cost, but only safe for primitive-typed fields.
+//
+// We use `@snapshot` here because each drain effect reads
+// exactly one (or two) primitive counters — single-word reads
+// on aligned u32s.
 //
 // Earlier drafts of this sample also shared `bytes_total` and
 // `last_byte` between producers — both the v0.1 (write-write) and
 // v0.2-β (read-write) verifiers rejected that. The current shape
-// — strictly disjoint per-source fields + atomic-wrapped drain
+// — strictly disjoint per-source fields + @snapshot-wrapped drain
 // — is what the engine proves race-free.
 //
 // What this sample exercises end-to-end (across slices 1-10):
@@ -124,28 +127,25 @@
 }
 
 
-// ─── Foreground drain (v0.2-δ: #atomic: interrupt_critical) ─────────
+// ─── Foreground drain (v0.2-ζ: @snapshot Auto.field) ────────────────
 //
-// `drain_total` returns the SUM across both per-source counters,
-// computed at read time. The Acquire fence pairs with the Release
-// on every producer transition (publication ordering).
-//
-// `#atomic: interrupt_critical;` makes the body atomic with
-// respect to the producers — the §7.2 verifier suppresses the
-// read-write race pair, and (when codegen support lands) the
-// runtime will mask interrupts for the body's duration.
+// `drain_total` returns the SUM across both per-source counters
+// using `@snapshot` to take owned copies. The Acquire fence
+// pairs with the Release on every producer transition
+// (publication ordering); `@snapshot` makes each individual
+// read race-free with the ISR's load-modify-store.
 
-#effect drain_total() -> u32 #mutates: [Telemetry] #atomic: interrupt_critical; $ [Acquire] {
-  return Telemetry.bytes_uart1 + Telemetry.bytes_uart2;
+#effect drain_total() -> u32 #mutates: [Telemetry] $ [Acquire] {
+  return @snapshot Telemetry.bytes_uart1 + @snapshot Telemetry.bytes_uart2;
 }
 
 // Same pattern for the per-source byte snapshots.
-#effect drain_last_uart1() -> u8 #mutates: [Telemetry] #atomic: interrupt_critical; $ [Acquire] {
-  return Telemetry.last_byte_uart1;
+#effect drain_last_uart1() -> u8 #mutates: [Telemetry] $ [Acquire] {
+  return @snapshot Telemetry.last_byte_uart1;
 }
 
-#effect drain_last_uart2() -> u8 #mutates: [Telemetry] #atomic: interrupt_critical; $ [Acquire] {
-  return Telemetry.last_byte_uart2;
+#effect drain_last_uart2() -> u8 #mutates: [Telemetry] $ [Acquire] {
+  return @snapshot Telemetry.last_byte_uart2;
 }
 
 
