@@ -99,7 +99,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use clifford_ast::{AtomicKind, Item, PriorityLevel, Program, TraitRef};
+use clifford_ast::{AtomicKind, Block, Item, PriorityLevel, Program, StmtKind, TraitRef};
 use clifford_effect::{CallableId, FieldRef, MutationProfile, MutationProfiles};
 use thiserror::Error;
 
@@ -640,6 +640,102 @@ fn node_touches(node: &ConcurrencyNode, profiles: &MutationProfiles) -> HashSet<
 /// canonicalised as `(lo, hi)` alphabetically-sorted pairs so
 /// `@sequential(A, B)` and `@sequential(B, A)` produce the same
 /// entry per spec §2.6's symmetry note.
+/// v0.2-θ: collect every callable name (transitions + effects)
+/// declared with `#atomic: interrupt_critical;`. Used by
+/// `body_inherits_atomic_from_proc_call` to decide whether a
+/// caller body whose only statement is `#> name();` should
+/// inherit atomicity from its callee.
+///
+/// Transitions are recorded by name only (no automaton
+/// qualifier). The §6.2 transition-name uniqueness invariant
+/// already guarantees no collisions across automatons in real
+/// programs, but this helper does NOT validate that — collisions
+/// would silently treat both as atomic, which is conservative-
+/// permissive (over-suppression rather than under-suppression).
+/// A future slice can refine to `(automaton, name)` qualified
+/// keys.
+fn collect_atomic_callable_names(program: &Program) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for item in &program.items {
+        match item {
+            Item::Effect(decl) => {
+                if matches!(decl.atomic, Some(AtomicKind::InterruptCritical)) {
+                    out.insert(decl.name.clone());
+                }
+            }
+            Item::Interrupt(decl) => {
+                if matches!(decl.atomic, Some(AtomicKind::InterruptCritical)) {
+                    out.insert(decl.name.clone());
+                }
+            }
+            Item::Automaton(decl) => {
+                for tr in &decl.transitions {
+                    if matches!(tr.atomic, Some(AtomicKind::InterruptCritical)) {
+                        out.insert(tr.name.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// v0.2-θ: returns `true` iff a callable's body should inherit
+/// atomicity from a `#atomic: interrupt_critical;` callee.
+///
+/// **v0.2-θ MVP rule:** the body consists of EXACTLY one
+/// statement that is a `#> proc()` call to an atomic-marked
+/// callable, optionally followed by a `return;`. This is the
+/// canonical "delegated ISR" pattern:
+///
+/// ```clifford
+/// #interrupt USART1_IRQ() #mutates: [C] #priority: HIGH {
+///   #> handle_uart1_event();   // body = exactly one #> call
+/// }
+/// ```
+///
+/// If `handle_uart1_event` is `#atomic: interrupt_critical;`,
+/// then USART1_IRQ enters that callee's body which masks
+/// interrupts via the v0.2-ε `cpsid i` emission. The interrupt
+/// effectively runs atomically.
+///
+/// **Why this strict rule:** any other statement in the body
+/// (a direct mutation, a non-atomic call, a let-binding that
+/// reads automaton state, an if/sigma block) could expose racy
+/// operations BEFORE the atomic callee enters. v0.2-θ takes
+/// the conservative path; richer inheritance (multi-statement
+/// bodies, atomic blocks within larger bodies, atomic-on-call-
+/// site rather than per-callable) is a future slice with its
+/// own analysis.
+///
+/// **Symmetry note:** the rule applies uniformly to effects,
+/// interrupts, and the callees they delegate to (which can be
+/// transitions, effects, or other interrupts). Inheritance
+/// is single-hop only — we don't iteratively close the
+/// "inherited atomic" property across chains because the
+/// strict one-statement rule already implies a single hop.
+fn body_inherits_atomic_from_proc_call(
+    body: &Block,
+    atomic_callables: &HashSet<String>,
+) -> bool {
+    // Filter out a trailing `return;` (no value) — common in
+    // hand-written firmware and semantically a no-op after the
+    // delegated call.
+    let stmts: Vec<&clifford_ast::Stmt> = body
+        .stmts
+        .iter()
+        .filter(|s| !matches!(s.kind, StmtKind::Return(None)))
+        .collect();
+    if stmts.len() != 1 {
+        return false;
+    }
+    match &stmts[0].kind {
+        StmtKind::ProcCall { name, .. } => atomic_callables.contains(name),
+        _ => false,
+    }
+}
+
 /// v0.2-η: collect every `#interrupt`'s `#priority: …` clause
 /// into a name → level map. Used by `priorities_indicate_no_preemption`
 /// to decide whether two interrupts can preempt each other.
@@ -772,11 +868,20 @@ pub fn verify(
         Err(e) => return Err(vec![e]),
     };
 
+    // v0.2-θ: pre-pass — collect every callable name declared
+    // `#atomic: interrupt_critical;` so the per-node atomicity
+    // computation below can OR in the `inherits_atomic` bit
+    // for delegated-ISR bodies.
+    let atomic_callables = collect_atomic_callable_names(program);
+
     // Collect every concurrency-checked node with its behaviour
     // and atomicity state. `@fn`s are included as nodes (v0.2-α)
     // for trait-basis and read-basis interactions; v0.2-δ adds
     // `is_atomic_critical` so the pair check can suppress
-    // interrupt pairings against atomic-critical bodies.
+    // interrupt pairings against atomic-critical bodies. v0.2-θ
+    // OR's in `body_inherits_atomic_from_proc_call` so a one-
+    // statement delegated-ISR body inherits atomicity from its
+    // callee.
     let mut nodes: Vec<(ConcurrencyNode, Behaviour, bool)> = Vec::new();
     for item in &program.items {
         match item {
@@ -794,8 +899,16 @@ pub fn verify(
                     &decl.trait_list,
                     &basis,
                 );
-                let atomic = matches!(decl.atomic, Some(AtomicKind::InterruptCritical));
-                nodes.push((ConcurrencyNode::Effect(decl.name.clone()), beh, atomic));
+                let direct_atomic = matches!(decl.atomic, Some(AtomicKind::InterruptCritical));
+                // v0.2-θ inheritance: a one-statement body that
+                // is a `#>` to an atomic callable inherits.
+                let inherited_atomic = !direct_atomic
+                    && body_inherits_atomic_from_proc_call(&decl.body, &atomic_callables);
+                nodes.push((
+                    ConcurrencyNode::Effect(decl.name.clone()),
+                    beh,
+                    direct_atomic || inherited_atomic,
+                ));
             }
             Item::Interrupt(decl) => {
                 let cid = CallableId::Interrupt(decl.name.clone());
@@ -804,8 +917,14 @@ pub fn verify(
                     &decl.trait_list,
                     &basis,
                 );
-                let atomic = matches!(decl.atomic, Some(AtomicKind::InterruptCritical));
-                nodes.push((ConcurrencyNode::Interrupt(decl.name.clone()), beh, atomic));
+                let direct_atomic = matches!(decl.atomic, Some(AtomicKind::InterruptCritical));
+                let inherited_atomic = !direct_atomic
+                    && body_inherits_atomic_from_proc_call(&decl.body, &atomic_callables);
+                nodes.push((
+                    ConcurrencyNode::Interrupt(decl.name.clone()),
+                    beh,
+                    direct_atomic || inherited_atomic,
+                ));
             }
             _ => {}
         }
@@ -1821,6 +1940,218 @@ mod tests {
             }
             _ => panic!("expected OrthogonalityViolation"),
         }
+    }
+
+    // ─── v0.2-θ: transition-side #atomic inheritance (delegated ISR) ─
+
+    #[test]
+    fn delegated_isr_inherits_atomic_from_transition_callee() {
+        // The canonical delegated-ISR pattern: the interrupt's
+        // body is a single `#>` to a `#atomic` transition.
+        // Pre-v0.2-θ: pair against another interrupt (foreground
+        // effect, etc.) with overlapping reads/writes flags as
+        // E0520. Post-v0.2-θ: the interrupt inherits atomicity
+        // and the pair is suppressed.
+        let src = "\
+            #automaton C { v: u32; w: u32;\n  \
+              #transition handle #atomic: interrupt_critical; { C.v = 1u32; C.w = 2u32; }\n\
+            }\n\
+            #effect main_loop() #mutates: [C] {\n  \
+              let _x: u32 = C.v + C.w;\n  \
+              return;\n\
+            }\n\
+            #interrupt SysTick() #mutates: [C] #priority: HIGH {\n  \
+              #> handle();\n\
+            }\n\
+        ";
+        let program = parse_program(src);
+        let profiles = build_profiles(&program);
+        // SysTick inherits atomic from `handle`. main_loop reads
+        // C.v + C.w (which SysTick writes via the inherited
+        // atomic transition). Without v0.2-θ this would be a
+        // read-write race; with v0.2-θ the inherited atomic
+        // suppresses the pair.
+        verify(&program, &profiles).expect("delegated ISR inherits atomic");
+    }
+
+    #[test]
+    fn delegated_isr_with_explicit_return_still_inherits() {
+        // The body has TWO statements: the proc call and an
+        // explicit `return;`. The trailing void return is
+        // filtered out by the inheritance walker; the body
+        // still counts as a single-statement delegated ISR.
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #effect handle() #mutates: [C] #atomic: interrupt_critical; { C.v = 1u32; }\n\
+            #interrupt SysTick() #mutates: [C] #priority: HIGH {\n  \
+              #> handle();\n  \
+              return;\n\
+            }\n\
+            #effect drain() -> u32 #mutates: [C] {\n  \
+              return @snapshot C.v;\n\
+            }\n\
+        ";
+        let program = parse_program(src);
+        let profiles = build_profiles(&program);
+        verify(&program, &profiles).expect("explicit return doesn't break inheritance");
+    }
+
+    #[test]
+    fn body_with_multiple_statements_does_not_inherit() {
+        // The body has more than one statement (the proc call
+        // plus a direct mutation). Inheritance does NOT apply —
+        // the direct mutation could race before the atomic
+        // call enters.
+        let src = "\
+            #automaton C { v: u32; w: u32;\n  \
+              #transition handle #atomic: interrupt_critical; { C.v = 1u32; }\n\
+            }\n\
+            #interrupt SysTick() #mutates: [C] #priority: HIGH {\n  \
+              C.w = 9u32;\n  \
+              #> handle();\n\
+            }\n\
+            #effect read_w() -> u32 #mutates: [C] { return C.w; }\n\
+        ";
+        let program = parse_program(src);
+        let profiles = build_profiles(&program);
+        // SysTick has a direct mutation of C.w (NOT in the
+        // atomic transition). read_w reads C.w. The pair
+        // should be flagged.
+        let errs = verify(&program, &profiles).expect_err("multi-stmt body should not inherit");
+        assert!(
+            errs.iter().any(|e| match e {
+                OrthoError::OrthogonalityViolation { shared_fields, .. } => {
+                    shared_fields.iter().any(|f| f.field == "w")
+                }
+                _ => false,
+            }),
+            "expected violation on C.w; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn body_calling_non_atomic_transition_does_not_inherit() {
+        // The body's single `#>` call is to a transition that
+        // is NOT marked `#atomic`. Inheritance does not apply.
+        let src = "\
+            #automaton C { v: u32;\n  \
+              #transition tick { C.v += 1u32; }\n\
+            }\n\
+            #effect drain() -> u32 #mutates: [C] { return C.v; }\n\
+            #interrupt SysTick() #mutates: [C] #priority: HIGH {\n  \
+              #> tick();\n\
+            }\n\
+        ";
+        let program = parse_program(src);
+        let profiles = build_profiles(&program);
+        // Pair drain × SysTick: drain reads C.v, SysTick writes
+        // C.v (transitively via tick). Without #atomic on tick,
+        // no inheritance, pair flagged.
+        let errs = verify(&program, &profiles).expect_err("non-atomic call doesn't inherit");
+        assert_eq!(errs.len(), 1);
+    }
+
+    #[test]
+    fn already_atomic_callable_unaffected_by_inheritance_check() {
+        // A callable that's directly marked `#atomic` is atomic
+        // regardless of its body shape. The inheritance check
+        // is `OR`'d so the answer is still atomic.
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #effect drain() -> u32 #mutates: [C] #atomic: interrupt_critical; {\n  \
+              C.v = 1u32;\n  \
+              return @snapshot C.v;\n\
+            }\n\
+            #interrupt SysTick() #mutates: [C] #priority: HIGH { C.v = 2u32; }\n\
+        ";
+        let program = parse_program(src);
+        let profiles = build_profiles(&program);
+        // drain is directly atomic → pair with SysTick suppressed.
+        // The body's two statements would have prevented
+        // inheritance, but direct atomic wins.
+        verify(&program, &profiles).expect("direct atomic still works");
+    }
+
+    #[test]
+    fn body_inherits_atomic_helper_smoke_one_stmt_call() {
+        use clifford_ast::{Block as AstBlock, Stmt as AstStmt};
+        let mut atomic = HashSet::new();
+        atomic.insert("handle".to_owned());
+        // Synthetic Block with a single ProcCall to "handle".
+        let span = clifford_lexer::Span::new(0, 0);
+        let stmt = AstStmt {
+            kind: StmtKind::ProcCall {
+                name: "handle".to_owned(),
+                args: vec![],
+            },
+            span,
+        };
+        let body = AstBlock {
+            stmts: vec![stmt],
+            span,
+        };
+        assert!(body_inherits_atomic_from_proc_call(&body, &atomic));
+    }
+
+    #[test]
+    fn body_inherits_atomic_helper_returns_false_on_empty_body() {
+        let atomic: HashSet<String> = HashSet::new();
+        let span = clifford_lexer::Span::new(0, 0);
+        let body = clifford_ast::Block {
+            stmts: vec![],
+            span,
+        };
+        assert!(!body_inherits_atomic_from_proc_call(&body, &atomic));
+    }
+
+    #[test]
+    fn body_inherits_atomic_helper_returns_false_when_callee_not_in_set() {
+        use clifford_ast::{Block as AstBlock, Stmt as AstStmt};
+        let atomic: HashSet<String> = HashSet::new();
+        let span = clifford_lexer::Span::new(0, 0);
+        let stmt = AstStmt {
+            kind: StmtKind::ProcCall {
+                name: "handle".to_owned(),
+                args: vec![],
+            },
+            span,
+        };
+        let body = AstBlock {
+            stmts: vec![stmt],
+            span,
+        };
+        assert!(!body_inherits_atomic_from_proc_call(&body, &atomic));
+    }
+
+    #[test]
+    fn collect_atomic_callable_names_finds_all_three_decl_kinds() {
+        let src = "\
+            #automaton C { v: u32;\n  \
+              #transition tick #atomic: interrupt_critical; { C.v = 1u32; }\n\
+            }\n\
+            #effect handler() #mutates: [C] #atomic: interrupt_critical; { return; }\n\
+            #interrupt IRQ() #mutates: [C] #priority: HIGH #atomic: interrupt_critical; { return; }\n\
+        ";
+        let program = parse_program(src);
+        let names = collect_atomic_callable_names(&program);
+        assert!(names.contains("tick"));
+        assert!(names.contains("handler"));
+        assert!(names.contains("IRQ"));
+        assert_eq!(names.len(), 3);
+    }
+
+    #[test]
+    fn collect_atomic_callable_names_excludes_non_atomic() {
+        let src = "\
+            #automaton C { v: u32;\n  \
+              #transition plain { C.v = 1u32; }\n  \
+              #transition critical #atomic: interrupt_critical; { C.v = 2u32; }\n\
+            }\n\
+        ";
+        let program = parse_program(src);
+        let names = collect_atomic_callable_names(&program);
+        assert!(!names.contains("plain"));
+        assert!(names.contains("critical"));
     }
 
     // ─── v0.2-η: #priority-aware concurrency inference ──────────────

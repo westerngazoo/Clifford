@@ -43,14 +43,49 @@ The atomic suppression is asymmetric across callable kinds:
 | `#atomic interrupt` × `#interrupt` | ✅ | Atomic interrupt masks the other on entry |
 | `#atomic effect` × `#effect` | ❌ | Foreground-thread serialisation handles it (§7.3 already returns `false` for can_concur) |
 | `#atomic effect` × `@fn` | ❌ | Same — foreground serialisation |
-| `#atomic transition` × `#interrupt` | ❌ (today) | Transitions aren't direct concurrency nodes per §7.3 — their writes propagate via `actual_writes` into their callers; the attribute is parsed but not yet consumed by the verifier on transitions |
+| `#atomic transition` × `#interrupt` | ✅ via inheritance (v0.2-θ) | If the calling effect/interrupt's body is a single `#> name();` to the atomic transition, the caller inherits atomicity. See "Delegated-ISR inheritance" below. |
 
-The **transition-side gap** is intentional for v0.2-δ. Transitions
-are leaves of `#>` chains; their atomicity propagates indirectly
-(if an interrupt's body invokes a `#> tick()` whose transition is
-`#atomic: interrupt_critical`, the interrupt gets the masking for
-that call site). Modelling this transitively requires call-site-
-aware atomicity tracking, which is its own slice.
+**Delegated-ISR inheritance (v0.2-θ).** Transitions aren't
+direct concurrency nodes per §7.3, but their atomicity does
+propagate to callers via the **delegated-ISR pattern** — the
+canonical "the ISR's body is just one call into a handler"
+shape:
+
+```clifford
+#automaton C { v: u32; w: u32;
+  #transition handle #atomic: interrupt_critical; {
+    C.v = 1u32;
+    C.w = 2u32;
+  }
+}
+
+#interrupt SysTick() #mutates: [C] #priority: HIGH {
+  #> handle();   // body = exactly one #> call
+  // Inherits atomicity: SysTick is treated as #atomic by the
+  // verifier even though the attribute isn't on SysTick itself.
+  // Codegen v0.2-ε emits cpsid i / cpsie i around `handle`'s
+  // body, so the runtime contract holds.
+}
+```
+
+The inheritance rule is intentionally strict in v0.2-θ:
+
+- The caller's body must consist of **exactly one** statement.
+- That statement must be a `#> name();` proc-call to a callee
+  declared `#atomic: interrupt_critical;`.
+- A trailing `return;` (no value) is permitted and filtered out
+  before the count.
+
+Anything else — a direct mutation, a non-atomic call, a
+let-binding that reads automaton state, an `if`/`sigma` block
+— prevents inheritance. Those statements could expose racy
+operations BEFORE the atomic callee enters its masked region.
+
+Inheritance applies uniformly: the callee can be a transition,
+effect, or interrupt; the caller can be an effect or
+interrupt. Inheritance is single-hop only — we don't
+iteratively close the property across chains because the
+strict one-statement rule already implies one hop.
 
 ## The runtime contract (v0.2-ε)
 
@@ -211,7 +246,12 @@ The full sample lives in `examples/dual_uart_telemetry.cl`.
 - Verifier: `verify` consults each node's `is_atomic_critical`
   flag and skips the pair when the other side is an
   `#interrupt`. The flag is collected from the AST during the
-  node-collection phase.
+  node-collection phase. v0.2-θ adds inheritance: the flag is
+  OR'd with `body_inherits_atomic_from_proc_call(body,
+  &atomic_callables)` so the delegated-ISR pattern is
+  recognised. `collect_atomic_callable_names(program)`
+  pre-collects every `#atomic: interrupt_critical;` callable
+  (transitions + effects + interrupts) for the lookup.
 - Codegen (v0.2-ε):
   - `Emitter::emit_atomic_entry_mask` emits the entry-mask asm
     and queues the matching unmask.
@@ -258,3 +298,19 @@ The full sample lives in `examples/dual_uart_telemetry.cl`.
   v0.7+ deferred kind surfaces a structured error.
 - `atomic_custom_kind_is_not_yet_implemented` — user-defined
   kinds rejected to prevent silent unsafety.
+
+`crates/ortho/src/lib.rs` (delegated-ISR inheritance, v0.2-θ):
+
+- `delegated_isr_inherits_atomic_from_transition_callee` —
+  the canonical pattern (interrupt body = single `#>` call to
+  an atomic transition; no E0520 against a foreground reader).
+- `delegated_isr_with_explicit_return_still_inherits` —
+  trailing `return;` filtered out.
+- `body_with_multiple_statements_does_not_inherit` —
+  conservatism: any extra statement kills inheritance.
+- `body_calling_non_atomic_transition_does_not_inherit` —
+  the callee must itself be `#atomic`.
+- `already_atomic_callable_unaffected_by_inheritance_check`
+  — direct atomic still wins regardless of body shape.
+- 3 direct unit tests on `body_inherits_atomic_from_proc_call`
+  and `collect_atomic_callable_names`.
