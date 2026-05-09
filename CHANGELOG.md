@@ -7,6 +7,57 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 19: `#flush` flows into the mutation profile (2026-05-09)
+
+Closes the deliberately-deferred soundness gap from slice 18:
+the §6.2 mutation-profile check now treats `#flush A;` as a
+write to **every declared field of `A`** so the existing
+`#mutates: [...]` validator fires uniformly. The §7
+orthogonality engine sees the same expanded write set, so a
+flush + a field-write to the same staged automaton is now
+detected as a race (previously the flush was invisible to the
+verifier and could quietly conflict with concurrent writers).
+
+**Effect crate (`crates/effect/src/lib.rs`):**
+
+- New `build_automaton_fields(program)` indexes every
+  `#automaton`'s declared field names. Built once per
+  `extract_mutation_profiles` invocation and threaded
+  through `walk_body_for_direct` /
+  `walk_transition_for_direct` / `walk_stmts`.
+- New `Flush { automaton }` arm in `walk_stmts` looks up the
+  target's field set and inserts one `FieldRef { automaton,
+  field }` per declared field into `out.writes`. If the
+  target doesn't resolve to any automaton (resolver-side
+  E0413), the lookup misses and nothing is recorded — the
+  resolver's error is the user's signal.
+- The downstream `actual_automata` derivation
+  (`actual_writes → automaton names`) and
+  `validate_declared_mutates` (E0410 / E0411) work
+  unchanged: routing flush writes through `actual_writes`
+  is enough to make the existing checks fire correctly.
+
+**Tests added (4):**
+
+- `flush_records_one_write_per_field` — confirms a flush
+  records exactly one direct write per declared field of
+  the target staged automaton.
+- `flush_outside_mutates_clause_is_e0410` — surfaces E0410
+  `EffectMutatesUndeclaredAutomaton` on a flush whose
+  enclosing callable omits the target from
+  `#mutates: [...]`.
+- `flush_inside_mutates_clause_is_well_formed` — happy
+  path; no errors.
+- `flush_transitively_propagates_through_proc_call` —
+  confirms the transitive-closure pass picks up flushes
+  from `#>`-called callees.
+
+**No surface, codegen, or sample changes.** Slice 18's IR
+output is byte-identical; the only observable difference is
+that programs that previously *quietly* compiled an
+unsound `#flush` outside `#mutates: [...]` now correctly
+surface E0410.
+
 ### Added — Slice 18: `#staged` automaton + `#flush` (Decision #12) (2026-05-09)
 
 Implements **Decision #12** (deferred-mutation automata),

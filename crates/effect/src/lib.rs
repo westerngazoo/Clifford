@@ -710,18 +710,26 @@ fn collect_direct_profiles(
     program: &Program,
     resolution: &Resolution,
 ) -> HashMap<CallableId, DirectProfile> {
+    // Slice 19: build the automaton → field-names map once so the
+    // `Flush` arm in `walk_stmts` can expand `#flush A;` into one
+    // synthetic write per declared field of `A` (see
+    // [`flush_writes_all_fields`] for why).
+    let automaton_fields = build_automaton_fields(program);
+
     let mut map: HashMap<CallableId, DirectProfile> = HashMap::new();
 
     for item in &program.items {
         match item {
             Item::Effect(decl) => {
                 let id = CallableId::Effect(decl.name.clone());
-                let profile = walk_body_for_direct(&decl.body, resolution);
+                let profile =
+                    walk_body_for_direct(&decl.body, resolution, &automaton_fields);
                 map.insert(id, profile);
             }
             Item::Interrupt(decl) => {
                 let id = CallableId::Interrupt(decl.name.clone());
-                let profile = walk_body_for_direct(&decl.body, resolution);
+                let profile =
+                    walk_body_for_direct(&decl.body, resolution, &automaton_fields);
                 map.insert(id, profile);
             }
             Item::Automaton(decl) => {
@@ -730,7 +738,12 @@ fn collect_direct_profiles(
                         automaton: decl.name.clone(),
                         name: trans.name.clone(),
                     };
-                    let profile = walk_transition_for_direct(decl, trans, resolution);
+                    let profile = walk_transition_for_direct(
+                        decl,
+                        trans,
+                        resolution,
+                        &automaton_fields,
+                    );
                     map.insert(id, profile);
                 }
             }
@@ -741,13 +754,44 @@ fn collect_direct_profiles(
     map
 }
 
-fn walk_body_for_direct(body: &Block, resolution: &Resolution) -> DirectProfile {
+/// Slice 19: index every `#automaton`'s declared field names so the
+/// `#flush A;` profile expansion can record one write per field of
+/// `A` (see [`walk_stmts`]'s `Flush` arm). Returns a map from
+/// automaton name to its declared field names in source order.
+///
+/// **Why expand:** semantically `#flush A;` commits the entire
+/// shadow struct into live state — it is a write to *every* field
+/// of `A`. Recording one synthetic field would (a) under-report
+/// the write set for the orthogonality engine (a flush + a field
+/// write to `A` would not appear to race) and (b) introduce a
+/// spurious sentinel field name into the profile API. Iterating
+/// the actual field set keeps both downstream consumers
+/// (orthogonality + diagnostics) consistent with the live-state
+/// post-condition of a flush.
+fn build_automaton_fields(program: &Program) -> HashMap<String, Vec<String>> {
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    for item in &program.items {
+        if let Item::Automaton(decl) = item {
+            map.insert(
+                decl.name.clone(),
+                decl.fields.iter().map(|f| f.name.clone()).collect(),
+            );
+        }
+    }
+    map
+}
+
+fn walk_body_for_direct(
+    body: &Block,
+    resolution: &Resolution,
+    automaton_fields: &HashMap<String, Vec<String>>,
+) -> DirectProfile {
     let mut profile = DirectProfile::default();
     // Top-level `#effect` / `#interrupt` bodies have no `Self` —
     // pass `None` for the enclosing owner. Any `Self.field`
     // appearing here is invalid (resolver already emitted an error),
     // and we silently skip it during read collection.
-    walk_stmts(&body.stmts, resolution, None, &mut profile);
+    walk_stmts(&body.stmts, resolution, None, automaton_fields, &mut profile);
     profile
 }
 
@@ -755,6 +799,7 @@ fn walk_transition_for_direct(
     automaton: &AutomatonDecl,
     trans: &TransitionDecl,
     resolution: &Resolution,
+    automaton_fields: &HashMap<String, Vec<String>>,
 ) -> DirectProfile {
     let mut profile = DirectProfile::default();
     // Inside a `#transition` body, `Self.field` resolves to the
@@ -764,6 +809,7 @@ fn walk_transition_for_direct(
         &trans.body.stmts,
         resolution,
         Some(automaton.name.as_str()),
+        automaton_fields,
         &mut profile,
     );
     profile
@@ -773,6 +819,7 @@ fn walk_stmts(
     stmts: &[Stmt],
     resolution: &Resolution,
     enclosing_owner: Option<&str>,
+    automaton_fields: &HashMap<String, Vec<String>>,
     out: &mut DirectProfile,
 ) {
     for stmt in stmts {
@@ -876,14 +923,58 @@ fn walk_stmts(
                 else_block,
             } => {
                 walk_expr_for_reads(cond, resolution, enclosing_owner, out);
-                walk_stmts(&then_block.stmts, resolution, enclosing_owner, out);
+                walk_stmts(
+                    &then_block.stmts,
+                    resolution,
+                    enclosing_owner,
+                    automaton_fields,
+                    out,
+                );
                 if let Some(blk) = else_block {
-                    walk_stmts(&blk.stmts, resolution, enclosing_owner, out);
+                    walk_stmts(
+                        &blk.stmts,
+                        resolution,
+                        enclosing_owner,
+                        automaton_fields,
+                        out,
+                    );
                 }
             }
             StmtKind::Sigma { source, body, .. } => {
                 walk_expr_for_reads(source, resolution, enclosing_owner, out);
-                walk_stmts(&body.stmts, resolution, enclosing_owner, out);
+                walk_stmts(
+                    &body.stmts,
+                    resolution,
+                    enclosing_owner,
+                    automaton_fields,
+                    out,
+                );
+            }
+            // Slice 19 (Decision #12 follow-up): `#flush A;`
+            // commits the shadow struct of `A` into live state in
+            // one memcpy — semantically a write to *every* field
+            // of `A`. Record one direct write per declared field
+            // so:
+            //   - the §6.2 mutation-profile check fires
+            //     **E0410 EffectMutatesUndeclaredAutomaton** when
+            //     the enclosing callable's `#mutates: [...]` list
+            //     omits `A`, and
+            //   - the §7 orthogonality engine sees a flush race
+            //     against any other writer of any field of `A`,
+            //     not just other flushes.
+            // If `A` doesn't resolve to any automaton (the
+            // resolver already emitted E0413), the lookup misses
+            // and we record nothing — the resolver-side error is
+            // the user's signal.
+            StmtKind::Flush { automaton } => {
+                if let Some(field_names) = automaton_fields.get(automaton) {
+                    for field in field_names {
+                        out.writes.insert(FieldRef {
+                            automaton: automaton.clone(),
+                            field: field.clone(),
+                        });
+                    }
+                }
             }
             // Forward-compat for new statement kinds.
             _ => {}
@@ -2533,5 +2624,98 @@ mod tests {
         assert!(names.iter().any(|n| n.as_str() == "A"));
         assert!(names.iter().any(|n| n.as_str() == "B"));
         assert!(!names.iter().any(|n| n.as_str() == "C"));
+    }
+
+    // ── Slice 19: `#flush` flows into the mutation profile ──────────────
+
+    #[test]
+    fn flush_records_one_write_per_field() {
+        // `#flush S;` where `S` has fields a, b, c records three
+        // direct writes — `S.a`, `S.b`, `S.c` — so the §6.2 check
+        // and the §7 ortho engine both see a flush as a write to
+        // every field of the staged automaton.
+        let profiles = profiles_str(
+            "#staged #automaton S { a: u32; b: u32; c: u32; } \
+             #effect commit() #mutates: [S] { #flush S; return; }",
+        )
+        .expect("profile extraction");
+        let id = CallableId::Effect("commit".to_owned());
+        let p = profiles.lookup(&id).expect("profile for commit");
+        assert!(
+            p.actual_writes.contains(&make_field("S", "a")),
+            "expected #flush to record write to S.a; got {:?}",
+            p.actual_writes
+        );
+        assert!(
+            p.actual_writes.contains(&make_field("S", "b")),
+            "expected #flush to record write to S.b; got {:?}",
+            p.actual_writes
+        );
+        assert!(
+            p.actual_writes.contains(&make_field("S", "c")),
+            "expected #flush to record write to S.c; got {:?}",
+            p.actual_writes
+        );
+        assert!(p.actual_automata.contains("S"));
+    }
+
+    #[test]
+    fn flush_outside_mutates_clause_is_e0410() {
+        // `#flush S;` inside an effect that doesn't list `S` in its
+        // `#mutates: [...]` clause must surface E0410 — the existing
+        // mutation-profile check fires uniformly because slice 19
+        // routes flush writes through `actual_writes`.
+        let errors = profiles_str(
+            "#staged #automaton S { a: u32; } \
+             #effect bad_commit() #mutates: [] { #flush S; return; }",
+        )
+        .expect_err("expected E0410 for flush outside #mutates");
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                EffectError::EffectMutatesUndeclaredAutomaton {
+                    ref callable,
+                    ref automaton,
+                    ..
+                } if callable == "bad_commit" && automaton == "S"
+            )),
+            "expected E0410 for `bad_commit` writing `S` via flush; got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn flush_inside_mutates_clause_is_well_formed() {
+        // The happy path — `#flush S;` inside an effect that lists
+        // `S` in `#mutates: [...]` extracts cleanly with no errors.
+        let profiles = profiles_str(
+            "#staged #automaton S { a: u32; } \
+             #effect commit() #mutates: [S] { #flush S; return; }",
+        )
+        .expect("happy-path extraction");
+        let id = CallableId::Effect("commit".to_owned());
+        assert!(profiles.lookup(&id).is_some(), "profile present for commit");
+    }
+
+    #[test]
+    fn flush_transitively_propagates_through_proc_call() {
+        // A caller that #> calls a flush-containing callee picks
+        // up the flush's write set transitively. Mirrors the
+        // existing transitive-mutate test for #mutate.
+        let errors = profiles_str(
+            "#staged #automaton S { a: u32; } \
+             #effect inner() #mutates: [S] { #flush S; return; } \
+             #effect outer() #mutates: [] { #> inner(); }",
+        )
+        .expect_err("expected E0410 for transitive flush");
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                EffectError::EffectMutatesUndeclaredAutomaton {
+                    ref callable,
+                    ..
+                } if callable == "outer"
+            )),
+            "expected E0410 on `outer` via transitive flush; got {errors:?}"
+        );
     }
 }
