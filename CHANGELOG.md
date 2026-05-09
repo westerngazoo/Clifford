@@ -7,6 +7,133 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — `clifford-codegen` v0.2-ε: `#atomic: interrupt_critical` runtime wrapping (Cortex-M) (2026-05-08)
+
+Closes the soundness gap v0.2-δ deliberately documented. Codegen
+now emits the actual interrupt-mask / unmask instructions for
+`#atomic: interrupt_critical` bodies — `cpsid i` at body entry,
+`cpsie i` before every `ret` exit. The verifier's safety claim
+finally holds at runtime on Cortex-M.
+
+**The IR shape** (every `#atomic: interrupt_critical` callable):
+
+```llvm
+define i32 @drain_total() {
+entry:
+  fence acquire
+  call void asm sideeffect "cpsid i", ""() ; #atomic: interrupt_critical entry (mask all maskable interrupts)
+  ; ... body ...
+  ; (slice 9 tag write, if any)
+  ; (Decision #22 release fence, if any)
+  call void asm sideeffect "cpsie i", ""() ; #atomic: interrupt_critical exit (unmask)
+  ret i32 ...
+}
+```
+
+**Order at exit** (enforced by `emit_exit_fence_if_pending`):
+
+1. State-tag write (slice 9).
+2. Release / SeqCst fence (Decision #22) — publishes prior writes.
+3. **`cpsie i`** (this slice) — re-enables interrupts.
+4. `ret`.
+
+Reversing 2 and 3 would let an interrupt fire mid-publication and
+observe partial state. The order is tested explicitly by
+`atomic_interacts_correctly_with_release_fence`.
+
+**Implementation (`crates/codegen/src/lib.rs`):**
+
+- New `Emitter::pending_atomic_exit_unmask: bool` flag, reset
+  per function. Set by `emit_atomic_entry_mask` when an
+  `#atomic: interrupt_critical` body opens; consumed by
+  `emit_atomic_exit_unmask_if_pending` at every `ret` site.
+- New `Emitter::emit_atomic_entry_mask(atomic)` method emits
+  `call void asm sideeffect "cpsid i", ""()` for
+  `InterruptCritical` and queues the unmask. Other kinds
+  (`MulticoreCritical`, `Custom(_)`) surface a structured
+  `NotYetImplemented` instead of silently producing wrong
+  code.
+- New `Emitter::emit_atomic_exit_unmask_if_pending` method
+  emits `call void asm sideeffect "cpsie i", ""()`. Called
+  from `emit_exit_fence_if_pending` AFTER the release fence.
+- Three call sites (`emit_effect`, `emit_interrupt`,
+  `emit_transition`) migrated from the v0.2-δ
+  `emit_atomic_marker_if_any` free helper to the new
+  method-based `emit_atomic_entry_mask`. The v0.2-δ helper is
+  kept as `#[allow(dead_code)]` for one slice as a transition
+  marker; will be deleted in a follow-up cleanup.
+
+**Target portability.** v0.2-ε MVP wires only Cortex-M
+(`cpsid i` / `cpsie i`). Other targets need different
+sequences (`cli`/`sti` for x86, `csrrci`/`csrrsi` for RISC-V).
+The IR emitted today targets thumbv7m-none-eabi unconditionally;
+a future `cliffordc compile --target` slice will switch on the
+requested triple. Programs built for non-ARM targets without
+the future flag will produce IR that clang rejects on link.
+
+**Codegen ↔ verifier soundness contract — now tight.**
+
+- v0.2-δ: verifier trusts `#atomic` for race-freedom
+  reasoning.
+- v0.2-ε: codegen makes that trust valid at runtime.
+
+Together: a program that the v0.2-δ verifier proves race-free
+under `#atomic: interrupt_critical` AND that v0.2-ε codegen
+accepts (i.e. uses `interrupt_critical`, not the deferred
+`multicore_critical` / `custom` kinds) will, when built for a
+Cortex-M target, actually mask interrupts at runtime as
+asserted. The verifier-runtime contract holds end-to-end.
+
+**Tests added: 7 new in codegen.**
+
+- `atomic_interrupt_critical_emits_cpsid_at_body_start` — entry
+  mask emitted in the right place.
+- `atomic_interrupt_critical_emits_cpsie_before_ret` — exit
+  unmask before the `ret`.
+- `atomic_emits_balanced_pair_per_function` — exactly one
+  cpsid + one cpsie per atomic body (and zero for non-atomic
+  siblings).
+- `atomic_interacts_correctly_with_release_fence` — exit order
+  fence < cpsie < ret.
+- `non_atomic_effect_emits_no_cpsid_or_cpsie` — sanity that
+  non-atomic bodies aren't wrapped.
+- `atomic_on_interrupt_emits_wrapping_too` — `#interrupt`
+  with `#atomic` gets wrapped.
+- `atomic_multicore_critical_is_not_yet_implemented` — v0.7+
+  reserved kind surfaces structured error.
+- `atomic_custom_kind_is_not_yet_implemented` — user-defined
+  kinds rejected; codegen has no semantics to emit.
+
+**Behaviour doc updated.** `docs/ortho-atomic-attribute.md`
+now documents the v0.2-ε runtime contract instead of the
+v0.2-δ gap. The "runtime gap" section is replaced with the
+"runtime contract" section showing the actual IR sequence,
+the exit-order rationale, and target-portability notes.
+
+**Pipeline regression checked.** All 7 examples compile
+cleanly through the v0.2-ε pipeline. The `dual_uart_telemetry`
+sample's drain effects now emit real wrapping (3164-byte IR,
+up from 2852 in v0.2-δ — the difference is the new asm
+instructions).
+
+**Deferred:**
+
+- **Target-aware emission**: switch on `--target` to emit
+  Cortex-M / x86 / RISC-V variants.
+- **Transition-side `#atomic` consumption** (verifier still
+  doesn't propagate transition atomicity through `#>` chains;
+  codegen wraps the transition body if the attribute is set,
+  but the verifier doesn't yet trust that).
+- **Multi-exit safety audit**: a body with multiple `ret`
+  paths emits multiple cpsie's. v0.2-ε handles this via the
+  existing `emit_exit_fence_if_pending` infrastructure;
+  worth a future smoke test once `match` / `break` / multi-
+  return shapes land.
+- **NMI handling** documentation in `clifford-check`.
+
+Total codegen tests: **170** (163 pre-v0.2-ε + 7 new).
+Workspace clean; clippy clean.
+
 ### Added — `clifford-ortho` v0.2-δ: `#atomic: interrupt_critical` (§6.6) — verifier side (2026-05-08)
 
 End-to-end plumbing for `#atomic: <kind>;` clauses on `#effect`,

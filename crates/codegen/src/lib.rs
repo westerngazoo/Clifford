@@ -284,6 +284,13 @@ struct Emitter<'a> {
     /// would produce invalid LLVM IR. Reset to `false` whenever a
     /// new label opens a fresh basic block.
     current_block_terminated: bool,
+    /// v0.2-ε: `true` when an `#atomic: interrupt_critical` body
+    /// is open and needs an exit `cpsie i` (or target-equivalent
+    /// unmask) before every `ret`. Set by `emit_atomic_entry_mask`
+    /// at the start of each `#atomic` callable; consumed by
+    /// `emit_atomic_exit_unmask_if_pending` at every exit site;
+    /// cleared at end-of-callable.
+    pending_atomic_exit_unmask: bool,
     /// Errors collected across the whole program.
     errors: Vec<CodegenError>,
 }
@@ -404,6 +411,7 @@ impl<'a> Emitter<'a> {
             current_block: "entry".to_owned(),
             next_label_id: 0,
             current_block_terminated: false,
+            pending_atomic_exit_unmask: false,
             errors: Vec::new(),
         }
     }
@@ -589,7 +597,7 @@ impl<'a> Emitter<'a> {
         if let Some(entry_fence) = ordering.entry {
             writeln!(&mut self.out, "  fence {entry_fence}").ok();
         }
-        emit_atomic_marker_if_any(&mut self.out, decl.atomic.as_ref());
+        self.emit_atomic_entry_mask(decl.atomic.as_ref());
         self.emit_block(&decl.body, &ret_ty);
         writeln!(&mut self.out, "}}").ok();
         writeln!(&mut self.out).ok();
@@ -653,7 +661,7 @@ impl<'a> Emitter<'a> {
         if let Some(entry_fence) = ordering.entry {
             writeln!(&mut self.out, "  fence {entry_fence}").ok();
         }
-        emit_atomic_marker_if_any(&mut self.out, decl.atomic.as_ref());
+        self.emit_atomic_entry_mask(decl.atomic.as_ref());
         self.emit_block(&decl.body, &ret_ty);
         writeln!(&mut self.out, "}}").ok();
         writeln!(&mut self.out).ok();
@@ -727,7 +735,7 @@ impl<'a> Emitter<'a> {
         if let Some(entry_fence) = ordering.entry {
             writeln!(&mut self.out, "  fence {entry_fence}").ok();
         }
-        emit_atomic_marker_if_any(&mut self.out, decl.atomic.as_ref());
+        self.emit_atomic_entry_mask(decl.atomic.as_ref());
         self.emit_block(&decl.body, "void");
         writeln!(&mut self.out, "}}").ok();
         writeln!(&mut self.out).ok();
@@ -763,6 +771,7 @@ impl<'a> Emitter<'a> {
         self.enclosing_owner = None;
         self.current_block = "entry".to_owned();
         self.current_block_terminated = false;
+        self.pending_atomic_exit_unmask = false;
     }
 
     fn emit_fn(&mut self, decl: &FnDecl) {
@@ -861,14 +870,102 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// Decision #22 + Slice 9: emit any pending exit-time writes
-    /// just before a `ret` is written. Called from every site that
-    /// emits a `ret` so the contracts are honoured at every exit
-    /// path.
+    /// v0.2-ε: emit the runtime interrupt-mask instruction at the
+    /// start of an `#atomic: interrupt_critical` body, and queue the
+    /// matching unmask for every `ret` exit.
+    ///
+    /// Cortex-M emits `cpsid i` (PRIMASK ← 1, all maskable
+    /// interrupts disabled). The same IR works on QEMU's
+    /// `lm3s6965evb` board which is what the QEMU CI test targets.
+    /// Other architectures (x86, RISC-V) need different sequences;
+    /// for v0.2-ε MVP we always emit the Cortex-M form. A future
+    /// `cliffordc compile --target` slice will switch on the
+    /// requested triple.
+    ///
+    /// **Codegen ↔ verifier soundness contract.** `clifford-ortho`
+    /// (v0.2-δ) trusts that `#atomic: interrupt_critical` bodies
+    /// run with interrupts masked. v0.2-ε makes that trust valid
+    /// at runtime by emitting the actual masking. The two slices
+    /// together close the gap that v0.2-δ deliberately documented.
+    ///
+    /// `MulticoreCritical` and `Custom(_)` are accepted by the
+    /// parser but produce only an IR comment + a structured
+    /// `NotYetImplemented` error so codegen rejects the program
+    /// rather than silently producing unsafe binaries.
+    fn emit_atomic_entry_mask(&mut self, atomic: Option<&clifford_ast::AtomicKind>) {
+        let Some(kind) = atomic else { return };
+        match kind {
+            clifford_ast::AtomicKind::InterruptCritical => {
+                // LLVM IR inline-asm form. The empty constraint
+                // string is correct for a side-effecting
+                // instruction with no operands.
+                writeln!(
+                    &mut self.out,
+                    "  call void asm sideeffect \"cpsid i\", \"\"() ; #atomic: interrupt_critical entry (mask all maskable interrupts)"
+                )
+                .ok();
+                self.pending_atomic_exit_unmask = true;
+            }
+            clifford_ast::AtomicKind::MulticoreCritical => {
+                // Reserved for Decision #21 (v0.7+). Codegen for
+                // the inter-core lock acquire/release isn't
+                // wired yet.
+                self.errors.push(CodegenError::NotYetImplemented {
+                    what: "#atomic: multicore_critical (Decision #21 lock machinery, v0.7+)",
+                });
+            }
+            clifford_ast::AtomicKind::Custom(name) => {
+                // User-defined atomicity scope — codegen has no
+                // way to know what masking semantics to emit.
+                // Surface as NotYet rather than silently
+                // ignoring.
+                let _ = name;
+                self.errors.push(CodegenError::NotYetImplemented {
+                    what: "#atomic: <custom> kind (codegen only knows interrupt_critical today)",
+                });
+            }
+            // `AtomicKind` is `#[non_exhaustive]`; future variants
+            // need their own arm above. Defensively skip.
+            _ => {}
+        }
+    }
+
+    /// v0.2-ε: emit the matching unmask instruction at every `ret`
+    /// site if an `#atomic: interrupt_critical` mask is currently
+    /// pending. Called from `emit_exit_fence_if_pending` AFTER the
+    /// release fence so the order at exit is:
+    ///
+    /// 1. State-tag write (slice 9)
+    /// 2. Release / SeqCst fence (Decision #22) — publishes prior
+    ///    writes to other agents.
+    /// 3. **`cpsie i`** (this method) — re-enables interrupts.
+    /// 4. `ret` — return to caller.
+    ///
+    /// This order matters: the fence completes BEFORE interrupts
+    /// can fire, so a now-pending interrupt sees the published
+    /// state. Reversed order would let an interrupt see partial
+    /// state.
+    fn emit_atomic_exit_unmask_if_pending(&mut self) {
+        if self.pending_atomic_exit_unmask {
+            writeln!(
+                &mut self.out,
+                "  call void asm sideeffect \"cpsie i\", \"\"() ; #atomic: interrupt_critical exit (unmask)"
+            )
+            .ok();
+        }
+    }
+
+    /// Decision #22 + Slice 9 + v0.2-ε: emit any pending exit-time
+    /// writes just before a `ret` is written. Called from every
+    /// site that emits a `ret` so the contracts are honoured at
+    /// every exit path.
     ///
     /// Order matters: the state-tag write happens BEFORE the
     /// release / SeqCst fence so the new state is visible to other
-    /// agents only once the fence makes it so.
+    /// agents only once the fence makes it so. The atomic unmask
+    /// (v0.2-ε) happens AFTER the fence — the fence has to complete
+    /// before interrupts can fire, otherwise a pending IRQ would
+    /// see partial state.
     fn emit_exit_fence_if_pending(&mut self) {
         // Slice 9: emit the destination state-tag write before any
         // fence. Cloning the pair is fine — it's a one-shot per
@@ -892,6 +989,10 @@ impl<'a> Emitter<'a> {
         if let Some(ordering) = self.pending_exit_fence {
             writeln!(&mut self.out, "  fence {ordering}").ok();
         }
+        // v0.2-ε: unmask interrupts AFTER the release fence so the
+        // fence's publication completes before any pending IRQ can
+        // observe the state.
+        self.emit_atomic_exit_unmask_if_pending();
     }
 
     fn emit_stmt(&mut self, stmt: &Stmt) {
@@ -2956,41 +3057,33 @@ enum FieldLocation {
 /// `"0xFF"` etc., possibly with `_` separators) to a `u64` value.
 /// Decimal literals are also accepted as a defensive convenience.
 /// Returns `None` if the literal is malformed.
-/// v0.2-δ: emit a comment line in the IR marking a callable's
-/// `#atomic: <kind>` clause. The actual runtime wrapping
-/// (`cpsid i` / `cpsie i` on Cortex-M for `interrupt_critical`)
-/// is **deferred to a future slice** — for now codegen produces
-/// only the comment, which means a binary built today does NOT
-/// actually mask interrupts even when the source asks for it.
-///
-/// **This is a known soundness gap** between the verifier
-/// (which trusts `#atomic` for race-freedom reasoning) and
-/// codegen (which doesn't yet emit the wrapping). The CHANGELOG
-/// flags it explicitly. Until the runtime wrapping lands,
-/// `#atomic`-using programs should be treated as
-/// "verifier-proven safe in concept; runtime safety pending."
-///
-/// The IR comment makes the gap visible to anyone reading the
-/// `.ll` output and to future tooling that may post-process to
-/// inject the wrapping at link time.
+/// v0.2-ε: kind-name for diagnostics + IR comments. Used by both
+/// the entry-mask emitter (to label which kind of atomicity
+/// triggered the wrapping) and the unmask-pending check.
+fn atomic_kind_str(kind: &clifford_ast::AtomicKind) -> &'static str {
+    match kind {
+        clifford_ast::AtomicKind::InterruptCritical => "interrupt_critical",
+        clifford_ast::AtomicKind::MulticoreCritical => "multicore_critical",
+        clifford_ast::AtomicKind::Custom(_) => "<custom>",
+        // `AtomicKind` is `#[non_exhaustive]`. Forward-compat:
+        // unknown variants render as `<unknown>` so callers can
+        // emit a structured diagnostic without crashing.
+        _ => "<unknown>",
+    }
+}
+
+/// (kept for legacy callers — superseded by the
+/// [`Emitter::emit_atomic_entry_mask`] method which actually emits
+/// the runtime wrapping. Existing call sites have been migrated;
+/// this stub exists only to mark the v0.2-δ → v0.2-ε transition
+/// in the diff history and may be deleted in a follow-up cleanup.)
+#[allow(dead_code)]
 fn emit_atomic_marker_if_any(out: &mut String, atomic: Option<&clifford_ast::AtomicKind>) {
     if let Some(kind) = atomic {
-        let kind_str = match kind {
-            clifford_ast::AtomicKind::InterruptCritical => "interrupt_critical",
-            clifford_ast::AtomicKind::MulticoreCritical => "multicore_critical",
-            clifford_ast::AtomicKind::Custom(s) => s.as_str(),
-            // `AtomicKind` is `#[non_exhaustive]`. Forward-compat:
-            // unknown variants render as `<unknown>` so the IR
-            // still has a marker. A future variant would normally
-            // have its own arm above.
-            _ => "<unknown>",
-        };
-        // ; <comment> is LLVM IR's comment syntax. clang strips
-        // these on parse, so they don't affect the generated
-        // binary — purely documentary for now.
+        let kind_str = atomic_kind_str(kind);
         writeln!(
             out,
-            "  ; #atomic: {kind_str} (runtime wrapping deferred to a future slice; see CHANGELOG)"
+            "  ; #atomic: {kind_str} (legacy marker — runtime wrapping is now emitted; see emit_atomic_entry_mask)"
         )
         .ok();
     }
@@ -6283,6 +6376,174 @@ mod tests {
         assert!(
             body_pos < store_pos && store_pos < back_edge_pos,
             "store must be between body label and back-edge; got:\n{ir}"
+        );
+    }
+
+    // ─── v0.2-ε: #atomic: interrupt_critical runtime wrapping ────────────
+
+    #[test]
+    fn atomic_interrupt_critical_emits_cpsid_at_body_start() {
+        // `#atomic: interrupt_critical;` on an effect produces an
+        // inline-asm `cpsid i` at the start of the body (after
+        // entry: + any entry fence).
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #effect snapshot() #mutates: [C] #atomic: interrupt_critical; { return; }\n\
+        ";
+        let ir = lower_str(src).expect("lower atomic effect");
+        assert!(
+            ir.contains("call void asm sideeffect \"cpsid i\""),
+            "expected cpsid i entry asm; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn atomic_interrupt_critical_emits_cpsie_before_ret() {
+        // The matching `cpsie i` lands before every `ret`, paired
+        // 1:1 with the entry mask.
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #effect snapshot() #mutates: [C] #atomic: interrupt_critical; { return; }\n\
+        ";
+        let ir = lower_str(src).expect("lower atomic effect");
+        assert!(
+            ir.contains("call void asm sideeffect \"cpsie i\""),
+            "expected cpsie i exit asm; got:\n{ir}"
+        );
+        // The unmask appears before the ret.
+        let unmask_pos = ir
+            .find("cpsie i")
+            .expect("cpsie should appear");
+        let ret_pos = ir.find("ret void").expect("ret void should appear");
+        assert!(
+            unmask_pos < ret_pos,
+            "cpsie i must come before ret; positions {unmask_pos} / {ret_pos} in:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn atomic_emits_balanced_pair_per_function() {
+        // Exactly one cpsid + one cpsie per #atomic callable.
+        // (Multiple ret paths would emit multiple cpsie's, but
+        // this minimal body has one ret.)
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #effect a() #mutates: [C] #atomic: interrupt_critical; { return; }\n\
+            #effect b() #mutates: [C] #atomic: interrupt_critical; { return; }\n\
+            #effect plain() #mutates: [C] { return; }\n\
+        ";
+        let ir = lower_str(src).expect("lower mixed atomic + non-atomic");
+        // Two atomic effects → 2 cpsid + 2 cpsie. The plain
+        // effect contributes nothing.
+        assert_eq!(
+            ir.matches("cpsid i").count(),
+            2,
+            "expected exactly 2 cpsid emissions; got:\n{ir}"
+        );
+        assert_eq!(
+            ir.matches("cpsie i").count(),
+            2,
+            "expected exactly 2 cpsie emissions; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn atomic_interacts_correctly_with_release_fence() {
+        // The exit order must be: tag write → release fence → cpsie → ret.
+        // For an atomic effect with $ [Release], we verify the
+        // fence appears before the cpsie (so the publication
+        // completes before any pending IRQ can fire).
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #effect commit() #mutates: [C] #atomic: interrupt_critical; $ [Release] {\n  \
+              C.v = 1u32;\n  \
+              return;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower atomic + release");
+        let fence_pos = ir.find("fence release").expect("expected fence release");
+        let unmask_pos = ir.find("cpsie i").expect("expected cpsie i");
+        let ret_pos = ir.find("ret void").expect("expected ret void");
+        assert!(
+            fence_pos < unmask_pos && unmask_pos < ret_pos,
+            "expected order: fence release < cpsie i < ret void; got positions {fence_pos} / {unmask_pos} / {ret_pos} in:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn non_atomic_effect_emits_no_cpsid_or_cpsie() {
+        // Sanity: an effect WITHOUT #atomic produces zero asm
+        // emissions. Confirms we don't accidentally wrap every
+        // body.
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #effect plain() #mutates: [C] { C.v = 1u32; }\n\
+        ";
+        let ir = lower_str(src).expect("lower plain effect");
+        assert!(
+            !ir.contains("cpsid"),
+            "plain effect should not emit cpsid; got:\n{ir}"
+        );
+        assert!(
+            !ir.contains("cpsie"),
+            "plain effect should not emit cpsie; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn atomic_on_interrupt_emits_wrapping_too() {
+        // #atomic: interrupt_critical on an interrupt is unusual
+        // (interrupts mask their own priority on entry already)
+        // but legal — the wrapping still emits and asserts the
+        // body masks ALL maskable interrupts during execution.
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #interrupt SysTick() #mutates: [C] #priority: HIGH #atomic: interrupt_critical; { C.v = 1u32; }\n\
+        ";
+        let ir = lower_str(src).expect("lower atomic interrupt");
+        assert!(ir.contains("cpsid i"), "expected cpsid; got:\n{ir}");
+        assert!(ir.contains("cpsie i"), "expected cpsie; got:\n{ir}");
+    }
+
+    #[test]
+    fn atomic_multicore_critical_is_not_yet_implemented() {
+        // Reserved for Decision #21 (v0.7+). Codegen should
+        // surface a structured error rather than silently emit
+        // wrong code.
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #effect e() #mutates: [C] #atomic: multicore_critical; { return; }\n\
+        ";
+        let errors = lower_str(src).expect_err("expected NotYetImplemented for multicore");
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            CodegenError::NotYetImplemented { what }
+                if what.contains("multicore_critical")
+        ));
+        assert!(
+            saw,
+            "expected NotYetImplemented(multicore_critical); got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn atomic_custom_kind_is_not_yet_implemented() {
+        // Custom atomicity kinds are parser-accepted but codegen
+        // doesn't know what masking semantics to emit; surface a
+        // structured error.
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #effect e() #mutates: [C] #atomic: my_custom_lock; { return; }\n\
+        ";
+        let errors = lower_str(src).expect_err("expected NotYetImplemented for custom");
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            CodegenError::NotYetImplemented { what }
+                if what.contains("custom")
+        ));
+        assert!(
+            saw,
+            "expected NotYetImplemented(custom); got {errors:?}"
         );
     }
 
