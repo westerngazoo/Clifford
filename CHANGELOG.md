@@ -7,6 +7,139 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — `clifford-ortho` v0.2-δ: `#atomic: interrupt_critical` (§6.6) — verifier side (2026-05-08)
+
+End-to-end plumbing for `#atomic: <kind>;` clauses on `#effect`,
+`#interrupt`, and `#transition` declarations. The verifier
+consumes the attribute to suppress orthogonality pairs against
+`#interrupt` callables — the canonical fix for the SPSC
+consumer-side race v0.2-β rejected on `dual_uart_telemetry.cl`.
+
+**The drain effects are back.** The sample's foreground readers
+(`drain_total`, `drain_last_uart1`, `drain_last_uart2`) now
+carry `#atomic: interrupt_critical;` and pass the v0.2-δ
+verifier cleanly:
+
+```clifford
+#effect drain_total() -> u32
+    #mutates: [Telemetry]
+    #atomic: interrupt_critical;
+    $ [Acquire]
+{
+  return Telemetry.bytes_uart1 + Telemetry.bytes_uart2;
+}
+```
+
+**⚠ Documented soundness gap.** v0.2-δ is **verifier only**.
+Codegen emits a comment marker in the IR but does NOT yet emit
+the runtime masking instructions (`cpsid i` / `cpsie i` on
+Cortex-M). A binary built today with `#atomic` will *not*
+actually mask interrupts at runtime. The verifier's safety
+proof is valid for the program as written; the runtime gap is
+on the emission side. The closing slice (v0.2-ε, planned)
+wires the inline-asm sequences for at least Cortex-M.
+
+This is a deliberate trade-off: shipping the verifier value
+NOW (so users can write idiomatic `#atomic` code and have it
+type-checked) and deferring the runtime to a focused
+follow-up. The CHANGELOG and the `; #atomic:` IR comment
+both call out the gap.
+
+**Pipeline (5 crates touched):**
+
+- **`clifford-ast`**: new `AtomicKind` enum
+  (`InterruptCritical`, `MulticoreCritical` (reserved for
+  v0.7+), `Custom(String)`) marked `#[non_exhaustive]`. New
+  `atomic: Option<AtomicKind>` field on `EffectDecl`,
+  `InterruptDecl`, and `TransitionDecl`.
+- **`clifford-parser`**: new `parse_optional_atomic_clause`
+  recognises `#atomic: <ident>;` after the `#mutates` /
+  `#priority` / `#cannot_mutate` clauses, before the
+  `$ [TraitList]` (or before the body if no trait list). Wired
+  into all three decl parsers.
+- **`clifford-resolve`** / **`clifford-types`**: no changes.
+  The attribute is data-only; no name resolution or typing
+  obligations.
+- **`clifford-codegen`**: new `emit_atomic_marker_if_any`
+  helper writes `; #atomic: <kind> (runtime wrapping deferred
+  to a future slice; see CHANGELOG)` as a comment line at the
+  start of every `#atomic` callable's `entry:` block. The
+  comment is stripped by clang on parse — purely documentary
+  for human readers and post-processing tools.
+- **`clifford-ortho`**: each `ConcurrencyNode` now carries an
+  `is_atomic_critical: bool` flag collected during the
+  node-collection phase. `verify` checks the flag before the
+  wedge-product check: if either side is atomic AND the other
+  side is an `#interrupt`, the pair is suppressed. Effect ×
+  effect and effect × @fn pairs are unaffected (they're
+  already non-concurrent per §7.3).
+
+**Suppression matrix (per `docs/ortho-atomic-attribute.md`):**
+
+| Pair | Atomic suppresses? |
+|---|---|
+| `#atomic effect` × `#interrupt` | ✅ |
+| `#atomic interrupt` × `#interrupt` | ✅ |
+| `#atomic effect` × `#effect` | ❌ (foreground serialises) |
+| `#atomic effect` × `@fn` | ❌ (foreground serialises) |
+| `#atomic transition` × `#interrupt` | ❌ today (transitions aren't direct concurrency nodes per §7.3; the attribute is parsed but transition-side suppression needs call-site-aware tracking — separate slice) |
+
+**`docs/ortho-atomic-attribute.md`** ships alongside this
+slice as the behaviour reference. Covers the verifier
+semantics, the runtime gap, the closing slice's plan, what
+`#atomic` doesn't cover (NMI, multi-core, foreground-vs-
+foreground races), worked examples, and cross-references to
+the implementation + tests.
+
+**Tests added: 6 new in ortho (45 → 51).**
+
+- `atomic_effect_suppresses_pair_with_interrupt` — the
+  canonical SPSC consumer-side fix.
+- `atomic_interrupt_suppresses_pair_with_other_interrupt` —
+  IRQ-vs-IRQ pair with one side atomic.
+- `atomic_does_not_suppress_pair_with_non_interrupt` — atomic
+  is interrupt-specific; foreground serialisation handles the
+  rest.
+- `no_atomic_means_no_suppression` — sanity that the attribute
+  is what's making the first test pass.
+- `atomic_with_multiple_field_writes_suppresses_all` — §7.2's
+  motivation (multi-field consistency).
+- `atomic_transition_is_recognised` — confirms transition-side
+  parsing (verifier consumption deferred).
+
+**Pipeline regression checked.** All 7 examples (the 6 from
+prior slices plus this slice's restored
+`dual_uart_telemetry.cl` drain effects) compile cleanly:
+
+| Sample | Status |
+|---|---|
+| `examples/dual_uart_telemetry.cl` | ✅ (drain effects restored with `#atomic`) |
+| `examples/buffer_init_sigma.cl` | ✅ |
+| `examples/uart_fsm.cl` | ✅ |
+| `examples/traffic_classifier.cl` | ✅ |
+| `examples/crc32.cl` | ✅ |
+| `examples/sequential_attribute_demo.cl` | ✅ |
+| `tests/qemu/firmware_smoke.cl` | ✅ |
+
+**Deferred:**
+
+- **v0.2-ε: runtime wrapping for `#atomic: interrupt_critical`.**
+  Emit `cpsid i` / `cpsie i` (or target equivalents) around the
+  body. Cortex-M only for the MVP; other targets surface a
+  structured `NotYetImplemented`.
+- **Transition-side `#atomic` consumption in the verifier.**
+  Today the parser plumbs the field on transitions but the
+  verifier doesn't consume it (transitions aren't direct
+  concurrency nodes). Call-site-aware atomicity tracking
+  through `#> proc()` chains is its own slice.
+- **`#atomic: multicore_critical`** for Decision #21 (v0.7+)
+  shared-field locking.
+- **NMI handling**: documenting which interrupts are NMI on
+  each target so `#atomic` can warn or escalate.
+
+Total ortho tests: **51** (45 pre-v0.2-δ + 6 new). Workspace
+clean; clippy clean.
+
 ### Added — `clifford-ortho` v0.2-γ: `@sequential(A, B)` consumption (Decision #11) (2026-05-08)
 
 The verifier now consumes `@sequential(A, B);` top-level

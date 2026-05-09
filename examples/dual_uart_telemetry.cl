@@ -15,33 +15,28 @@
 //   - mutation sugar `+=` and `=`                           (slice 3)
 //   - integer cast (volatile-read u32, store low byte u8)   (slice 7)
 //
-// What this sample does NOT include (deliberately):
-//   - The foreground "drain" side. v0.2-β's read-write race detector
-//     (spec §7.2) correctly flags reads of `bytes_uartN` from
-//     foreground code as racing against the ISR writes — even with
-//     Acquire/Release publication ordering, the read of the memory
-//     cell itself races with the ISR's load-modify-store (a
-//     theoretical race that's benign on aligned 32-bit hardware but
-//     fails the conservative §7.2 check).
+// The foreground drain side uses `#atomic: interrupt_critical;`
+// (v0.2-δ) to mask all interrupts during the body. The §7.2
+// graded engine sees the attribute and suppresses the read-write
+// race pair against the ISR producers — the masked body cannot
+// be preempted, so the read is serialised with the ISR's
+// load-modify-store.
 //
-//     A SAFE drain-side requires either:
-//       (a) `#atomic: interrupt_critical` on the drain effect (CLI/STI
-//           wrapper) — implementation deferred to a future slice.
-//       (b) `@snapshot Auto.field` (Decision #24 / ADR 0004) to copy
-//           the field into a private local before reading — parser
-//           ships in v0.2-α; codegen lowering is a future slice.
-//
-//     Until either lands, the foreground reader pattern is:
-//       - Disable interrupts manually (via inline asm, future).
-//       - Read the counters.
-//       - Re-enable interrupts.
-//     This sample documents the producer side in isolation.
+// **Soundness gap as of v0.2-δ (documented):** the verifier
+// trusts `#atomic` for race-freedom reasoning, but codegen does
+// NOT yet emit the runtime wrapping (`cpsid i` / `cpsie i` on
+// Cortex-M). The IR carries a comment marker; the actual
+// interrupt-disable instructions land in a follow-up slice. A
+// binary built today with `#atomic` does NOT mask interrupts
+// at runtime. The verifier's safety proof IS valid for the
+// program as written; the runtime gap is purely on the
+// emission side.
 //
 // Earlier drafts of this sample also shared `bytes_total` and
 // `last_byte` between producers — both the v0.1 (write-write) and
 // v0.2-β (read-write) verifiers rejected that. The current shape
-// — strictly disjoint per-source fields — is what the engine
-// proves race-free.
+// — strictly disjoint per-source fields + atomic-wrapped drain
+// — is what the engine proves race-free.
 //
 // What this sample exercises end-to-end (across slices 1-10):
 //   - register-block automatons + volatile MMIO reads          (slice 4)
@@ -126,6 +121,31 @@
     Telemetry.bytes_uart2 += 1u32;
     Telemetry.last_byte_uart2 = (Uart2.rx_data as u8);
   }
+}
+
+
+// ─── Foreground drain (v0.2-δ: #atomic: interrupt_critical) ─────────
+//
+// `drain_total` returns the SUM across both per-source counters,
+// computed at read time. The Acquire fence pairs with the Release
+// on every producer transition (publication ordering).
+//
+// `#atomic: interrupt_critical;` makes the body atomic with
+// respect to the producers — the §7.2 verifier suppresses the
+// read-write race pair, and (when codegen support lands) the
+// runtime will mask interrupts for the body's duration.
+
+#effect drain_total() -> u32 #mutates: [Telemetry] #atomic: interrupt_critical; $ [Acquire] {
+  return Telemetry.bytes_uart1 + Telemetry.bytes_uart2;
+}
+
+// Same pattern for the per-source byte snapshots.
+#effect drain_last_uart1() -> u8 #mutates: [Telemetry] #atomic: interrupt_critical; $ [Acquire] {
+  return Telemetry.last_byte_uart1;
+}
+
+#effect drain_last_uart2() -> u8 #mutates: [Telemetry] #atomic: interrupt_critical; $ [Acquire] {
+  return Telemetry.last_byte_uart2;
 }
 
 

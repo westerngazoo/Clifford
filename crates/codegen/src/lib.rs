@@ -589,6 +589,7 @@ impl<'a> Emitter<'a> {
         if let Some(entry_fence) = ordering.entry {
             writeln!(&mut self.out, "  fence {entry_fence}").ok();
         }
+        emit_atomic_marker_if_any(&mut self.out, decl.atomic.as_ref());
         self.emit_block(&decl.body, &ret_ty);
         writeln!(&mut self.out, "}}").ok();
         writeln!(&mut self.out).ok();
@@ -652,6 +653,7 @@ impl<'a> Emitter<'a> {
         if let Some(entry_fence) = ordering.entry {
             writeln!(&mut self.out, "  fence {entry_fence}").ok();
         }
+        emit_atomic_marker_if_any(&mut self.out, decl.atomic.as_ref());
         self.emit_block(&decl.body, &ret_ty);
         writeln!(&mut self.out, "}}").ok();
         writeln!(&mut self.out).ok();
@@ -725,6 +727,7 @@ impl<'a> Emitter<'a> {
         if let Some(entry_fence) = ordering.entry {
             writeln!(&mut self.out, "  fence {entry_fence}").ok();
         }
+        emit_atomic_marker_if_any(&mut self.out, decl.atomic.as_ref());
         self.emit_block(&decl.body, "void");
         writeln!(&mut self.out, "}}").ok();
         writeln!(&mut self.out).ok();
@@ -2953,6 +2956,46 @@ enum FieldLocation {
 /// `"0xFF"` etc., possibly with `_` separators) to a `u64` value.
 /// Decimal literals are also accepted as a defensive convenience.
 /// Returns `None` if the literal is malformed.
+/// v0.2-δ: emit a comment line in the IR marking a callable's
+/// `#atomic: <kind>` clause. The actual runtime wrapping
+/// (`cpsid i` / `cpsie i` on Cortex-M for `interrupt_critical`)
+/// is **deferred to a future slice** — for now codegen produces
+/// only the comment, which means a binary built today does NOT
+/// actually mask interrupts even when the source asks for it.
+///
+/// **This is a known soundness gap** between the verifier
+/// (which trusts `#atomic` for race-freedom reasoning) and
+/// codegen (which doesn't yet emit the wrapping). The CHANGELOG
+/// flags it explicitly. Until the runtime wrapping lands,
+/// `#atomic`-using programs should be treated as
+/// "verifier-proven safe in concept; runtime safety pending."
+///
+/// The IR comment makes the gap visible to anyone reading the
+/// `.ll` output and to future tooling that may post-process to
+/// inject the wrapping at link time.
+fn emit_atomic_marker_if_any(out: &mut String, atomic: Option<&clifford_ast::AtomicKind>) {
+    if let Some(kind) = atomic {
+        let kind_str = match kind {
+            clifford_ast::AtomicKind::InterruptCritical => "interrupt_critical",
+            clifford_ast::AtomicKind::MulticoreCritical => "multicore_critical",
+            clifford_ast::AtomicKind::Custom(s) => s.as_str(),
+            // `AtomicKind` is `#[non_exhaustive]`. Forward-compat:
+            // unknown variants render as `<unknown>` so the IR
+            // still has a marker. A future variant would normally
+            // have its own arm above.
+            _ => "<unknown>",
+        };
+        // ; <comment> is LLVM IR's comment syntax. clang strips
+        // these on parse, so they don't affect the generated
+        // binary — purely documentary for now.
+        writeln!(
+            out,
+            "  ; #atomic: {kind_str} (runtime wrapping deferred to a future slice; see CHANGELOG)"
+        )
+        .ok();
+    }
+}
+
 fn parse_address_literal(s: &str) -> Option<u64> {
     let trimmed: String = s.chars().filter(|c| *c != '_').collect();
     if let Some(body) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {

@@ -55,13 +55,13 @@
 #![warn(missing_docs)]
 
 use clifford_ast::{
-    AccessMode, AccessType, AddressClause, ArraySize, ArrayType, AssignOp, AutomatonDecl,
-    AutomatonField, BasisClause, BinaryOp, Block, EffectDecl, Expr, ExprKind, Field, FieldAssign,
-    FieldKind, FnDecl, FnType, GenericParam, ImplDecl, InterfaceDecl, InterfaceMethod,
-    InterruptDecl, Item, Param, PathType, PriorityLevel, PrimitiveType, Program, RefType,
-    SequentialAttr, SliceType, StateName, Stmt, StmtKind, TestDecl, TraitDecl, TraitMethod,
-    TraitRef, TransitionDecl, TupleType, TypeBody, TypeDecl, TypeExpr, TypeKind, UnaryOp, Variant,
-    VariantData,
+    AccessMode, AccessType, AddressClause, ArraySize, ArrayType, AssignOp, AtomicKind,
+    AutomatonDecl, AutomatonField, BasisClause, BinaryOp, Block, EffectDecl, Expr, ExprKind,
+    Field, FieldAssign, FieldKind, FnDecl, FnType, GenericParam, ImplDecl, InterfaceDecl,
+    InterfaceMethod, InterruptDecl, Item, Param, PathType, PriorityLevel, PrimitiveType,
+    Program, RefType, SequentialAttr, SliceType, StateName, Stmt, StmtKind, TestDecl, TraitDecl,
+    TraitMethod, TraitRef, TransitionDecl, TupleType, TypeBody, TypeDecl, TypeExpr, TypeKind,
+    UnaryOp, Variant, VariantData,
 };
 use clifford_lexer::{Span, Token, TokenKind};
 use thiserror::Error;
@@ -671,12 +671,16 @@ impl<'t> Parser<'t> {
         } else {
             Vec::new()
         };
+        // v0.2-δ: optional `#atomic: <kind>;` after the trait list,
+        // before the body block.
+        let atomic = self.parse_optional_atomic_clause()?;
         let body = self.parse_block()?;
         let end = body.span.end;
         Ok(TransitionDecl {
             name,
             destination,
             trait_list,
+            atomic,
             body,
             span: Span::new(start, end),
         })
@@ -703,6 +707,9 @@ impl<'t> Parser<'t> {
 
         let (mutates, cannot_mutate) = self.parse_effect_meta_for_effect()?;
 
+        // v0.2-δ: optional `#atomic: <kind>;` clause per §6.6.
+        let atomic = self.parse_optional_atomic_clause()?;
+
         // Decision #22: optional `$ [TraitList]` after the `#mutates` /
         // `#cannot_mutate` metadata, before the body block.
         let trait_list = if matches!(self.peek().kind, TokenKind::Dollar) {
@@ -721,6 +728,7 @@ impl<'t> Parser<'t> {
             mutates,
             cannot_mutate,
             trait_list,
+            atomic,
             body,
             span: Span::new(start, end),
         })
@@ -743,6 +751,9 @@ impl<'t> Parser<'t> {
 
         let (mutates, priority) = self.parse_effect_meta_for_interrupt(start)?;
 
+        // v0.2-δ: optional `#atomic: <kind>;` clause per §6.6.
+        let atomic = self.parse_optional_atomic_clause()?;
+
         // Decision #22: optional `$ [TraitList]` after `#mutates` / `#priority`
         // metadata, before the body block.
         let trait_list = if matches!(self.peek().kind, TokenKind::Dollar) {
@@ -761,6 +772,7 @@ impl<'t> Parser<'t> {
             mutates,
             priority,
             trait_list,
+            atomic,
             body,
             span: Span::new(start, end),
         })
@@ -1156,6 +1168,33 @@ impl<'t> Parser<'t> {
                 }
             }
         }
+    }
+
+    /// Parse an optional `#atomic: <kind>;` clause per §6.6 (v0.2-δ).
+    /// Returns `None` if no `#atomic` clause appears at the current
+    /// position. The trailing `;` is part of the clause to mirror
+    /// the §2.5 effect_meta token shape.
+    ///
+    /// Recognised kinds:
+    /// - `interrupt_critical` → [`AtomicKind::InterruptCritical`].
+    /// - `multicore_critical` → [`AtomicKind::MulticoreCritical`]
+    ///   (reserved; consumers may reject it as v0.7+).
+    /// - any other ident → [`AtomicKind::Custom`] preserving the
+    ///   raw text for downstream tools to interpret.
+    fn parse_optional_atomic_clause(&mut self) -> Result<Option<AtomicKind>, ParseError> {
+        if !matches!(self.peek().kind, TokenKind::KwHashAtomic) {
+            return Ok(None);
+        }
+        self.advance(); // `#atomic`
+        self.expect(TokenKind::Colon, "`:` after `#atomic`")?;
+        let (kind_name, _) = self.expect_ident("atomicity kind after `#atomic:`")?;
+        self.expect(TokenKind::Semi, "`;` to terminate `#atomic` clause")?;
+        let kind = match kind_name.as_str() {
+            "interrupt_critical" => AtomicKind::InterruptCritical,
+            "multicore_critical" => AtomicKind::MulticoreCritical,
+            _ => AtomicKind::Custom(kind_name),
+        };
+        Ok(Some(kind))
     }
 
     /// Parse `LOW | MEDIUM | HIGH | <integer>` per §2.5.

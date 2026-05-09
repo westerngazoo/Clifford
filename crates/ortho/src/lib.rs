@@ -99,7 +99,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use clifford_ast::{Item, Program, TraitRef};
+use clifford_ast::{AtomicKind, Item, Program, TraitRef};
 use clifford_effect::{CallableId, FieldRef, MutationProfile, MutationProfiles};
 use thiserror::Error;
 
@@ -717,23 +717,20 @@ pub fn verify(
         Err(e) => return Err(vec![e]),
     };
 
-    // Collect every concurrency-checked node with its behaviour.
-    // We include `@fn`s as nodes (v0.2-α) so trait-basis and
-    // read-basis interactions can be checked.
-    let mut nodes: Vec<(ConcurrencyNode, Behaviour)> = Vec::new();
+    // Collect every concurrency-checked node with its behaviour
+    // and atomicity state. `@fn`s are included as nodes (v0.2-α)
+    // for trait-basis and read-basis interactions; v0.2-δ adds
+    // `is_atomic_critical` so the pair check can suppress
+    // interrupt pairings against atomic-critical bodies.
+    let mut nodes: Vec<(ConcurrencyNode, Behaviour, bool)> = Vec::new();
     for item in &program.items {
         match item {
             Item::Fn(decl) => {
                 let id = ConcurrencyNode::Fn(decl.name.clone());
-                // @fns aren't tracked in clifford-effect's profile
-                // map (CallableId only covers Effect/Interrupt/
-                // Transition), so profile lookup returns None.
-                // Future slice that adds @fn-callable mutation
-                // profiles can pass `profiles.lookup_fn(&decl.name)`
-                // here. For now, behaviour_from_fn_traits handles
-                // None gracefully and uses just trait bits.
                 let beh = behaviour_from_fn_traits(None, &decl.trait_list, &basis);
-                nodes.push((id, beh));
+                // `@fn`s can't carry `#atomic` (it's an imperative-
+                // layer clause); always false.
+                nodes.push((id, beh, false));
             }
             Item::Effect(decl) => {
                 let cid = CallableId::Effect(decl.name.clone());
@@ -742,7 +739,8 @@ pub fn verify(
                     &decl.trait_list,
                     &basis,
                 );
-                nodes.push((ConcurrencyNode::Effect(decl.name.clone()), beh));
+                let atomic = matches!(decl.atomic, Some(AtomicKind::InterruptCritical));
+                nodes.push((ConcurrencyNode::Effect(decl.name.clone()), beh, atomic));
             }
             Item::Interrupt(decl) => {
                 let cid = CallableId::Interrupt(decl.name.clone());
@@ -751,7 +749,8 @@ pub fn verify(
                     &decl.trait_list,
                     &basis,
                 );
-                nodes.push((ConcurrencyNode::Interrupt(decl.name.clone()), beh));
+                let atomic = matches!(decl.atomic, Some(AtomicKind::InterruptCritical));
+                nodes.push((ConcurrencyNode::Interrupt(decl.name.clone()), beh, atomic));
             }
             _ => {}
         }
@@ -770,8 +769,8 @@ pub fn verify(
     let mut errors: Vec<OrthoError> = Vec::new();
     for i in 0..nodes.len() {
         for j in (i + 1)..nodes.len() {
-            let (id_a, beh_a) = &nodes[i];
-            let (id_b, beh_b) = &nodes[j];
+            let (id_a, beh_a, atomic_a) = &nodes[i];
+            let (id_b, beh_b, atomic_b) = &nodes[j];
             if !can_concur(id_a, id_b) {
                 continue;
             }
@@ -780,6 +779,29 @@ pub fn verify(
             // *trusted* override per Decision #11 — the engine
             // does not verify the assertion.
             if is_pair_sequential(id_a, id_b, profiles, &sequential_pairs) {
+                continue;
+            }
+            // v0.2-δ: skip pairs where one side is `#atomic:
+            // interrupt_critical` and the other is an `#interrupt`.
+            // The atomic side runs with all maskable interrupts
+            // disabled (`cpsid i` on Cortex-M); the interrupt
+            // cannot preempt the body. Per spec §6.6 + §7.2.
+            //
+            // Rationale for the asymmetric rule:
+            //   - atomic_effect × interrupt → suppressed (interrupt
+            //     masked during the body).
+            //   - atomic_interrupt × interrupt → suppressed (the
+            //     atomic interrupt masks all maskable interrupts on
+            //     entry; even a higher-priority IRQ stays pending
+            //     until the body returns).
+            //   - atomic_X × non-atomic non-interrupt callable →
+            //     the standard wedge check still runs; atomicity
+            //     doesn't grant safety against foreground-thread
+            //     races (those are already non-concurrent per §7.3).
+            let either_atomic = *atomic_a || *atomic_b;
+            let other_is_interrupt = matches!(id_a, ConcurrencyNode::Interrupt(_))
+                || matches!(id_b, ConcurrencyNode::Interrupt(_));
+            if either_atomic && other_is_interrupt {
                 continue;
             }
             // Combined conflict mask across the three race classes.
@@ -1152,6 +1174,121 @@ mod tests {
         let program = parse_program(src);
         let profiles = build_profiles(&program);
         verify(&program, &profiles).expect("imperative traits are not in the basis");
+    }
+
+    // ─── v0.2-δ: #atomic: interrupt_critical (§6.6) ──────────────────
+
+    #[test]
+    fn atomic_effect_suppresses_pair_with_interrupt() {
+        // Without #atomic, this is the canonical SPSC consumer
+        // race v0.2-β catches: foreground reads `v` while
+        // interrupt writes it. With `#atomic: interrupt_critical`
+        // on the effect, the pair is suppressed because the
+        // effect's body runs with all interrupts masked.
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #effect drain() -> u32 #mutates: [C] #atomic: interrupt_critical; { return C.v; }\n\
+            #interrupt Tally() #mutates: [C] #priority: HIGH { C.v += 1u32; }\n\
+        ";
+        let program = parse_program(src);
+        let profiles = build_profiles(&program);
+        verify(&program, &profiles).expect("#atomic suppresses pair with interrupt");
+    }
+
+    #[test]
+    fn atomic_interrupt_suppresses_pair_with_other_interrupt() {
+        // An `#atomic: interrupt_critical` interrupt masks ALL
+        // maskable interrupts on entry, so a higher-priority
+        // (or same-priority) IRQ that would otherwise preempt
+        // it cannot. The pair is suppressed regardless of which
+        // side carries the attribute.
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #interrupt Critical() #mutates: [C] #priority: LOW #atomic: interrupt_critical; { C.v = 1u32; }\n\
+            #interrupt Other() #mutates: [C] #priority: HIGH { C.v = 2u32; }\n\
+        ";
+        let program = parse_program(src);
+        let profiles = build_profiles(&program);
+        verify(&program, &profiles).expect("#atomic interrupt suppresses pair");
+    }
+
+    #[test]
+    fn atomic_does_not_suppress_pair_with_non_interrupt() {
+        // `#atomic: interrupt_critical` only masks INTERRUPTS.
+        // Two foreground callables (effect × effect) are already
+        // non-concurrent per §7.3 — the attribute doesn't change
+        // that case (no false positive risk). But two effects
+        // mutating the same field still don't race because of
+        // the foreground-thread serialisation.
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #effect e1() #mutates: [C] #atomic: interrupt_critical; { C.v = 1u32; }\n\
+            #effect e2() #mutates: [C] { C.v = 2u32; }\n\
+        ";
+        let program = parse_program(src);
+        let profiles = build_profiles(&program);
+        // Both effects on foreground → can_concur returns false →
+        // no violation regardless of #atomic.
+        verify(&program, &profiles).expect("two effects always serialise");
+    }
+
+    #[test]
+    fn no_atomic_means_no_suppression() {
+        // Sanity: same source as
+        // `atomic_effect_suppresses_pair_with_interrupt` but
+        // WITHOUT the #atomic attribute. v0.2-β rejects with
+        // E0520; verifies the suppression is what's making the
+        // first test pass.
+        let src = "\
+            #automaton C { v: u32; }\n\
+            #effect drain() -> u32 #mutates: [C] { return C.v; }\n\
+            #interrupt Tally() #mutates: [C] #priority: HIGH { C.v += 1u32; }\n\
+        ";
+        let program = parse_program(src);
+        let profiles = build_profiles(&program);
+        let errs = verify(&program, &profiles).expect_err("expected E0520 without #atomic");
+        assert_eq!(errs.len(), 1);
+    }
+
+    #[test]
+    fn atomic_with_multiple_field_writes_suppresses_all() {
+        // An `#atomic: interrupt_critical` effect that writes
+        // multiple fields — the spec §7.2 motivation for #atomic
+        // ("multi-field consistency must use #atomic"). The
+        // engine suppresses the entire pair regardless of how
+        // many fields would otherwise conflict.
+        let src = "\
+            #automaton C { v1: u32; v2: u32; v3: u32; }\n\
+            #effect bulk_update() #mutates: [C] #atomic: interrupt_critical; {\n  \
+              C.v1 = 1u32;\n  \
+              C.v2 = 2u32;\n  \
+              C.v3 = 3u32;\n\
+            }\n\
+            #interrupt Reader() #mutates: [C] #priority: HIGH { C.v1 = C.v2; }\n\
+        ";
+        let program = parse_program(src);
+        let profiles = build_profiles(&program);
+        verify(&program, &profiles).expect("#atomic suppresses regardless of conflict count");
+    }
+
+    #[test]
+    fn atomic_transition_is_recognised() {
+        // Verifies the parser plumbs `#atomic` on transitions
+        // (slice 9's transitions weren't atomic-aware). Today
+        // the verifier doesn't check transitions directly per
+        // §7.3 (their writes propagate via actual_writes), but
+        // the AST field still gets populated and a future slice
+        // can consume it.
+        let src = "\
+            #automaton C { v: u32;\n  \
+              #transition tick #atomic: interrupt_critical; { C.v += 1u32; }\n\
+            }\n\
+        ";
+        let program = parse_program(src);
+        // Ortho doesn't surface transition-side atomic in v0.2-δ,
+        // so just confirm the program parses + verifies.
+        let profiles = build_profiles(&program);
+        verify(&program, &profiles).expect("transition-side #atomic parses + verifies");
     }
 
     // ─── v0.2-γ: @sequential(A, B) consumption (Decision #11) ────────
