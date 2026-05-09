@@ -7,6 +7,143 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — `@snapshot Auto.field` codegen + verifier exclusion (v0.2-ζ) (2026-05-08)
+
+End-to-end implementation of Decision #24 / ADR 0004's
+`@snapshot Auto.field` boundary-crossing read. Codegen lowers
+the construct to a single `load` (same shape as `Auto.field`);
+the verifier excludes snapshot reads from `actual_reads` so the
+v0.2-β graded check doesn't pair them against concurrent writes.
+The snapshot-and-decide pattern (spec §7.2 closing note 3) is
+the lighter-weight alternative to `#atomic: interrupt_critical;`
+for SPSC consumer-side reads.
+
+**The headline win**: `dual_uart_telemetry.cl`'s drain effects
+are now race-free WITHOUT `#atomic` (no interrupt-mask cost).
+The IR for `drain_total` shrinks from ~3164 bytes (with `#atomic`
+wrapping) to ~2573 bytes (with `@snapshot`) — six fewer
+inline-asm instructions across the three drain effects, and no
+runtime interrupt-latency hit.
+
+```clifford
+#effect drain_total() -> u32 #mutates: [Telemetry] $ [Acquire] {
+  return @snapshot Telemetry.bytes_uart1 + @snapshot Telemetry.bytes_uart2;
+}
+```
+
+**Why this is sound** (per the new
+`docs/snapshot-attribute.md`):
+1. `@snapshot Auto.field` lowers to a single `load` instruction.
+2. On every supported target, single-word loads of aligned data
+   are atomic at the instruction level — the racer either reads
+   the pre-write or the post-write value, never torn.
+3. After the snapshot, the SSA value is owned and immutable;
+   subsequent operations don't re-read the field.
+4. Therefore the read race v0.2-β would have flagged is benign
+   at the hardware level — the user took responsibility for the
+   single-load atomicity by writing `@snapshot`.
+
+The verifier trusts the annotation; codegen enforces the
+type-level precondition (primitive single-word fields only) so
+the trust is sound.
+
+**Pipeline changes (2 crates):**
+
+- **`clifford-effect`**: the `Snapshot` arm in
+  `walk_expr_for_reads` is now **deliberately empty** — it
+  walks past the snapshot without recording a read in
+  `actual_reads`. The arm carries a long comment explaining
+  the spec basis. This single arm change is what makes the
+  verifier accept the snapshot pattern.
+- **`clifford-codegen`**:
+  - New `Emitter::emit_snapshot(automaton, field)` resolves
+    `Self` to the enclosing automaton (mirroring
+    `emit_field_access`), validates the field's IR type is
+    primitive via `is_primitive_ir_ty_for_snapshot`, then
+    delegates to the new `emit_field_access_by_name` for the
+    actual lowering.
+  - `emit_field_access` refactored to delegate to a new
+    `emit_field_access_by_name(auto_name, field)` so both the
+    `FieldAccess` and `Snapshot` paths share lowering. No
+    behaviour change to `Auto.field` reads.
+  - New `is_primitive_ir_ty_for_snapshot(ir_ty)` free helper:
+    `i1`/`i8`/`i16`/`i32`/`i64` are primitive; everything else
+    rejects with a structured `NotYetImplemented`. This is
+    what keeps the soundness claim tight — compound types
+    would tear at the load level.
+  - New `Snapshot` arm in `emit_expr` dispatches to
+    `emit_snapshot`.
+
+**`docs/snapshot-attribute.md`** ships as the behaviour
+reference (~210 lines). Covers:
+
+- The "why this works" reasoning chain.
+- The choice matrix between `@snapshot` /
+  `#atomic: interrupt_critical` / `@sequential`.
+- What `@snapshot` covers (foreground × interrupt reads,
+  `Self.field` inside transitions, composition in arithmetic).
+- What it doesn't (compound fields, multi-field consistency,
+  writes, NMI).
+- Implementation references + test list.
+- Worked example (the dual_uart_telemetry pattern).
+- Forward references (compound `@snapshot`, `@fn` snapshots
+  with row-typed `Readable`).
+
+**Pipeline regression checked.** All 7 examples pass:
+
+| Sample | Status |
+|---|---|
+| `examples/dual_uart_telemetry.cl` | ✅ (drain side now uses `@snapshot`) |
+| `examples/buffer_init_sigma.cl` | ✅ |
+| `examples/uart_fsm.cl` | ✅ |
+| `examples/traffic_classifier.cl` | ✅ |
+| `examples/crc32.cl` | ✅ |
+| `examples/sequential_attribute_demo.cl` | ✅ |
+| `tests/qemu/firmware_smoke.cl` | ✅ |
+
+**Tests added: 13 new total.**
+
+*Codegen (8) — `crates/codegen/src/lib.rs`:*
+- `snapshot_lowers_to_same_load_as_field_access`
+- `snapshot_on_register_block_field_emits_volatile_load`
+- `snapshot_self_inside_transition_resolves_owner`
+- `snapshot_compound_field_returns_e0810`
+- `snapshot_on_unknown_automaton_rejected_by_resolver`
+- `snapshot_inside_arithmetic_composes`
+- (refactor regression) two pre-existing `snapshot_canonical_*`
+  tests still pass through the new `emit_field_access_by_name`
+  path.
+
+*Ortho (5) — `crates/ortho/src/lib.rs`:*
+- `snapshot_read_does_not_trigger_race_with_concurrent_write`
+  — the canonical SPSC consumer-side fix.
+- `snapshot_in_arithmetic_remains_race_free` — composition.
+- `plain_read_still_triggers_race_with_snapshot_alternative`
+  — negative control (snapshot is the difference-maker).
+- `snapshot_does_not_protect_writes` — sanity that writes
+  still race (it would be very wrong to silently exempt
+  writes).
+- `snapshot_self_inside_transition_excluded_from_reads` —
+  `Self` resolution path consistency.
+
+**Deferred:**
+
+- **Compound `@snapshot`** (memcpy-style snapshot inside a
+  `cpsid i` / `cpsie i` scope). Would lift the primitive
+  restriction at the cost of becoming equivalent to `#atomic`
+  — deferred until a use case surfaces.
+- **`@snapshot` inside `@fn`** with full row-typed `Readable`
+  enforcement (ADR 0003). v0.2-ζ supports `@fn` snapshots
+  syntactically; the layer-aware `Readable` row-gating lands
+  with a separate `clifford-types` slice.
+- **Target-aware `#atomic` codegen** (RISC-V `csrrci/csrrsi`,
+  x86 `cli/sti`). Filed as known follow-up; doesn't affect
+  `@snapshot` since it lowers to a portable `load`.
+
+Total ortho tests: **61** (56 + 5). Total codegen tests:
+**178** (170 + 8 net of 0 regressions). Workspace clean;
+clippy clean.
+
 ### Added — `clifford-codegen` v0.2-ε: `#atomic: interrupt_critical` runtime wrapping (Cortex-M) (2026-05-08)
 
 Closes the soundness gap v0.2-δ deliberately documented. Codegen
