@@ -7,6 +7,83 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 20: `#audit` automaton modifier surface (Decision #18) (2026-05-09)
+
+Lands the AST + parser surface for **Decision #18** (runtime
+auditing of unsafe primitives), previously listed as
+"designed; deferred to v0.2." User code can now opt an
+automaton into runtime instrumentation by writing
+`#audit #automaton Foo { … }`. The instrumentation itself
+(wrapping every `#unchecked_*` / `#volatile_*` /
+`#unchecked_cast` with `PointerAuditor` calls in debug
+builds) is deliberately not in scope for slice 20 — the
+codegen pass and the `clifford::audit::ShadowSanitizer`
+default impl land in subsequent slices once the stdlib has
+the runtime helpers.
+
+The two prefix modifiers `#staged` (slice 18) and `#audit`
+(slice 20) compose in **any order** — `#staged #audit
+#automaton …` and `#audit #staged #automaton …` produce
+identical ASTs. Each modifier may appear at most once per
+declaration; duplicates are a parse error.
+
+**Surface syntax:**
+
+```clifford
+#audit #automaton Buf { storage: [u8; 64]; }
+#audit #staged #automaton Pose { x: i32; y: i32; }
+#staged #audit #automaton Pose2 { x: i32; }   // identical to above
+```
+
+**Pipeline changes:**
+
+- **AST (`crates/ast/src/lib.rs`):** new `audited: bool`
+  field on `AutomatonDecl`. Documented to indicate the
+  surface-only scope of slice 20 (no codegen wrapping yet).
+- **Lexer:** already had `KwHashAudit` reserved (per the
+  spec's "reserved keywords for v0.2" list); slice 20 just
+  consumes it.
+- **Parser (`crates/parser/src/lib.rs`):**
+  - `KwHashStaged` and `KwHashAudit` arms in `parse_item`
+    both dispatch to a new `parse_prefixed_automaton`
+    helper that runs a small state machine consuming any
+    permutation of the two modifiers, rejecting
+    duplicates, then handing off to `parse_automaton_decl`
+    with both flags resolved.
+  - `parse_automaton_decl` now takes `audited: bool`
+    alongside `staged: bool` and threads it onto the AST.
+  - The slice-18 `#staged @fn …` rejection still works
+    (and now uses the unified diagnostic pointing at both
+    Decisions #12 and #18).
+- **No resolver, codegen, or sample changes.** Programs
+  with `#audit` automata compile through to the same IR
+  as their non-`#audit` siblings; the AST round-trips the
+  flag for downstream consumption when the codegen pass
+  lands.
+
+**Tests added (7 parser):**
+
+- `unprefixed_automaton_is_not_audited`
+- `audited_automaton_sets_flag`
+- `audit_then_staged_composes`
+- `staged_then_audit_composes_identically`
+- `duplicate_audit_modifier_errors`
+- `duplicate_staged_modifier_errors`
+- `audit_without_automaton_errors`
+
+**Deliberately NOT in slice 20:**
+
+- **No codegen wrapping.** Future slice 21+ will (a)
+  define the `PointerAuditor` interface in the stdlib,
+  (b) ship a default `ShadowSanitizer` impl, and (c)
+  wire codegen to wrap unsafe primitives in
+  `#audit`-marked automata's bodies during debug builds.
+- **No instrumentation profile.** The §6.2 mutation-
+  profile check sees `#audit` automata identically to
+  their non-`#audit` siblings — runtime instrumentation
+  doesn't change which fields are read or written
+  semantically.
+
 ### Added — Slice 19: `#flush` flows into the mutation profile (2026-05-09)
 
 Closes the deliberately-deferred soundness gap from slice 18:
