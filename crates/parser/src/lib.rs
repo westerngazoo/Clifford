@@ -275,26 +275,19 @@ impl<'t> Parser<'t> {
             TokenKind::KwAtFn => self.parse_fn_decl(lead.span.start).map(Item::Fn),
             TokenKind::KwAtType => self.parse_type_decl(lead.span.start).map(Item::Type),
             TokenKind::KwAtTrait => self.parse_trait_decl(lead.span.start).map(Item::Trait),
-            TokenKind::KwHashAutomaton => {
-                self.parse_automaton_decl(lead.span.start, false).map(Item::Automaton)
-            }
-            // Decision #12 (v0.2): `#staged` is an item-level prefix on
-            // `#automaton`. Consume it here, then dispatch to
-            // `parse_automaton_decl` with `staged = true`. The `#staged`
-            // keyword is reserved for `#automaton` only; any other follower
-            // is a parse error.
-            TokenKind::KwHashStaged => {
-                let start = lead.span.start;
-                self.advance(); // `#staged`
-                let next = self.peek().clone();
-                if !matches!(next.kind, TokenKind::KwHashAutomaton) {
-                    return Err(ParseError::Expected {
-                        expected: "`#automaton` after `#staged` modifier (Decision #12)",
-                        found: next.kind,
-                        at: next.span.start,
-                    });
-                }
-                self.parse_automaton_decl(start, true).map(Item::Automaton)
+            TokenKind::KwHashAutomaton => self
+                .parse_automaton_decl(lead.span.start, /*staged=*/ false, /*audited=*/ false)
+                .map(Item::Automaton),
+            // Decisions #12 + #18 (v0.2): `#staged` and `#audit` are
+            // item-level prefixes on `#automaton`. They compose in any
+            // order — `#staged #audit #automaton …` and
+            // `#audit #staged #automaton …` parse identically — but
+            // each prefix may appear at most once (duplicate token
+            // is a parse error). Both keywords are reserved for
+            // `#automaton` only; any other follower is rejected.
+            TokenKind::KwHashStaged | TokenKind::KwHashAudit => {
+                self.parse_prefixed_automaton(lead.span.start)
+                    .map(Item::Automaton)
             }
             TokenKind::KwHashEffect => {
                 self.parse_effect_decl(lead.span.start).map(Item::Effect)
@@ -379,10 +372,66 @@ impl<'t> Parser<'t> {
     /// parse time (E0210) because they're a clear-cut grammatical mistake;
     /// reordering them later doesn't change semantics, but writing two of
     /// the same one is always wrong.
+    /// Slice 20 (Decisions #12 + #18): consume any combination of
+    /// `#staged` / `#audit` prefix modifiers, then dispatch to
+    /// `parse_automaton_decl`. Each prefix may appear at most once
+    /// — duplicates are a parse error. The prefixes are
+    /// order-independent: `#staged #audit #automaton …` and
+    /// `#audit #staged #automaton …` produce identical ASTs.
+    /// Anything other than `#automaton` after the prefixes is
+    /// rejected with a diagnostic citing both decisions.
+    fn parse_prefixed_automaton(
+        &mut self,
+        start: usize,
+    ) -> Result<AutomatonDecl, ParseError> {
+        let mut staged = false;
+        let mut audited = false;
+        loop {
+            let tok = self.peek().clone();
+            match tok.kind {
+                TokenKind::KwHashStaged => {
+                    if staged {
+                        return Err(ParseError::Expected {
+                            expected: "single `#staged` modifier (duplicate not allowed)",
+                            found: tok.kind,
+                            at: tok.span.start,
+                        });
+                    }
+                    self.advance();
+                    staged = true;
+                }
+                TokenKind::KwHashAudit => {
+                    if audited {
+                        return Err(ParseError::Expected {
+                            expected: "single `#audit` modifier (duplicate not allowed)",
+                            found: tok.kind,
+                            at: tok.span.start,
+                        });
+                    }
+                    self.advance();
+                    audited = true;
+                }
+                TokenKind::KwHashAutomaton => {
+                    return self.parse_automaton_decl(start, staged, audited);
+                }
+                other => {
+                    return Err(ParseError::Expected {
+                        expected:
+                            "`#automaton` after `#staged` / `#audit` modifier(s) \
+                             (Decisions #12 + #18)",
+                        found: other,
+                        at: tok.span.start,
+                    });
+                }
+            }
+        }
+    }
+
     fn parse_automaton_decl(
         &mut self,
         start: usize,
         staged: bool,
+        audited: bool,
     ) -> Result<AutomatonDecl, ParseError> {
         self.advance(); // `#automaton`
         let (name, _) = self.expect_ident("automaton name after `#automaton`")?;
@@ -456,6 +505,7 @@ impl<'t> Parser<'t> {
             fields,
             transitions,
             staged,
+            audited,
             span: Span::new(start, close.end),
         })
     }
@@ -6720,6 +6770,85 @@ mod tests {
         assert!(
             msg.contains("`;`") || msg.contains("Semi"),
             "expected error to mention `;`; got: {msg}"
+        );
+    }
+
+    // ─── Slice 20: `#audit` automaton modifier (Decision #18) ────────────
+
+    #[test]
+    fn unprefixed_automaton_is_not_audited() {
+        // Sanity: the existing `#automaton Name { … }` form continues
+        // to parse with `audited = false`.
+        let p = parse_str("#automaton C { v: u32; }").unwrap();
+        let a = auto(&p, 0);
+        assert!(!a.audited, "unprefixed automaton must not be audited");
+        assert!(!a.staged);
+    }
+
+    #[test]
+    fn audited_automaton_sets_flag() {
+        // `#audit #automaton Name { … }` lifts the audited flag.
+        let p = parse_str("#audit #automaton C { v: u32; }").unwrap();
+        let a = auto(&p, 0);
+        assert!(a.audited, "expected #audit flag to be set");
+        assert!(!a.staged, "audit-only must not also set staged");
+    }
+
+    #[test]
+    fn audit_then_staged_composes() {
+        // `#audit #staged #automaton …` — both flags lifted.
+        let p = parse_str("#audit #staged #automaton C { v: u32; }").unwrap();
+        let a = auto(&p, 0);
+        assert!(a.audited);
+        assert!(a.staged);
+    }
+
+    #[test]
+    fn staged_then_audit_composes_identically() {
+        // Order doesn't matter — `#staged #audit #automaton …`
+        // produces the same flags as the reverse.
+        let p = parse_str("#staged #audit #automaton C { v: u32; }").unwrap();
+        let a = auto(&p, 0);
+        assert!(a.audited);
+        assert!(a.staged);
+    }
+
+    #[test]
+    fn duplicate_audit_modifier_errors() {
+        // `#audit #audit #automaton …` — repeating a modifier is
+        // a parse error (semantically meaningless and almost
+        // certainly a typo).
+        let err =
+            parse_str("#audit #audit #automaton C { v: u32; }").expect_err("duplicate audit");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("duplicate"),
+            "expected error to mention duplicate; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn duplicate_staged_modifier_errors() {
+        // Symmetric check for #staged.
+        let err =
+            parse_str("#staged #staged #automaton C { v: u32; }").expect_err("duplicate staged");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("duplicate"),
+            "expected error to mention duplicate; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn audit_without_automaton_errors() {
+        // `#audit @fn …` — `#audit` modifier is reserved for
+        // `#automaton` only.
+        let err = parse_str("#audit @fn t() { return; }")
+            .expect_err("expected parse error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("#automaton"),
+            "expected error to mention #automaton; got: {msg}"
         );
     }
 

@@ -261,17 +261,40 @@ pub struct AutomatonDecl {
     /// pre-Decision-#12 v0.1 behaviour).
     ///
     /// Order-independent with the other prefix attributes — the
-    /// parser accepts `#staged #automaton Foo { … }` as the only
-    /// surface form for v0.2 (single token of prefix). The GA
-    /// orthogonality engine treats `#staged` automata identically
-    /// to non-staged ones (timing of commit doesn't change which
+    /// parser accepts `#staged #automaton Foo { … }` and
+    /// `#staged #audit #automaton Foo { … }` (or any
+    /// permutation of the two prefixes). The GA orthogonality
+    /// engine treats `#staged` automata identically to
+    /// non-staged ones (timing of commit doesn't change which
     /// fields a callable touches), so no §7 changes are required.
     pub staged: bool,
+    /// `#audit` modifier per Decision #18 (runtime auditing of
+    /// unsafe primitives). When `true`, every
+    /// `#unchecked_*` / `#volatile_*` / `#unchecked_cast`
+    /// inside this automaton's transitions, effects, and
+    /// interrupts is wrapped (in debug builds) with calls
+    /// through the compiler-supplied `PointerAuditor`
+    /// interface. Release builds elide the wrapping so the
+    /// annotation produces zero runtime overhead.
+    ///
+    /// **Slice 20 scope: surface only.** This slice lands the
+    /// AST + parser surface so user code can opt in via
+    /// `#audit #automaton …`. The actual `PointerAuditor`
+    /// interface, the default `ShadowSanitizer` impl, and the
+    /// codegen wrapping pass land in subsequent slices once the
+    /// stdlib has the runtime helpers in place.
+    /// Slice 20 codegen ignores the flag (no instrumentation
+    /// emitted yet); the AST round-trips it so downstream
+    /// phases can already check it.
+    ///
+    /// Order-independent with [`Self::staged`]: any prefix
+    /// permutation parses identically.
+    pub audited: bool,
     /// Source span covering `#automaton Name { … }` (excluding
-    /// any `#staged` prefix, which is already represented via
-    /// [`Self::staged`]). Renames and prefix additions reuse the
-    /// same span so error messages stay anchored on the
-    /// `#automaton` keyword.
+    /// any `#staged` / `#audit` prefix, which are already
+    /// represented via the corresponding flags). Renames and
+    /// prefix additions reuse the same span so error messages
+    /// stay anchored on the `#automaton` keyword.
     pub span: Span,
 }
 
@@ -1536,6 +1559,7 @@ mod tests {
             fields: Vec::new(),
             transitions: Vec::new(),
             staged: false,
+            audited: false,
             span: Span::new(0, 14),
         });
         assert_eq!(a.layer(), Layer::Imperative);
