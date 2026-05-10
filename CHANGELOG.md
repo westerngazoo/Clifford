@@ -7,6 +7,82 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 21: `#audit` codegen markers at unsafe-primitive sites (2026-05-09)
+
+Wires the slice-20 `#audit` modifier through to codegen.
+Every unsafe-primitive emission site
+(`#unchecked_load` / `#unchecked_store` /
+`#unchecked_offset` / `#unchecked_cast` /
+`#volatile_load` / `#volatile_store`) inside an
+`#audit`-marked automaton's transition body now emits a
+`; audit-wrap site for <Owner> (<primitive>) ; Decision #18`
+IR comment immediately before the instruction. The marker
+gives the future `PointerAuditor` instrumentation pass a
+stable injection point without requiring further emitter
+changes; release builds elide the marker trivially (LLVM
+strips IR comments during parsing).
+
+**Slice 21 is the marker only.** No actual `PointerAuditor`
+calls are emitted — the marker is purely a wiring signpost.
+The `PointerAuditor` interface, the default
+`ShadowSanitizer` impl, and the wrap-emitting pass land in
+subsequent slices once the stdlib has the runtime helpers.
+
+**Codegen changes (`crates/codegen/src/lib.rs`):**
+
+- `AutomatonInfo` gains `is_audited: bool` (mirrors
+  slice-18's `is_staged`). Populated in pass 1 from
+  `decl.audited`.
+- `Emitter` gains `current_audited_owner: Option<String>`,
+  set at the top of `emit_transition` iff the owning
+  automaton's info has `is_audited == true`. Cleared by
+  `reset_per_function_state` so effects, interrupts, and
+  `@fn`s start fresh.
+- New `emit_audit_marker_if_needed(kind: &str)` helper —
+  the only behavioural change in the per-primitive emit
+  functions. Each of `emit_unchecked_load`,
+  `emit_unchecked_store`, `emit_unchecked_cast`,
+  `emit_unchecked_offset` calls it with the appropriate
+  category string. Same-IR-type `#unchecked_cast` is a
+  no-op and intentionally skips the marker (nothing to
+  wrap).
+
+**Tests added (9 codegen):**
+
+- `s21_unaudited_transition_emits_no_audit_marker`
+- `s21_audited_transition_unchecked_store_emits_marker`
+- `s21_audited_transition_unchecked_cast_emits_marker`
+- `s21_audited_transition_volatile_store_emits_marker`
+- `s21_audited_transition_unchecked_offset_emits_marker`
+- `s21_unchecked_load_emits_marker`
+- `s21_audit_marker_does_not_leak_across_transitions`
+- `s21_audit_marker_does_not_appear_in_effects`
+- `s21_audit_marker_composes_with_staged_writes`
+
+**Sample:** `examples/audit_marker_demo.cl` — three
+automata side by side: `AuditedRing` (4 markers, one per
+primitive), `PlainRing` (zero markers, byte-identical
+slice-20 IR), and `AuditedStaged` (markers + shadow global,
+demonstrating slices 18 and 21 compose cleanly).
+
+**Deliberately NOT in slice 21:**
+
+- **Effects / interrupts that target audited automatons.**
+  Slice 21 marks only the audited automaton's *transition*
+  bodies. An effect with `#mutates: [P]` where `P` is
+  audited does **not** get markers in its body. Extending
+  to effects requires per-primitive lookup of every
+  mutated automaton's audit flag — straightforward but
+  defers to a follow-up slice once the transition-body
+  case is exercised in real firmware.
+- **No `PointerAuditor` interface.** Lives in stdlib
+  (Decision #16 substrate); requires the `.cl` source tree
+  scaffold to grow first.
+- **No `ShadowSanitizer` default impl.** Same dependency.
+- **No actual call emission.** The marker is the wiring
+  signpost; turning it into a real call is a separate
+  pass once the stdlib interface lands.
+
 ### Added — Slice 20: `#audit` automaton modifier surface (Decision #18) (2026-05-09)
 
 Lands the AST + parser surface for **Decision #18** (runtime

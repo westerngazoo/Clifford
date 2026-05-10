@@ -260,6 +260,24 @@ struct Emitter<'a> {
     /// `#transition` body. `None` outside of transitions. Used to
     /// resolve `Self.field` to the correct automaton.
     enclosing_owner: Option<String>,
+    /// Slice 21 (Decision #18): name of the audited automaton
+    /// whose transition body is currently being emitted, if any.
+    /// `Some(name)` ⇒ every unsafe-primitive emission site
+    /// (`#unchecked_load` / `#unchecked_store` /
+    /// `#unchecked_offset` / `#unchecked_cast` /
+    /// `#volatile_load` / `#volatile_store`) prepends a
+    /// `; audit-wrap site for <name>` IR comment indicating
+    /// where a debug-build `PointerAuditor` call would be
+    /// injected. `None` ⇒ no marker emitted; the unsafe op
+    /// lowers as before, byte-identical to slice-20 output.
+    ///
+    /// The marker is established by [`Self::emit_audited_owner_if_needed`]
+    /// which is called at the top of `emit_automaton_transitions`'
+    /// per-transition loop (after the per-function reset, before
+    /// any body statements). Cleared by `reset_per_function_state`
+    /// so effects/interrupts (which run AFTER the transitions in
+    /// `lower`'s pass-3 loop) start with a fresh `None`.
+    current_audited_owner: Option<String>,
     /// Decision #22 codegen consumer: when the current callable is
     /// marked `Release` / `SeqCst`, this carries the LLVM fence
     /// ordering that must be emitted **before each `ret`**. `None`
@@ -346,6 +364,32 @@ struct AutomatonInfo {
     /// `zeroinitializer` so the initial state needs no special
     /// emission.
     state_tags: Vec<(String, u32)>,
+    /// Slice 20 (Decision #18): `true` if the source declared this
+    /// automaton with the `#audit` modifier. When emitting any
+    /// transition body of an audit automaton, [`Emitter`] sets
+    /// `current_audited_owner = Some(name)`; every unsafe-primitive
+    /// emission site (`#unchecked_load` / `#unchecked_store` /
+    /// `#unchecked_offset` / `#unchecked_cast` /
+    /// `#volatile_load` / `#volatile_store`) consults that field
+    /// and prepends a `; audit-wrap site for <Name>` IR comment.
+    ///
+    /// **Slice 21 scope is the marker only.** The actual
+    /// `PointerAuditor` dispatch (and the `ShadowSanitizer`
+    /// stdlib impl) lands in subsequent slices once the stdlib
+    /// has the runtime helpers in place. The marker establishes
+    /// the wiring point and gives downstream consumers (and
+    /// debug-build instrumentation passes) a stable place to
+    /// inject the wrap.
+    ///
+    /// Effects and interrupts that target audited automatons via
+    /// `#mutates: [...]` are **not** marked in slice 21 — only
+    /// transition bodies of the audited automaton itself. The
+    /// effects/interrupts case requires looking up every
+    /// mutated automaton's audit flag at every primitive site,
+    /// which is straightforward but defers to a follow-up slice
+    /// once the transition-body case is exercised in real
+    /// firmware.
+    is_audited: bool,
     /// Slice 18 (Decision #12): `true` if the source declared this
     /// automaton with the `#staged` modifier. Two consequences:
     ///
@@ -463,6 +507,7 @@ impl<'a> Emitter<'a> {
             automatons: HashMap::new(),
             transition_owners: HashMap::new(),
             enclosing_owner: None,
+            current_audited_owner: None,
             pending_exit_fence: None,
             pending_transition_tag_write: None,
             current_block: "entry".to_owned(),
@@ -542,6 +587,7 @@ impl<'a> Emitter<'a> {
                         base_address,
                         state_tags,
                         is_staged: decl.staged,
+                        is_audited: decl.audited,
                     },
                 );
                 // Slice 4: record transition→owner mapping so
@@ -871,6 +917,17 @@ impl<'a> Emitter<'a> {
         // set enclosing_owner so `Self.field` resolves correctly.
         self.reset_per_function_state();
         self.enclosing_owner = Some(owner.to_owned());
+        // Slice 21 (Decision #18): if the owning automaton is
+        // `#audit`-marked, set the audit context so every
+        // unsafe-primitive emission inside the body emits a
+        // `; audit-wrap site for <Owner>` IR comment. Cleared
+        // by the next `reset_per_function_state` call so this
+        // is strictly transition-scoped.
+        if let Some(info) = self.automatons.get(owner) {
+            if info.is_audited {
+                self.current_audited_owner = Some(owner.to_owned());
+            }
+        }
 
         let fn_name = format!("{owner}_{tr}", tr = decl.name);
 
@@ -950,6 +1007,11 @@ impl<'a> Emitter<'a> {
         self.next_label_id = 0;
         self.locals.clear();
         self.enclosing_owner = None;
+        // Slice 21: clear the audit-context marker. Re-set per
+        // transition body in `emit_automaton_transitions` when the
+        // owning automaton is `#audit`-marked. Effects, interrupts,
+        // and `@fn`s start with `None` and stay there for v0.21.
+        self.current_audited_owner = None;
         self.current_block = "entry".to_owned();
         self.current_block_terminated = false;
         self.pending_atomic_exit_unmask = false;
@@ -2238,6 +2300,31 @@ impl<'a> Emitter<'a> {
     /// %v = load <T>, <T>* <ptr>          ; #unchecked_load
     /// %v = load volatile <T>, <T>* <ptr> ; #volatile_load
     /// ```
+    /// Slice 21 (Decision #18): emit a `; audit-wrap site for
+    /// <Owner>` IR comment iff [`Self::current_audited_owner`] is
+    /// `Some`. Called from every unsafe-primitive emission site
+    /// (`#unchecked_load` / `#unchecked_store` /
+    /// `#unchecked_offset` / `#unchecked_cast` /
+    /// `#volatile_load` / `#volatile_store`) to give downstream
+    /// instrumentation passes a stable place to inject
+    /// `PointerAuditor` calls. The `kind` argument is the
+    /// human-readable primitive name (`"unchecked_load"`, etc.)
+    /// included in the comment so a single grep across the IR
+    /// surfaces every wrap site categorised by primitive.
+    ///
+    /// No-op when `current_audited_owner` is `None` — non-audited
+    /// transitions, effects, interrupts, and `@fn`s emit
+    /// byte-identical IR to slice-20 output.
+    fn emit_audit_marker_if_needed(&mut self, kind: &str) {
+        if let Some(owner) = &self.current_audited_owner {
+            writeln!(
+                &mut self.out,
+                "  ; audit-wrap site for {owner} ({kind}) ; Decision #18",
+            )
+            .ok();
+        }
+    }
+
     fn emit_unchecked_load(
         &mut self,
         ty: &TypeExpr,
@@ -2248,6 +2335,11 @@ impl<'a> Emitter<'a> {
         let ptr_value = self.emit_expr(ptr)?;
         let result = self.fresh_value();
         let keyword = if is_volatile { "load volatile" } else { "load" };
+        self.emit_audit_marker_if_needed(if is_volatile {
+            "volatile_load"
+        } else {
+            "unchecked_load"
+        });
         writeln!(
             &mut self.out,
             "  {result} = {keyword} {elem_ir_ty}, {elem_ir_ty}* {ptr_value}",
@@ -2273,6 +2365,11 @@ impl<'a> Emitter<'a> {
         let ptr_value = self.emit_expr(ptr)?;
         let val_ssa = self.emit_expr(value)?;
         let keyword = if is_volatile { "store volatile" } else { "store" };
+        self.emit_audit_marker_if_needed(if is_volatile {
+            "volatile_store"
+        } else {
+            "unchecked_store"
+        });
         writeln!(
             &mut self.out,
             "  {keyword} {elem_ir_ty} {val_ssa}, {elem_ir_ty}* {ptr_value}",
@@ -2306,8 +2403,13 @@ impl<'a> Emitter<'a> {
         let src_value = self.emit_expr(value)?;
 
         if src_ir_ty == dst_ir_ty {
+            // Same-IR-type cast is a no-op even semantically — the
+            // `value` SSA name is returned unchanged. No instruction
+            // is emitted, so we don't emit an audit marker either:
+            // there's nothing for an instrumentation pass to wrap.
             return Ok(src_value);
         }
+        self.emit_audit_marker_if_needed("unchecked_cast");
 
         // Pure integer ↔ integer: reuse the slice-7 logic. Source
         // signedness comes from the user-written `from_ty` since the
@@ -2371,6 +2473,7 @@ impl<'a> Emitter<'a> {
         let n_ir_ty = self.expr_ir_type(n);
         let n_value = self.emit_expr(n)?;
         let result = self.fresh_value();
+        self.emit_audit_marker_if_needed("unchecked_offset");
         writeln!(
             &mut self.out,
             "  {result} = getelementptr {elem_ir_ty}, {elem_ir_ty}* {ptr_value}, {n_ir_ty} {n_value}",
@@ -5925,6 +6028,7 @@ mod tests {
             base_address: 0,
             state_tags: vec![],
             is_staged: false,
+            is_audited: false,
         };
         assert_eq!(info.llvm_field_index(0), 0);
         assert_eq!(info.llvm_field_index(3), 3);
@@ -5942,6 +6046,7 @@ mod tests {
             base_address: 0,
             state_tags: vec![("A".to_owned(), 0), ("B".to_owned(), 1)],
             is_staged: false,
+            is_audited: false,
         };
         assert!(info.is_multi_state());
         assert_eq!(info.llvm_field_index(0), 1);
@@ -7678,6 +7783,216 @@ mod tests {
         assert!(
             ir.contains("getelementptr %struct.M, %struct.M* @M.shadow, i32 0, i32 1"),
             "expected value-write GEP into @M.shadow at idx 1; got:\n{ir}"
+        );
+    }
+
+    // ─── Slice 21: `#audit` codegen markers (Decision #18) ──────────────
+
+    #[test]
+    fn s21_unaudited_transition_emits_no_audit_marker() {
+        // A non-`#audit` automaton's transitions emit byte-identical
+        // IR to slice-20 output — no `; audit-wrap site` comments.
+        let src = "\
+            #automaton P { \n  \
+              #transition tick { \n    \
+                let p: &u32 = #unchecked_cast<u64, &u32>(\"mmio\", 0x4000u64); \n    \
+                #unchecked_store<u32>(p, 1u32); \n  \
+              } \n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower non-audit");
+        assert!(
+            !ir.contains("audit-wrap site"),
+            "non-audit transition must not emit audit markers; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s21_audited_transition_unchecked_store_emits_marker() {
+        // `#audit #automaton` transition with an
+        // `#unchecked_store` emits a `; audit-wrap site for P
+        // (unchecked_store)` IR comment immediately before the
+        // `store` instruction.
+        let src = "\
+            #audit #automaton P { \n  \
+              #transition tick { \n    \
+                let p: &u32 = #unchecked_cast<u64, &u32>(\"mmio\", 0x4000u64); \n    \
+                #unchecked_store<u32>(p, 1u32); \n  \
+              } \n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower audit");
+        assert!(
+            ir.contains("; audit-wrap site for P (unchecked_store) ; Decision #18"),
+            "expected audit marker for unchecked_store; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s21_audited_transition_unchecked_cast_emits_marker() {
+        // The `#unchecked_cast` itself also gets a marker (it's
+        // listed as one of the unsafe primitives in Decision #18).
+        // `inttoptr` (u64 -> &u32) is a non-trivial cast so the
+        // marker is emitted (same-IR-type casts are no-ops and
+        // emit no marker — see emit_unchecked_cast).
+        let src = "\
+            #audit #automaton P { \n  \
+              #transition tick { \n    \
+                let p: &u32 = #unchecked_cast<u64, &u32>(\"mmio\", 0x4000u64); \n    \
+                #unchecked_store<u32>(p, 1u32); \n  \
+              } \n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower audit");
+        assert!(
+            ir.contains("; audit-wrap site for P (unchecked_cast) ; Decision #18"),
+            "expected audit marker for unchecked_cast; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s21_audited_transition_volatile_store_emits_marker() {
+        // The volatile sibling lowers through the same emitter
+        // and gets its own categorised marker (`volatile_store`).
+        let src = "\
+            #audit #automaton P { \n  \
+              #transition tick { \n    \
+                let p: &u32 = #unchecked_cast<u64, &u32>(\"mmio\", 0x4000u64); \n    \
+                #volatile_store<u32>(p, 7u32); \n  \
+              } \n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower audit volatile");
+        assert!(
+            ir.contains("; audit-wrap site for P (volatile_store) ; Decision #18"),
+            "expected audit marker for volatile_store; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s21_audited_transition_unchecked_offset_emits_marker() {
+        // `#unchecked_offset` GEP also gets a marker.
+        let src = "\
+            #audit #automaton P { \n  \
+              #transition tick { \n    \
+                let p: &u32 = #unchecked_cast<u64, &u32>(\"mmio\", 0x4000u64); \n    \
+                let _q: &u32 = #unchecked_offset<u32>(p, 4i32); \n  \
+              } \n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower audit offset");
+        assert!(
+            ir.contains("; audit-wrap site for P (unchecked_offset) ; Decision #18"),
+            "expected audit marker for unchecked_offset; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s21_unchecked_load_emits_marker() {
+        // Read primitive — `#unchecked_load`.
+        let src = "\
+            #audit #automaton P { \n  \
+              #transition tick { \n    \
+                let p: &u32 = #unchecked_cast<u64, &u32>(\"mmio\", 0x4000u64); \n    \
+                let _v: u32 = #unchecked_load<u32>(p); \n  \
+              } \n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower audit load");
+        assert!(
+            ir.contains("; audit-wrap site for P (unchecked_load) ; Decision #18"),
+            "expected audit marker for unchecked_load; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s21_audit_marker_does_not_leak_across_transitions() {
+        // Two automatons in one program: one audited, one not.
+        // Markers must appear ONLY in the audited transition's
+        // body. Specifically: a `Q.bar` transition emitted AFTER
+        // the audited `P.foo` must not inherit the marker (the
+        // per-function reset clears `current_audited_owner`).
+        let src = "\
+            #audit #automaton P { \n  \
+              #transition foo { \n    \
+                let p: &u32 = #unchecked_cast<u64, &u32>(\"mmio\", 0x4000u64); \n    \
+                #unchecked_store<u32>(p, 1u32); \n  \
+              } \n\
+            }\n\
+            #automaton Q { \n  \
+              #transition bar { \n    \
+                let q: &u32 = #unchecked_cast<u64, &u32>(\"mmio\", 0x4004u64); \n    \
+                #unchecked_store<u32>(q, 2u32); \n  \
+              } \n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower mixed");
+        // Both functions live in the same module IR.
+        let p_def = ir.find("define void @P_foo()").expect("P_foo defined");
+        let q_def = ir.find("define void @Q_bar()").expect("Q_bar defined");
+        assert!(p_def < q_def, "expected P_foo before Q_bar in IR");
+        // P_foo body should contain the marker.
+        let p_body = &ir[p_def..q_def];
+        assert!(
+            p_body.contains("audit-wrap site for P"),
+            "expected marker in P_foo body; got:\n{p_body}"
+        );
+        // Q_bar body must NOT.
+        let q_body = &ir[q_def..];
+        assert!(
+            !q_body.contains("audit-wrap site"),
+            "non-audit Q_bar must not emit markers; got:\n{q_body}"
+        );
+    }
+
+    #[test]
+    fn s21_audit_marker_does_not_appear_in_effects() {
+        // Slice 21 scope: only TRANSITION bodies of audit
+        // automatons get markers. An effect that targets an
+        // audit automaton via `#mutates: [...]` does NOT
+        // produce markers — that wider semantics is a
+        // documented future-slice extension.
+        let src = "\
+            #audit #automaton P { \n  \
+              v: u32; \n\
+            }\n\
+            #effect tick() #mutates: [P] { \n  \
+              let p: &u32 = #unchecked_cast<u64, &u32>(\"mmio\", 0x4000u64); \n  \
+              #unchecked_store<u32>(p, 1u32); \n  \
+              return; \n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower effect");
+        // The effect body has no marker because the marker is
+        // transition-scoped in slice 21.
+        assert!(
+            !ir.contains("audit-wrap site"),
+            "slice 21 effects must not emit markers; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s21_audit_marker_composes_with_staged_writes() {
+        // Sanity: an `#audit #staged` automaton (both modifiers)
+        // emits both the slice-18 shadow-write redirection AND
+        // the slice-21 audit marker for any unsafe primitive in
+        // its transitions. The two slices are orthogonal.
+        let src = "\
+            #audit #staged #automaton P { \n  \
+              #transition tick { \n    \
+                let p: &u32 = #unchecked_cast<u64, &u32>(\"mmio\", 0x4000u64); \n    \
+                #unchecked_store<u32>(p, 1u32); \n  \
+              } \n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower audit+staged");
+        assert!(
+            ir.contains("@P.shadow"),
+            "expected #staged shadow global; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("audit-wrap site for P"),
+            "expected audit marker; got:\n{ir}"
         );
     }
 }
