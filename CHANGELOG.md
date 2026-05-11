@@ -7,6 +7,41 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Documentation — Slice 28: Sync `docs/DECISIONS.md` with `#staged` + `#audit` implementation status (2026-05-09)
+
+Decisions #12 (`#staged`) and #18 (`#audit`) had been marked
+"DEFERRED TO V0.2" in `docs/DECISIONS.md` since the spec
+draft. After slices 18-27 landed both (#12 in full, #18 for
+surface + codegen markers), the document was out of sync
+with the implementation. This slice updates:
+
+- **Status header:** the gating note for #12 changes to
+  "implemented in v0.2 (slices 18–19, 24–25)" and for #18
+  to "surface + codegen markers landed in v0.2 (slices
+  20–23, 26)" with the runtime pass explicitly deferred
+  pending stdlib scaffolding.
+- **Decision #12 entry:** appends an "Implementation
+  status (2026-05-09)" table mapping each shipped slice
+  to the surface/mechanism it added and the new error
+  codes (E0212, E0412, E0413, E0414). Calls out three
+  explicit future-deferred items (reads-from-shadow in
+  transitions, partial flushes, non-memcpy commit
+  strategies).
+- **Decision #18 entry:** same treatment — implementation
+  table (slices 20-23, 26), the marker shape, and the
+  v0.4+ runway items (`PointerAuditor` interface, default
+  `ShadowSanitizer` impl, marker→call rewrite pass,
+  build-mode toggle).
+- The original "deferred to v0.2" rationale paragraphs
+  are preserved for context (renamed "Rationale for
+  original deferral" / "Rationale for the partial
+  deferral").
+
+No code changes. Pure documentation reconciliation so
+agents and human contributors reading `DECISIONS.md` see
+the current state of play instead of stale design-time
+notes.
+
 ### Added — Slice 27: Labelled `break` / `continue` for `sigma` loops (2026-05-09)
 
 Closes the slice-17 deferred extension: `sigma 'outer i in

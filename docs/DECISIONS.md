@@ -1,6 +1,6 @@
 # Clifford Language: Critical Design Decisions
 
-**Status:** Decisions #1–#27 LOCKED. Implementation gating: #12 and #18 designed but deferred to v0.2; #21 design locked, implementation gated to v0.7; #22, #23, #24, #25 design locked, implementation slated for v0.2; #26 (rotor-plane locks, refines #21) implementation gated to v0.7; #27 (GA across scales / distributed runtime check) implementation gated to v0.4+ (Phase 5+ plugin work). Refinement #1a LOCKED. Phase 1 implementation underway.
+**Status:** Decisions #1–#27 LOCKED. Implementation gating: **#12 implemented in v0.2** (slices 18–19, 24–25 — `#staged`, `#flush`, `@shadow`, register-block-staged rejection); **#18 surface + codegen markers landed in v0.2** (slices 20–23, 26 — `#audit`, marker placement, multi-owner format), with the runtime `PointerAuditor` pass deferred to a later milestone pending stdlib scaffolding; #21 design locked, implementation gated to v0.7; #22, #23, #24, #25 design locked, implementation slated for v0.2; #26 (rotor-plane locks, refines #21) implementation gated to v0.7; #27 (GA across scales / distributed runtime check) implementation gated to v0.4+ (Phase 5+ plugin work). Refinement #1a LOCKED. Phase 1 implementation underway.
 **Dates:** see footer below for the full chronological log.
 **Owner:** Goose (Gustavo Delgadillo)
 **Positioning:** General-purpose systems language; embedded firmware is the canonical first target but not the only target. Decisions are language-level and apply across domains.
@@ -545,15 +545,30 @@ let mut count: u32 = 0;              // mut requires explicit form
 
 ---
 
-## Decision #12: `#staged` Automata for Deferred Mutation — DEFERRED TO V0.2
+## Decision #12: `#staged` Automata for Deferred Mutation ✓ IMPLEMENTED IN V0.2 (slices 18–19, 24–25)
 
 **Question:** Should Clifford have a first-class deferred-mutation mechanism for ISR-to-main-handoff and multi-field consistent updates?
 
-**Chosen design (deferred to v0.2):** A `#staged #automaton Foo { … }` modifier that buffers writes in a shadow state struct; an explicit `#flush Foo;` statement commits the shadow to live atomically. Inside `#staged` automata, `#mutate Foo { … }` writes to the shadow, not the live state. The GA engine treats `#staged` automata identically to non-staged ones for orthogonality (timing doesn't change field overlap).
+**Chosen design (implemented in v0.2):** A `#staged #automaton Foo { … }` modifier that buffers writes in a shadow state struct; an explicit `#flush Foo;` statement commits the shadow to live atomically. Inside `#staged` automata, `#mutate Foo { … }` writes to the shadow, not the live state. The GA engine treats `#staged` automata identically to non-staged ones for orthogonality (timing doesn't change field overlap).
 
-**Rationale for deferral:** v0.1's job is to land the GA proof on real hardware. The pattern is implementable today using `#atomic: interrupt_critical` plus a hand-written queue, so v0.1 users have a workaround. The shadow-buffer codegen + the new `#flush` statement add real spec/implementation surface that we should validate against actual user firmware before locking. Decision will be re-opened in v0.2 informed by reference firmware experience.
+**Implementation status (2026-05-09):**
 
-**Implications:** No v0.1 spec changes. `#staged` and `#flush` are reserved keywords for v0.2. v0.2 reference firmware should evaluate whether the pattern is needed often enough to justify the language-level support.
+| Slice | Surface / mechanism                              | Errors           |
+|-------|--------------------------------------------------|------------------|
+| 18    | `#staged` modifier + `#flush Name;` statement; shadow global per staged automaton; codegen redirects writes to `@Name.shadow`; `#flush` lowers to `llvm.memcpy` shadow → state | E0412 `FlushOnNonStaged`, E0413 `FlushOfUnknownAutomaton` |
+| 19    | `#flush A;` flows into `clifford-effect`'s mutation profile as a write to **every declared field of A**, so the existing `#mutates: [...]` validator fires uniformly (E0410) and the §7 ortho engine sees flush-vs-field-write races | (uses existing E0410) |
+| 24    | `@shadow Auto.field` operator — companion to `@snapshot` that reads from the pending shadow global instead of live state | E0414 `ShadowOnNonStaged` |
+| 25    | Reject `#staged` on register-block automata at parse time (memory-mapped I/O has no meaningful shadow) | E0212 `StagedRegisterBlock` |
+
+**Rationale for original deferral (preserved for context):** v0.1's job was to land the GA proof on real hardware. The pattern was implementable in v0.1 using `#atomic: interrupt_critical` plus a hand-written queue. The v0.2 reference-firmware work (audit-marker chain + sigma-loop ergonomics) confirmed `#staged` as a clean fit; implementation followed.
+
+**Implications:** §6 of `CLIFFORD_SPEC.md` will be updated to formalise the staged write semantics and the `#flush` profile expansion. The reserved-keyword note in v0.1 is now consumed: `#staged`, `#flush`, and `@shadow` are real language keywords as of v0.2.
+
+**What's deliberately NOT in v0.2 (deferred to later milestones):**
+
+- **Reads-from-shadow inside the staged automaton's own transitions.** Currently writes target shadow but reads always come from live state. A future operator (or implicit redirection inside transitions) could let an ISR read its own pending writes. v0.2's `@shadow Auto.field` partly covers this — it reads pending shadow from any callable.
+- **Partial flushes (`#flush Foo { x, y };`).** A field-subset commit. v0.2 always commits the whole struct.
+- **Non-memcpy commit strategies.** v0.2 uses a single `llvm.memcpy.p0.p0.i64`. Larger structs may benefit from per-field volatile stores or other strategies on specific targets; v0.2's choice keeps the codegen target-pointer-width-agnostic.
 
 ---
 
@@ -798,11 +813,34 @@ This decision sharpens Clifford's safety-critical positioning without changing t
 
 ---
 
-## Decision #18: Runtime Auditing of Unsafe Primitives — DEFERRED TO V0.2
+## Decision #18: Runtime Auditing of Unsafe Primitives — V0.2 SURFACE + MARKERS LANDED (slices 20–23, 26); RUNTIME PASS DEFERRED
 
 **Question:** Decision #17 makes unsafe operations visible per-occurrence at *compile time*. But static visibility doesn't catch *runtime* bugs — a `#unchecked_load` may compile fine and still dereference a freed pointer at execution. How does Clifford add runtime validation of unsafe primitive calls (KASAN/ASan-style) in a way that fits the language's automaton-and-interface model?
 
-**Chosen design (deferred to v0.2):** A `#audit` annotation on automata or modules opts into runtime tracking of narrow unsafe primitives in *debug builds only*. The tracking is performed by a `Sanitizer` automaton implementing a compiler-supplied `PointerAuditor` interface (Decision #16); the default implementation maintains a shadow allocation table, validates pointer arithmetic, and reports violations with source locations. Users can swap in custom Sanitizer impls. Release builds elide all runtime checks; the `#audit` annotation produces zero overhead.
+**Chosen design (surface + codegen markers in v0.2; runtime pass + stdlib in a later milestone):** A `#audit` annotation on automata or modules opts into runtime tracking of narrow unsafe primitives in *debug builds only*. The tracking is performed by a `Sanitizer` automaton implementing a compiler-supplied `PointerAuditor` interface (Decision #16); the default implementation maintains a shadow allocation table, validates pointer arithmetic, and reports violations with source locations. Users can swap in custom Sanitizer impls. Release builds elide all runtime checks; the `#audit` annotation produces zero overhead.
+
+**Implementation status (2026-05-09):**
+
+| Slice | Coverage                                                                                              |
+|-------|-------------------------------------------------------------------------------------------------------|
+| 20    | `#audit` modifier surface (AST `audited: bool` on `AutomatonDecl`; parser composes with `#staged` in any order) |
+| 21    | Codegen markers at `#unchecked_*` / `#volatile_*` / `#unchecked_cast` emission sites inside an `#audit` automaton's transition bodies |
+| 22    | Marker propagation to `#effect` / `#interrupt` whose `#mutates: [...]` lists an audited automaton    |
+| 23    | Marker propagation to register-block volatile loads/stores (`Auto.field = …`, `@snapshot Auto.field`); marker names the touched peripheral specifically |
+| 26    | Multi-owner marker text — `[A, B, C]` bracketed list when multiple audited automatons in one `#mutates` clause |
+
+The marker shape is `; audit-wrap site for <Owner> (<primitive>) ; Decision #18` (single owner) or `; audit-wrap site for [A, B] (<primitive>) ; Decision #18` (multi). The future runtime pass turns each marker into a `PointerAuditor::validate_load/store` call dispatched against every named Sanitizer instance.
+
+**What's still deferred (the v0.4+ runway):**
+
+- **`PointerAuditor` interface** — needs `clifford-stdlib` scaffolding (no `.cl`-source stdlib infrastructure yet).
+- **Default `ShadowSanitizer` impl** — depends on stdlib + allocator infrastructure (Decision #21+).
+- **Marker → call rewrite pass** — straightforward IR rewrite once the stdlib interface exists.
+- **Build-mode toggle** — release-build elision is trivial (markers are IR comments LLVM strips), but a release-mode `--strip-audit` flag would also drop the markers from debug-build IR-text dumps.
+
+**Rationale for the partial deferral:** v0.2's job was to land the marker placement so the codegen surface is stable. The runtime pass requires stdlib work that's independent of the marker design — once the stdlib lands, the wrap-emitting pass is a self-contained slice. Splitting the work this way let v0.2 ship the `#audit` surface without blocking on stdlib design.
+
+**Together with Decision #17:** the two form Clifford's complete unsafe-code story — Decision #17 (static, locked v0.1) is per-occurrence audit at compile time; Decision #18 (runtime, v0.2 surface + future runtime pass) is per-call validation at execution time.
 
 **Sketch:**
 
