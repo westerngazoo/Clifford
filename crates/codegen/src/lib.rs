@@ -1252,21 +1252,30 @@ impl<'a> Emitter<'a> {
             // Stage 1: pointer to the state-tag field (LLVM index 0
             // for multi-state automatons by construction).
             //
-            // Slice 18 (Decision #12): for `#staged` automata the
-            // tag write is part of the deferred-mutation set —
-            // route it to the shadow global so a `#flush` commits
-            // both field updates AND the destination state tag in
-            // one memcpy. This preserves the "atomic commit"
-            // invariant for staged transitions.
-            let target_global = self
-                .automatons
-                .get(&auto)
-                .map(|info| info.write_global())
-                .unwrap_or_else(|| format!("@{auto}.state"));
+            // Slice 32 (Decision #12 refinement): the destination
+            // state-tag write at transition exit ALWAYS targets
+            // live state, even for `#staged` automata. Rationale:
+            //   * State transitions are about *identity* /
+            //     lifecycle — observers post-transition must see
+            //     the new state immediately, regardless of whether
+            //     a body `#flush` happened.
+            //   * Routing tag writes to shadow (the slice 18
+            //     interpretation) was buggy: a transition body
+            //     containing both `#mutate` and `#flush` would
+            //     have its post-flush tag write to shadow never
+            //     reach live state, leaving the automaton stuck
+            //     in the source state despite the explicit
+            //     destination.
+            // Slice 18's "all writes to staged go to shadow"
+            // rule still holds for **field** writes (the data
+            // payload). The state-tag is a meta-write — identity
+            // — and is exempt. The slice-18 codegen tests for
+            // multi-state staged were updated to reflect this
+            // semantic (live tag, shadow fields).
             let tag_ptr = self.fresh_value();
             writeln!(
                 &mut self.out,
-                "  {tag_ptr} = getelementptr %struct.{auto}, %struct.{auto}* {target_global}, i32 0, i32 0",
+                "  {tag_ptr} = getelementptr %struct.{auto}, %struct.{auto}* @{auto}.state, i32 0, i32 0",
             )
             .ok();
             // Stage 2: store the destination tag.
@@ -8034,28 +8043,77 @@ mod tests {
     }
 
     #[test]
-    fn s18_multi_state_staged_tag_write_targets_shadow() {
-        // For a multi-state `#staged` automaton, the destination-
-        // state tag write at transition exit must also route
-        // through the shadow so a flush commits both field
-        // updates AND the new state tag atomically.
+    fn s32_multi_state_staged_field_write_to_shadow_tag_write_to_live() {
+        // Slice 32 (refines the slice-18 behavior): for a
+        // multi-state `#staged` automaton, **field** writes go
+        // to shadow (slice 18 unchanged) but the destination-
+        // state **tag** write at transition exit goes to LIVE
+        // state. Rationale: state transitions are about
+        // identity / lifecycle and must be visible immediately
+        // — the prior slice-18 behavior buggily routed the
+        // tag write through shadow, so a body `#flush`
+        // followed by the implicit exit tag-write would leave
+        // the live tag stale.
         let src = "\
             #staged #automaton M { #states: [A, B]; v: u32;\n\
               #transition flip -> B { M.v = 99u32; }\n\
             }\n\
         ";
         let ir = lower_str(src).expect("lower staged multi-state");
-        // Tag write (`store i32 1, i32* %tmp.X`) must appear
-        // after a GEP into `@M.shadow` at LLVM idx 0.
+        // Tag write at LLVM idx 0 — must target @M.state
+        // (live), not @M.shadow.
         assert!(
-            ir.contains("getelementptr %struct.M, %struct.M* @M.shadow, i32 0, i32 0"),
-            "expected tag-write GEP into @M.shadow; got:\n{ir}"
+            ir.contains("getelementptr %struct.M, %struct.M* @M.state, i32 0, i32 0"),
+            "expected tag-write GEP into @M.state (live); got:\n{ir}"
         );
-        // The value write is at user idx 0 → LLVM idx 1
-        // (multi-state shifts user fields by one).
+        // The value write is at user idx 0 → LLVM idx 1.
+        // **Field writes still go to shadow** (slice 18
+        // semantic preserved).
         assert!(
             ir.contains("getelementptr %struct.M, %struct.M* @M.shadow, i32 0, i32 1"),
             "expected value-write GEP into @M.shadow at idx 1; got:\n{ir}"
+        );
+        // Sanity: tag-write to shadow must NOT appear (the
+        // pre-slice-32 buggy emission).
+        assert!(
+            !ir.contains("getelementptr %struct.M, %struct.M* @M.shadow, i32 0, i32 0"),
+            "regression: tag write must not target shadow; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s32_staged_transition_with_explicit_flush_commits_then_writes_tag_to_live() {
+        // The full ISR-style pattern: build up shadow, flush
+        // explicitly, then the implicit exit tag-write
+        // promotes the state in live. Order matters:
+        //   1. Field writes → shadow
+        //   2. #flush memcpy → shadow into live
+        //   3. Tag write → live (so the new state is visible
+        //      AFTER the field commit)
+        let src = "\
+            #staged #automaton M { #states: [A, B]; v: u32;\n\
+              #transition flip -> B { M.v = 99u32; #flush M; }\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower staged flush+tag");
+        // Locate key positions in the IR.
+        let field_write = ir
+            .find("getelementptr %struct.M, %struct.M* @M.shadow, i32 0, i32 1")
+            .expect("expected shadow field write");
+        let memcpy = ir
+            .find("call void @llvm.memcpy.p0.p0.i64")
+            .expect("expected memcpy");
+        let tag_write = ir
+            .find("getelementptr %struct.M, %struct.M* @M.state, i32 0, i32 0")
+            .expect("expected live tag write");
+        assert!(
+            field_write < memcpy,
+            "field write must precede memcpy; got:\n{ir}"
+        );
+        assert!(
+            memcpy < tag_write,
+            "memcpy must precede the live tag write so the new state \
+             is visible after the field commit; got:\n{ir}"
         );
     }
 
