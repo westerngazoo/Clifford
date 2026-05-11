@@ -1903,7 +1903,7 @@ impl<'a> Inferer<'a> {
             // v0.1 scope: range sources only. Array sources (which
             // would type the var as the array's element type) land
             // when slice-indexing infrastructure is built out.
-            StmtKind::Sigma { var, source, body } => {
+            StmtKind::Sigma { var, source, body, .. } => {
                 let source_ty = self.infer_expr(source);
                 let var_ty = match &source_ty {
                     Type::Range { element, .. } => (**element).clone(),

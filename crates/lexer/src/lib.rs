@@ -276,6 +276,16 @@ pub enum TokenKind {
     /// a `#staged` automaton (E0414).
     KwAtShadow,
 
+    /// Slice 27: a Rust-style loop label like `'outer` —
+    /// stored without the leading apostrophe (e.g. `"outer"`).
+    /// Used by labelled `sigma` loops and the corresponding
+    /// `break 'outer;` / `continue 'outer;` statements to
+    /// target a non-innermost loop. Disambiguated from char
+    /// literals at lex time: `'X'` is a literal, `'name`
+    /// (apostrophe + ident-start + at least one ident-continue
+    /// byte) is a label.
+    Label(String),
+
     // ─ Composite sigils ─────────────────────────────────────────────────────
     /// `#>` effect-procedure call operator (Decision #3)
     HashGt,
@@ -651,7 +661,28 @@ impl<'src> Lexer<'src> {
             b'b' if self.peek(1) == Some(b'\'') => self.lex_byte_literal(start),
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => Ok(self.lex_ident_or_keyword(start)),
             b'0'..=b'9' => self.lex_number(start),
-            b'\'' => self.lex_char_literal(start),
+            b'\'' => {
+                // Slice 27: disambiguate `'label` (loop label,
+                // Rust-style) from `'X'` (char literal). A label
+                // is `'` followed by an ident-start byte and at
+                // least one more ident-continue byte (so
+                // `'a'`-style single-char literals stay as
+                // literals because peek(2) closes with `'`,
+                // which is not ident-continue). Escapes
+                // `'\n'` keep their literal path because
+                // peek(1)=`\\` fails the alpha test.
+                let is_label_start = self
+                    .peek(1)
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
+                    && self
+                        .peek(2)
+                        .is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_');
+                if is_label_start {
+                    Ok(self.lex_label(start))
+                } else {
+                    self.lex_char_literal(start)
+                }
+            }
             b'"' => self.lex_string_literal(start),
             b'#' => self.lex_hash_form(start),
             b'@' => self.lex_at_form(start),
@@ -871,6 +902,30 @@ impl<'src> Lexer<'src> {
         std::str::from_utf8(&self.src[start..self.pos])
             .expect("literal bytes are valid UTF-8 by construction")
             .to_owned()
+    }
+
+    /// Slice 27: lex a Rust-style loop label `'name`. Caller
+    /// has verified `peek(0) == '\''` and `peek(1)` /
+    /// `peek(2)` look like an ident-start + ident-continue.
+    /// Stores the label name *without* the leading
+    /// apostrophe so consumers don't have to strip it.
+    fn lex_label(&mut self, start: usize) -> Token {
+        self.pos += 1; // skip the leading `'`
+        let name_start = self.pos;
+        while let Some(b) = self.peek(0) {
+            if b.is_ascii_alphanumeric() || b == b'_' {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        let name = std::str::from_utf8(&self.src[name_start..self.pos])
+            .expect("label bytes are ASCII subset; UTF-8 valid by construction")
+            .to_owned();
+        Token {
+            kind: TokenKind::Label(name),
+            span: Span::new(start, self.pos),
+        }
     }
 
     /// Lex `'X'` char literal. Caller has verified `peek(0) == Some(b'\'')`.

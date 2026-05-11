@@ -333,7 +333,15 @@ struct Emitter<'a> {
     /// increment and jumps to the header. Reset in
     /// `reset_per_function_state`; pushed/popped by
     /// `emit_sigma`.
-    sigma_loop_stack: Vec<(String, String)>,
+    /// Slice 27: each entry is `(label, continue_block,
+    /// exit_block)` where `label` is `Some(name)` for a
+    /// labelled `sigma 'name …` loop and `None` for the
+    /// default unlabelled form. Labelled `break 'name;` /
+    /// `continue 'name;` walks this stack from the top
+    /// looking for the matching label; unlabelled
+    /// `break;` / `continue;` always picks the innermost
+    /// (`last()`) entry.
+    sigma_loop_stack: Vec<(Option<String>, String, String)>,
     /// Errors collected across the whole program.
     errors: Vec<CodegenError>,
 }
@@ -1423,39 +1431,39 @@ impl<'a> Emitter<'a> {
             // bounded-iteration loop. Lowers to a counted-loop CFG
             // (header + body + exit blocks) per spec §8.4. v0.1
             // scope: range sources only.
-            StmtKind::Sigma { var, source, body } => {
-                if let Err(e) = self.emit_sigma(var, source, body) {
+            StmtKind::Sigma { label, var, source, body } => {
+                if let Err(e) = self.emit_sigma(label.as_deref(), var, source, body) {
                     self.errors.push(e);
                 }
             }
-            // Slice 17: `break;` and `continue;` for sigma loops.
-            // The resolver has already enforced lexical nesting
-            // (E0411 outside any loop). Codegen branches to the
-            // innermost loop's exit / continue label and marks
-            // the current block terminated so the surrounding
-            // emit walker treats subsequent statements as dead.
-            StmtKind::Break => {
-                if let Some((_, exit_label)) = self.sigma_loop_stack.last().cloned() {
+            // Slices 17+27: `break;` / `continue;` (with
+            // optional `'label`) for sigma loops. The resolver
+            // has already enforced lexical nesting (E0411) and
+            // label resolution (E0415). Codegen searches the
+            // sigma-loop stack for the target loop and branches
+            // to its `exit` (break) or `continue` (continue)
+            // label, marking the current block terminated.
+            StmtKind::Break { label } => {
+                if let Some((_, _, exit_label)) =
+                    self.find_sigma_loop_for_target(label.as_deref())
+                {
                     writeln!(&mut self.out, "  br label %{exit_label}").ok();
                     self.current_block_terminated = true;
                 } else {
-                    // Resolver should have caught this; emit a
-                    // structured error so the user sees something
-                    // concrete if upstream gates are bypassed.
                     self.errors.push(CodegenError::NotYetImplemented {
-                        what: "`break` outside a sigma loop (resolver should have caught this; please file a bug)",
+                        what: "`break` outside a sigma loop (or unknown label) — resolver should have caught this; please file a bug",
                     });
                 }
             }
-            StmtKind::Continue => {
-                if let Some((continue_label, _)) =
-                    self.sigma_loop_stack.last().cloned()
+            StmtKind::Continue { label } => {
+                if let Some((_, continue_label, _)) =
+                    self.find_sigma_loop_for_target(label.as_deref())
                 {
                     writeln!(&mut self.out, "  br label %{continue_label}").ok();
                     self.current_block_terminated = true;
                 } else {
                     self.errors.push(CodegenError::NotYetImplemented {
-                        what: "`continue` outside a sigma loop (resolver should have caught this; please file a bug)",
+                        what: "`continue` outside a sigma loop (or unknown label) — resolver should have caught this; please file a bug",
                     });
                 }
             }
@@ -2440,6 +2448,35 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// Slice 27: locate the `sigma` loop on the stack that a
+    /// `break` / `continue` should target.
+    ///
+    /// - `target = None` (unlabelled): returns the innermost
+    ///   loop (`sigma_loop_stack.last()`), preserving slice-17
+    ///   behaviour.
+    /// - `target = Some(name)` (labelled): walks the stack
+    ///   from innermost to outermost looking for an entry whose
+    ///   own label matches `name`.
+    ///
+    /// Returns the (label, continue_label, exit_label) triple
+    /// of the target loop, or `None` if no match is found
+    /// (which the resolver should have already rejected as
+    /// E0411 / E0415; the codegen-side `None` is defensive).
+    fn find_sigma_loop_for_target(
+        &self,
+        target: Option<&str>,
+    ) -> Option<(Option<String>, String, String)> {
+        match target {
+            None => self.sigma_loop_stack.last().cloned(),
+            Some(name) => self
+                .sigma_loop_stack
+                .iter()
+                .rev()
+                .find(|(label, _, _)| label.as_deref() == Some(name))
+                .cloned(),
+        }
+    }
+
     /// Slice 22+26 (Decision #18): given a `#mutates: [A, B, C]`
     /// list, return every automaton in the list that is
     /// registered as `#audit`-marked, in source order. Empty
@@ -2807,6 +2844,7 @@ impl<'a> Emitter<'a> {
     /// infrastructure and land in a future slice.
     fn emit_sigma(
         &mut self,
+        label: Option<&str>,
         var: &str,
         source: &Expr,
         body: &Block,
@@ -2912,11 +2950,16 @@ impl<'a> Emitter<'a> {
             storage: LocalStorage::Ssa,
         });
 
-        // Slice 17: push this loop's (continue, exit) labels onto
-        // the stack so nested `break;` / `continue;` statements
-        // resolve to the innermost loop. Pop after the body.
-        self.sigma_loop_stack
-            .push((continue_label.clone(), exit_label.clone()));
+        // Slice 17+27: push this loop's (label, continue, exit)
+        // entry onto the stack so nested `break;` / `continue;`
+        // can resolve to the innermost loop, and labelled
+        // `break 'name;` / `continue 'name;` can search the
+        // stack for the matching label. Pop after the body.
+        self.sigma_loop_stack.push((
+            label.map(str::to_owned),
+            continue_label.clone(),
+            exit_label.clone(),
+        ));
 
         // Emit body statements. We don't reuse `emit_block` here
         // because we need to inject the back-edge ourselves and
@@ -8281,6 +8324,99 @@ mod tests {
         assert!(
             ir.contains("; audit-wrap site for P (volatile_store) ; Decision #18"),
             "expected volatile_store marker in interrupt body; got:\n{ir}"
+        );
+    }
+
+    // ─── Slice 27: labelled break/continue codegen ───────────────────────
+
+    #[test]
+    fn s27_labelled_break_targets_outer_sigma_exit() {
+        // `break 'outer;` inside an inner sigma branches to the
+        // OUTER loop's exit label. The outer loop has id 0
+        // (allocated first); the inner has id 1.
+        let src = "\
+            @fn t() {\n  \
+              sigma 'outer i in 0u32..4u32 {\n    \
+                sigma j in 0u32..4u32 {\n      \
+                  break 'outer;\n    \
+                }\n  \
+              }\n  \
+              return;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower labelled break");
+        // Branch to outer exit label, NOT inner.
+        assert!(
+            ir.contains("br label %sigma.exit.0"),
+            "expected branch to outer exit (.0); got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s27_labelled_continue_targets_outer_sigma_continue() {
+        let src = "\
+            @fn t() {\n  \
+              sigma 'outer i in 0u32..4u32 {\n    \
+                sigma j in 0u32..4u32 {\n      \
+                  continue 'outer;\n    \
+                }\n  \
+              }\n  \
+              return;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower labelled continue");
+        // Branch to outer continue label.
+        assert!(
+            ir.contains("br label %sigma.continue.0"),
+            "expected branch to outer continue (.0); got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s27_unlabelled_break_inside_labelled_outer_still_targets_innermost() {
+        // Slice-17 default behaviour preserved: bare `break;`
+        // targets the innermost loop regardless of labels on
+        // outer loops.
+        let src = "\
+            @fn t() {\n  \
+              sigma 'outer i in 0u32..4u32 {\n    \
+                sigma j in 0u32..4u32 {\n      \
+                  break;\n    \
+                }\n  \
+              }\n  \
+              return;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower bare break");
+        // Branch to inner exit (.1), not outer (.0).
+        assert!(
+            ir.contains("br label %sigma.exit.1"),
+            "expected branch to inner exit; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s27_labelled_break_skips_intermediate_unlabelled_loop() {
+        // Three-deep nest: outer (labelled), middle
+        // (unlabelled), inner (unlabelled). `break 'outer;`
+        // from inner skips middle and targets outer's exit.
+        let src = "\
+            @fn t() {\n  \
+              sigma 'outer i in 0u32..4u32 {\n    \
+                sigma j in 0u32..4u32 {\n      \
+                  sigma k in 0u32..4u32 {\n        \
+                    break 'outer;\n      \
+                  }\n    \
+                }\n  \
+              }\n  \
+              return;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower three-deep labelled");
+        // Outer exit is .0 (first allocated).
+        assert!(
+            ir.contains("br label %sigma.exit.0"),
+            "expected branch to outer exit (.0); got:\n{ir}"
         );
     }
 
