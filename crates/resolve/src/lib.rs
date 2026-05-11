@@ -306,6 +306,29 @@ pub enum ResolveError {
         /// Byte offset of the offending statement.
         at: usize,
     },
+
+    /// **E0416 DuplicateLoopLabel.** A `sigma 'label …` loop is
+    /// nested inside another `sigma 'label …` with the same
+    /// label name. The inner binding would shadow the outer
+    /// one for `break 'label;` / `continue 'label;` targeting
+    /// — almost certainly user error rather than intent.
+    ///
+    /// Slice 31: closes the slice-27 deferred "label collision
+    /// rejection" gap. The check fires when entering a
+    /// `Sigma` body whose label is already present elsewhere
+    /// on the loop-label stack. Same-label sibling loops
+    /// (one closes before the other opens) are fine.
+    #[error(
+        "E0416: duplicate loop label `'{label}` at byte {at} — \
+         an enclosing `sigma '{label} …` is already in scope; \
+         the inner binding would shadow the outer for break/continue targeting"
+    )]
+    DuplicateLoopLabel {
+        /// The label name (without leading apostrophe).
+        label: String,
+        /// Byte offset of the inner (offending) `sigma`.
+        at: usize,
+    },
 }
 
 /// Which kind of top-level item a [`Symbol`] refers to.
@@ -1273,6 +1296,25 @@ impl<'a> Walker<'a> {
             // ends.
             StmtKind::Sigma { label, var, source, body } => {
                 self.walk_expr(source);
+                // Slice 31: reject duplicate loop labels. An
+                // inner `sigma 'L …` whose label is already
+                // present on the stack would shadow the outer
+                // for break/continue targeting — almost always
+                // user error. Sibling same-label loops (one
+                // closes before the other opens) don't trigger
+                // because the outer was popped first.
+                if let Some(name) = label {
+                    let already_open = self
+                        .loop_labels
+                        .iter()
+                        .any(|entry| entry.as_deref() == Some(name.as_str()));
+                    if already_open {
+                        self.errors.push(ResolveError::DuplicateLoopLabel {
+                            label: name.clone(),
+                            at: stmt.span.start,
+                        });
+                    }
+                }
                 self.push_scope();
                 self.declare(LocalBinding {
                     name: var.clone(),
@@ -3212,6 +3254,46 @@ mod tests {
             ResolveError::UnknownLoopLabel { label, .. } if label == "gone"
         ));
         assert!(saw_e0415, "expected E0415; got {errors:?}");
+    }
+
+    #[test]
+    fn duplicate_nested_loop_label_is_e0416() {
+        // `sigma 'outer i in … { sigma 'outer j in … { … } }` —
+        // the inner shadows the outer. Slice 31 rejects this
+        // with E0416.
+        let src = "\
+            @fn t() {\n  \
+              sigma 'outer i in 0u32..4u32 {\n    \
+                sigma 'outer j in 0u32..4u32 {\n      \
+                  break 'outer;\n    \
+                }\n  \
+              }\n  \
+              return;\n\
+            }\n\
+        ";
+        let errors = resolve_str(src).expect_err("expected E0416");
+        let saw = errors
+            .iter()
+            .any(|e| matches!(e, ResolveError::DuplicateLoopLabel { label, .. } if label == "outer"));
+        assert!(saw, "expected E0416 for duplicate `'outer`; got {errors:?}");
+    }
+
+    #[test]
+    fn sibling_same_label_sigmas_resolve() {
+        // Two `sigma 'lp`s in series (one closes before the
+        // other opens) are NOT a duplicate — the stack is
+        // popped between them. (Note: labels must be ≥2
+        // chars per the lexer's label/char-lit
+        // disambiguation; `'l` would lex as char-literal
+        // start.)
+        let src = "\
+            @fn t() {\n  \
+              sigma 'lp i in 0u32..4u32 { break 'lp; }\n  \
+              sigma 'lp j in 0u32..4u32 { break 'lp; }\n  \
+              return;\n\
+            }\n\
+        ";
+        let _ = resolve_str(src).expect("sibling same-label loops should resolve");
     }
 
     #[test]
