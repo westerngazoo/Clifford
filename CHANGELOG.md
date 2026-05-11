@@ -7,6 +7,56 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 26: Multi-owner audit marker text (2026-05-09)
+
+Closes the "multiple audited owners" gap explicitly noted
+in the slice-22 CHANGELOG. When a callable's `#mutates:
+[...]` clause lists two or more `#audit`-marked automatons,
+the marker text now lists **all** of them in source order
+as a bracketed list:
+
+```
+; audit-wrap site for [Pose, Uart] (unchecked_store) ; Decision #18
+```
+
+The single-owner format (no brackets, bare name) is
+unchanged — slice-21/22 substring expectations and existing
+tests continue to work. The future
+`PointerAuditor`-dispatch pass can grep the bracketed list
+to enumerate every Sanitizer instance that should wrap the
+emission site.
+
+**Codegen changes (`crates/codegen/src/lib.rs`):**
+
+- `Emitter.current_audited_owner: Option<String>` becomes
+  `current_audited_owners: Vec<String>`. Empty = no audit
+  context; single-element = slice-22 bare-name marker;
+  multi-element = slice-26 bracketed list.
+- `first_audited_in_mutates(mutates) -> Option<String>` is
+  replaced by `audited_in_mutates(mutates) -> Vec<String>`
+  preserving source order.
+- `emit_effect` and `emit_interrupt` populate the list via
+  `audited_in_mutates`. `emit_transition` pushes the single
+  owner when the owning automaton is `#audit`-marked
+  (transitions only ever have one).
+- `emit_audit_marker_if_needed` matches on the slice
+  length: `[]` → no-op, `[X]` → `for X`, `[A,B,…]` →
+  `for [A, B, …]`.
+- The slice-23 register-block helper
+  (`emit_audit_marker_for_automaton`) is unchanged — RB
+  markers always name exactly one peripheral.
+
+**Tests added (4 codegen):**
+
+- `s26_effect_with_two_audited_mutates_emits_bracketed_list`
+- `s26_effect_with_three_audited_mutates_preserves_source_order`
+- `s26_effect_with_one_audited_amid_non_audited_uses_single_form`
+  — verifies single-owner format is preserved when only
+  one mutated automaton is audited.
+- `s26_register_block_marker_stays_bare_name` — verifies
+  the slice-23 RB marker path doesn't leak into the
+  multi-owner format.
+
 ### Added — Slice 25: Reject `#staged` on register-block automata (E0212) (2026-05-09)
 
 Closes the explicit "deliberately NOT in slice 18" note that
