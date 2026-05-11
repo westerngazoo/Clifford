@@ -7,6 +7,44 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 25: Reject `#staged` on register-block automata (E0212) (2026-05-09)
+
+Closes the explicit "deliberately NOT in slice 18" note that
+`#staged #automaton X { #address: ...; ... }` should be a
+parse-time error. Register blocks map to fixed MMIO regions —
+the live state IS the hardware, and the `#staged` shadow +
+`#flush` memcpy semantics are undefined for memory-mapped I/O
+(memcpy'ing into hardware registers from a RAM shadow has no
+established firmware meaning). The combination is now rejected
+at parse time with **E0212 `StagedRegisterBlock`**, surfacing
+the error immediately rather than letting it slip into
+downstream phases where the diagnostics are less clear.
+
+**Parser change (`crates/parser/src/lib.rs`):**
+
+- New `ParseError::StagedRegisterBlock { name, at }` variant
+  (E0212) with a help string suggesting "remove `#staged`
+  or remove `#address`".
+- `parse_automaton_decl` runs the check at the close of the
+  automaton body — after both modifiers and the `#address`
+  clause have been observed.
+
+**Tests added (3 parser):**
+
+- `staged_register_block_is_rejected_e0212` — verifies the
+  full `#staged #automaton X { #address: ...; ... }` shape
+  surfaces E0212.
+- `staged_without_address_still_parses` — regression check
+  that the slice-18 happy path (`#staged` without
+  `#address`) still works.
+- `audit_register_block_still_parses` — regression check
+  that the slice-23 happy path (`#audit` + `#address`,
+  audit markers on volatile ops) still works.
+
+Codegen's defensive `is_staged && !is_register_block` guard
+in `AutomatonInfo::write_global` is kept as defence in depth
+even though the parser now rejects the case upstream.
+
 ### Added — Slice 24: `@shadow Auto.field` operator (Decision #12) (2026-05-09)
 
 Adds the symmetric companion to `@snapshot` for `#staged`

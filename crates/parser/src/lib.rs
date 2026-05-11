@@ -117,6 +117,20 @@ pub enum ParseError {
         /// Byte offset where the `#states` keyword began.
         at: usize,
     },
+
+    /// Slice 25: `#staged` is incompatible with `#address`
+    /// (register-block) automata. A register block maps to a
+    /// fixed MMIO region — there is no shadow buffer that
+    /// would survive a `#flush` memcpy in any meaningful way
+    /// (the live target IS the hardware). Reject the
+    /// combination at parse time.
+    #[error("E0212: `#staged` on register-block automaton `{name}` at byte {at} (a register block maps to fixed MMIO; the shadow/flush semantics are undefined — remove `#staged` or remove `#address`)")]
+    StagedRegisterBlock {
+        /// The automaton being declared.
+        name: String,
+        /// Byte offset where the `#automaton` keyword began.
+        at: usize,
+    },
 }
 
 /// Parse a token stream into a [`Program`] (the root AST node).
@@ -497,6 +511,19 @@ impl<'t> Parser<'t> {
         }
 
         let close = self.expect(TokenKind::RBrace, "`}` to close automaton body")?;
+
+        // Slice 25: `#staged` + `#address` is incompatible per
+        // Decision #12 — register blocks map to fixed MMIO and
+        // have no meaningful shadow. Reject at parse time so
+        // users see the error immediately, before downstream
+        // phases see a half-baked AST node.
+        if staged && address.is_some() {
+            return Err(ParseError::StagedRegisterBlock {
+                name: name.clone(),
+                at: start,
+            });
+        }
+
         Ok(AutomatonDecl {
             name,
             address,
@@ -6876,6 +6903,52 @@ mod tests {
             msg.contains("duplicate"),
             "expected error to mention duplicate; got: {msg}"
         );
+    }
+
+    #[test]
+    fn staged_register_block_is_rejected_e0212() {
+        // Slice 25: `#staged #automaton X { #address: 0x...; }`
+        // is incompatible — register blocks have no meaningful
+        // shadow. Parser rejects at the close of the automaton
+        // body with E0212.
+        let err = parse_str(
+            "#staged #automaton Uart { #address: 0x4000_4000; tx_data: u32 #offset: 0x00; }",
+        )
+        .expect_err("expected E0212");
+        match err {
+            ParseError::StagedRegisterBlock { name, .. } => {
+                assert_eq!(name, "Uart");
+            }
+            other => panic!("expected StagedRegisterBlock, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn staged_without_address_still_parses() {
+        // Regression check: `#staged #automaton` without an
+        // `#address` clause is the normal slice-18 form and
+        // must keep parsing.
+        let p =
+            parse_str("#staged #automaton Pose { x: u32; }").expect("staged non-RB parses");
+        let a = auto(&p, 0);
+        assert!(a.staged);
+        assert!(a.address.is_none());
+    }
+
+    #[test]
+    fn audit_register_block_still_parses() {
+        // Regression check: `#audit #automaton X { #address: ...; }`
+        // is a different combination (slice 23 specifically
+        // wires audit markers for register-block volatile ops);
+        // it must keep parsing.
+        let p = parse_str(
+            "#audit #automaton Uart { #address: 0x4000_4000; tx_data: u32 #offset: 0x00; }",
+        )
+        .expect("audit register block parses");
+        let a = auto(&p, 0);
+        assert!(a.audited);
+        assert!(a.address.is_some());
+        assert!(!a.staged);
     }
 
     #[test]
