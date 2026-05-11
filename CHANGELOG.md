@@ -7,6 +7,70 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 22: audit markers extended to effects + interrupts (2026-05-09)
+
+Closes the soundness gap explicitly noted in slice 21: an
+`#effect` or `#interrupt` whose `#mutates: [...]` clause
+names an audited automaton now emits the same
+`; audit-wrap site for <Owner> (<primitive>) ; Decision #18`
+IR markers at every unsafe-primitive site in its body. The
+slice-21 transition-only marker placement is retained
+unchanged; slice 22 just expands the set of callable kinds
+that participate.
+
+The marker text names the **first** audited automaton in
+source order from the `#mutates: [...]` list. The marker is
+a wiring signpost — the future instrumentation pass that
+turns markers into real `PointerAuditor` dispatch will
+consult the AST's full `#mutates: [...]` list to determine
+which Sanitizer instances to call into. The marker only
+needs to be present at the wrap site.
+
+**Codegen changes (`crates/codegen/src/lib.rs`):**
+
+- New `first_audited_in_mutates(mutates: &[String]) -> Option<String>`
+  helper iterates a `#mutates: [...]` list in source order
+  and returns the first automaton whose `AutomatonInfo` has
+  `is_audited == true`.
+- `emit_effect` and `emit_interrupt` now set
+  `current_audited_owner = self.first_audited_in_mutates(&decl.mutates)`
+  immediately after `reset_per_function_state`. Cleared by
+  the next callable's reset, so non-audit effects /
+  interrupts that follow an audit one in source order do
+  not inherit the marker.
+
+**Tests:**
+
+- The slice-21 negative test
+  `s21_audit_marker_does_not_appear_in_effects` documented
+  the future-slice extension and is now obsolete; replaced
+  by **6 new positive slice-22 tests**:
+  - `s22_audit_marker_appears_in_effect_targeting_audit_automaton`
+  - `s22_effect_without_audited_mutates_emits_no_marker`
+  - `s22_effect_with_empty_mutates_emits_no_marker`
+  - `s22_effect_with_mixed_mutates_uses_first_audited_owner`
+  - `s22_audit_marker_appears_in_interrupt_targeting_audit_automaton`
+  - `s22_audit_context_clears_between_effects`
+
+**Sample:** `examples/audit_marker_demo.cl` extended with
+two effects and one interrupt — `poke_audited_via_effect`
+(2 markers), `poke_plain_via_effect` (zero), and
+`SysTick` (2 markers) — verifying the propagation rule
+end-to-end through the cliffordc CLI.
+
+**Deliberately NOT in slice 22:**
+
+- **Multiple audited owners.** When an effect mutates two
+  audited automata, only the first appears in the marker
+  text. The actual wrap pass (future slice) consults the
+  AST for the full list; the marker is just a stable
+  signpost at the IR-instruction site.
+- **Still no actual `PointerAuditor` calls.** Slices 18,
+  20, 21, 22 stand up the surface, AST, codegen markers,
+  and propagation rules. The stdlib interface, default
+  `ShadowSanitizer` impl, and call-emitting pass remain
+  in subsequent slices.
+
 ### Added — Slice 21: `#audit` codegen markers at unsafe-primitive sites (2026-05-09)
 
 Wires the slice-20 `#audit` modifier through to codegen.
