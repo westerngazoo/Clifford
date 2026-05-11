@@ -2478,4 +2478,79 @@ mod tests {
         assert!(can_concur(&a, &b));
         assert!(can_concur(&b, &a));
     }
+
+    // ─── Slice 33: verify slice-19 #flush race-detection plumbing ───────
+
+    #[test]
+    fn s33_flush_vs_concurrent_field_write_is_a_race() {
+        // Slice 19 expanded `#flush A;` into one direct write per
+        // declared field of A in the mutation profile. Slice 33
+        // verifies that the §7 ortho engine actually sees the
+        // expansion: an effect that flushes a #staged automaton
+        // and an interrupt that writes one of its fields are
+        // concurrent and share the field — must surface E0520.
+        let src = "\
+            #staged #automaton S { v: u32; w: u32; }\n\
+            #effect committer() #mutates: [S] { #flush S; }\n\
+            #interrupt SysTick() #mutates: [S] #priority: HIGH { S.v += 1u32; }\n\
+        ";
+        let program = parse_program(src);
+        let profiles = build_profiles(&program);
+        let errs = verify(&program, &profiles).expect_err(
+            "expected race: flush writes every field, IRQ writes S.v",
+        );
+        let saw = errs.iter().any(|e| matches!(
+            e,
+            OrthoError::OrthogonalityViolation { shared_fields, .. }
+                if shared_fields.iter().any(|f| f.field == "v")
+        ));
+        assert!(
+            saw,
+            "expected E0520 race on S.v from flush vs IRQ; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn s33_two_flushes_of_same_staged_automaton_race() {
+        // Two callables both flushing `S` race on every field —
+        // because each `#flush S;` expands to writes of `S.v` and
+        // `S.w` per slice 19.
+        let src = "\
+            #staged #automaton S { v: u32; w: u32; }\n\
+            #effect committer_a() #mutates: [S] { #flush S; }\n\
+            #interrupt SysTick() #mutates: [S] #priority: HIGH { #flush S; }\n\
+        ";
+        let program = parse_program(src);
+        let profiles = build_profiles(&program);
+        let errs = verify(&program, &profiles).expect_err(
+            "expected race: both flushes write every field of S",
+        );
+        // At least one violation; shared_fields names a field of S.
+        let saw = errs.iter().any(|e| matches!(
+            e,
+            OrthoError::OrthogonalityViolation { shared_fields, .. }
+                if !shared_fields.is_empty()
+        ));
+        assert!(
+            saw,
+            "expected E0520 from flush-vs-flush; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn s33_flush_vs_disjoint_automaton_does_not_race() {
+        // Sanity: a flush of S and an IRQ writing field of an
+        // unrelated automaton T are orthogonal. The slice-19
+        // expansion records writes for fields of S, not T.
+        let src = "\
+            #staged #automaton S { v: u32; }\n\
+            #automaton T { w: u32; }\n\
+            #effect committer() #mutates: [S] { #flush S; }\n\
+            #interrupt SysTick() #mutates: [T] #priority: HIGH { T.w += 1u32; }\n\
+        ";
+        let program = parse_program(src);
+        let profiles = build_profiles(&program);
+        verify(&program, &profiles)
+            .expect("flush of S and write of T are orthogonal");
+    }
 }

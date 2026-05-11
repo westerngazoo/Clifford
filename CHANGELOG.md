@@ -7,6 +7,36 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 33: ortho-engine tests verifying slice-19 `#flush` race detection (2026-05-09)
+
+Slice 19 claimed: "`#flush A;` flows into the §6.2
+mutation profile as a write to every declared field of A,
+so the §7 ortho engine sees flush-vs-field-write races."
+Slice 33 adds **3 explicit ortho-engine tests** that
+verify this claim end-to-end through `verify(&program,
+&profiles)`:
+
+- `s33_flush_vs_concurrent_field_write_is_a_race` —
+  an effect that flushes a `#staged` automaton and an
+  interrupt that writes one of its fields surface
+  E0520 with `S.v` in `shared_fields`.
+- `s33_two_flushes_of_same_staged_automaton_race` —
+  two callables both flushing `S` race because each
+  flush writes every declared field.
+- `s33_flush_vs_disjoint_automaton_does_not_race` —
+  a flush of `S` and an interrupt writing a field of
+  unrelated `T` are correctly orthogonal (regression
+  check that the slice-19 expansion doesn't over-report).
+
+These tests sit in `crates/ortho/src/lib.rs::tests`
+alongside the existing v0.1 race-detection tests, so
+any future ortho-engine refactor immediately surfaces a
+failure if the slice-19 plumbing breaks.
+
+No code changes — pure test additions verifying the
+end-to-end soundness chain (effect-crate flush expansion
+→ ortho-engine race detection).
+
 ### Fixed — Slice 32: staged-automaton transition tag-write goes to live state (2026-05-09)
 
 Found a real soundness bug while inspecting the slice-29
