@@ -7,6 +7,59 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Fixed — Slice 32: staged-automaton transition tag-write goes to live state (2026-05-09)
+
+Found a real soundness bug while inspecting the slice-29
+showcase IR: in a `#staged #automaton` with a multi-state
+`#transition boot -> Running { … #flush Self; }`, the
+implicit destination state-tag write at transition exit
+was routed to `@<Auto>.shadow` (per slice 18's "all writes
+to staged go to shadow" rule). The body's `#flush` ran
+BEFORE the exit emission, so the tag write to shadow was
+never committed — live state stayed in the source state
+forever.
+
+**Fix:** the destination state-tag write at transition
+exit now ALWAYS targets live state (`@<Auto>.state`),
+even for staged automatons. Field writes still go to
+shadow (slice 18 semantic preserved); only the
+state-tag is exempt.
+
+**Rationale for the carve-out:**
+
+- State transitions are about *identity* / lifecycle —
+  observers post-transition must see the new state
+  immediately.
+- The slice-32 ordering (field writes → memcpy flush →
+  live tag write) is correct: the new state becomes
+  visible AFTER the field commit, so no observer ever
+  sees the new state with stale fields.
+- Without the fix, `#staged` multi-state automatons were
+  effectively non-functional for any transition with an
+  explicit `#flush`.
+
+**Codegen change (`crates/codegen/src/lib.rs`):**
+
+- `emit_exit_fence_if_pending` no longer routes the
+  state-tag write through `AutomatonInfo::write_global`
+  (which returns the shadow for staged automatons).
+  Instead it hardcodes `@<Auto>.state` for the tag GEP.
+- The slice-18 test
+  `s18_multi_state_staged_tag_write_targets_shadow`
+  was renamed and inverted to
+  `s32_multi_state_staged_field_write_to_shadow_tag_write_to_live`,
+  documenting the new (correct) behavior and asserting
+  the bug regression cannot reappear (no GEP into
+  `@<Auto>.shadow` at LLVM idx 0).
+- New `s32_staged_transition_with_explicit_flush_commits_then_writes_tag_to_live`
+  asserts the IR ordering: field write → memcpy → live
+  tag write.
+
+The slice-29 showcase IR was re-inspected post-fix: the
+`Pose.boot` transition now correctly emits the
+`Running`-tag write to `@Pose.state` after the flush
+memcpy.
+
 ### Added — Slice 31: Reject duplicate nested sigma-loop labels (E0416) (2026-05-09)
 
 Closes the slice-27 deferred "label collision rejection"
