@@ -7,6 +7,91 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 23: audit markers on register-block volatile loads/stores (2026-05-09)
+
+Closes the most-firmware-relevant remaining gap in the
+`#audit` chain: peripheral register accesses (`Uart.tx_data
+= …`, `@snapshot Spi.status`, `Uart.tx_data += 1u32`) lower
+to `store volatile` / `load volatile` and now emit
+`; audit-wrap site for <Peripheral> (volatile_store)` (or
+`volatile_load`) IR markers naming the **specific
+peripheral being touched** — the most useful place to wrap
+a `PointerAuditor::validate_load/store` call for firmware
+bug classes like wrong-peripheral-base or wrong-offset.
+
+The slice 23 marker names the *touched* automaton, not the
+slice-22 callable-level `current_audited_owner`. This is a
+strict precision improvement: when an effect with
+`#mutates: [Pose, Uart]` (both audited) writes only
+`Uart.tx_data`, the marker correctly identifies `Uart` as
+the wrap target — not `Pose` (which slice 22 would have
+named as the first audited in `#mutates`).
+
+**Codegen changes (`crates/codegen/src/lib.rs`):**
+
+- New `emit_audit_marker_for_automaton(automaton, kind)`
+  helper — the register-block companion to slice 21's
+  `emit_audit_marker_if_needed`. Takes the specific
+  automaton being touched as an explicit argument and
+  checks its `is_audited` flag locally rather than reading
+  the per-callable `current_audited_owner`.
+- The three register-block volatile emission sites now
+  call the helper:
+  - `emit_field_store`'s `RegisterBlock` arm (single-field
+    writes, `volatile_store`)
+  - `emit_field_load`'s `RegisterBlock` arm (single-field
+    reads via the function-internal call path,
+    `volatile_load`)
+  - `emit_field_access_by_name`'s inline volatile-read
+    branch (the path `@snapshot Auto.field` takes,
+    `volatile_load`)
+  - `emit_indexed_field_store`'s `RegisterBlock` branch
+    (indexed-array writes like `Auto.arr[i] = …`,
+    `volatile_store`)
+- Non-audit register blocks emit byte-identical IR (the
+  helper short-circuits when `is_audited == false`).
+
+**Tests added (7 codegen):**
+
+- `s23_audit_register_block_write_via_mutate_short_emits_marker`
+- `s23_non_audit_register_block_write_emits_no_marker`
+- `s23_audit_register_block_read_emits_marker`
+- `s23_audit_register_block_mutate_block_form_emits_marker`
+- `s23_audit_register_block_compound_assign_marks_both_sides`
+  — verifies the load marker precedes the store marker for
+  `+=` on an audit register block.
+- `s23_audit_register_block_marker_uses_touched_automaton_name`
+  — verifies the touched-automaton precision (Uart, not
+  Pose, in a `#mutates: [Pose, Uart]` effect that writes
+  only Uart).
+- `s23_audit_register_block_indexed_write_emits_marker`
+  — `#mutate Buf { data[0u32] = 1u32 }` against a `#audit`
+  register-block array field.
+
+**Sample:** `examples/audit_marker_demo.cl` extended with
+`AuditedUart` (a `#audit` register block) and three
+callables — `send_byte` (1 store marker), `read_status`
+(1 load marker via `@snapshot`), `increment_tx` (1 load
++ 1 store, both marked) — verifying the propagation rule
+end-to-end through the cliffordc CLI.
+
+**Status of the `#audit` chain after slice 23:**
+
+The marker placement is now complete for **all unsafe
+emission sites in v0.2**:
+- Slice 21: `#unchecked_*` / `#volatile_*` /
+  `#unchecked_cast` inside transition bodies
+- Slice 22: same primitives inside effects / interrupts
+  whose `#mutates` lists an audited automaton
+- Slice 23: register-block volatile loads / stores
+  (`Auto.field` and `@snapshot Auto.field` against
+  `#audit #automaton ... { #address: ...; ... }`)
+
+The only remaining piece in the `#audit` runway is the
+actual `PointerAuditor` interface + `ShadowSanitizer`
+default impl in stdlib, plus the pass that turns markers
+into real calls — all gated on stdlib scaffolding work.
+
 ### Added — Slice 22: audit markers extended to effects + interrupts (2026-05-09)
 
 Closes the soundness gap explicitly noted in slice 21: an

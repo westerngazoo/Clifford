@@ -100,3 +100,36 @@
   #volatile_store<u32>(base, 1u32);
   return;
 }
+
+
+// ─── Slice 23: register-block field accesses get markers too ────────
+//
+// The biggest firmware win for `#audit`: peripheral register
+// accesses (`Uart.tx_data = …`, `@snapshot Spi.status`, etc.)
+// lower to `store volatile` / `load volatile` and now emit
+// markers naming the *specific* peripheral being touched.
+//
+// AuditedUart is a `#audit #automaton` with a `#address: …`
+// clause (register block per Decision #6). Each field access
+// — write, read, or compound — surfaces a marker.
+
+#audit #automaton AuditedUart {
+  #address: 0x4000_4400;
+  tx_data: u32 #offset: 0x00;
+  rx_data: u32 #offset: 0x04;
+  status:  u32 #offset: 0x08;
+}
+
+#effect send_byte(b: u32) #mutates: [AuditedUart] {
+  AuditedUart.tx_data = b;          // volatile_store marker
+  return;
+}
+
+@fn read_status() -> u32 $ [Readable] {
+  return @snapshot AuditedUart.status;   // volatile_load marker
+}
+
+#effect increment_tx() #mutates: [AuditedUart] {
+  AuditedUart.tx_data += 1u32;       // load + store, both marked
+  return;
+}
