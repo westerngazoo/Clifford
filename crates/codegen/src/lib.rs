@@ -1628,6 +1628,17 @@ impl<'a> Emitter<'a> {
 
         // Stage 3: store.
         let store_keyword = if is_register_block { "store volatile" } else { "store" };
+        if is_register_block {
+            // Slice 23 (Decision #18): mark register-block
+            // indexed-field volatile stores. Mirrors the
+            // non-indexed register-block path in
+            // `emit_field_store`. The `kind` string is the same
+            // because the underlying IR op is `store volatile`;
+            // the future instrumentation pass discriminates
+            // indexed vs. non-indexed via the surrounding GEP
+            // structure, not the marker text.
+            self.emit_audit_marker_for_automaton(automaton, "volatile_store");
+        }
         writeln!(
             &mut self.out,
             "  {store_keyword} {element_ir_ty} {value}, {element_ir_ty}* {elem_ptr}",
@@ -1673,6 +1684,13 @@ impl<'a> Emitter<'a> {
             }
             FieldLocation::RegisterBlock { absolute_address } => {
                 let _ = is_register_block; // tag for diagnostic-future use
+                // Slice 23 (Decision #18): if `automaton` is
+                // `#audit`-marked, emit a wrap-site marker for
+                // this peripheral. The marker names the specific
+                // automaton being touched, which is more precise
+                // than the callable-level `current_audited_owner`
+                // when an effect lists multiple audited automata.
+                self.emit_audit_marker_for_automaton(automaton, "volatile_store");
                 writeln!(
                     &mut self.out,
                     "  store volatile {ir_ty} {value}, {ir_ty}* inttoptr (i64 {abs} to {ir_ty}*)",
@@ -1707,6 +1725,13 @@ impl<'a> Emitter<'a> {
                 val
             }
             FieldLocation::RegisterBlock { absolute_address } => {
+                // Slice 23 (Decision #18): mark register-block
+                // volatile reads from `#audit`-marked
+                // peripherals. Same marker shape as the
+                // write-side path; the future wrap pass will
+                // dispatch through the appropriate
+                // `PointerAuditor::validate_load` call.
+                self.emit_audit_marker_for_automaton(automaton, "volatile_load");
                 let val = self.fresh_value();
                 writeln!(
                     &mut self.out,
@@ -2335,6 +2360,45 @@ impl<'a> Emitter<'a> {
             writeln!(
                 &mut self.out,
                 "  ; audit-wrap site for {owner} ({kind}) ; Decision #18",
+            )
+            .ok();
+        }
+    }
+
+    /// Slice 23 (Decision #18): emit a `; audit-wrap site for
+    /// <Automaton>` IR comment iff the named automaton is
+    /// registered as `#audit`-marked. Unlike
+    /// [`Self::emit_audit_marker_if_needed`] (which reads the
+    /// per-callable `current_audited_owner`), this variant takes
+    /// the touched automaton as an explicit argument — used at
+    /// the register-block emission sites
+    /// (`emit_field_store`, `emit_indexed_field_store`,
+    /// `emit_field_load`) where the specific peripheral being
+    /// poked is locally known and more informative than the
+    /// callable-level owner.
+    ///
+    /// Example: an effect with `#mutates: [Pose, Uart]` where
+    /// both are audited writes `Uart.tx_data`. The slice-22
+    /// callable-level owner is `"Pose"` (first audited in
+    /// `#mutates`), but the *touched* automaton is `Uart`. This
+    /// helper emits a `Uart` marker so the future
+    /// instrumentation pass dispatches against the correct
+    /// `PointerAuditor` instance.
+    ///
+    /// No-op when the automaton is unknown to the registry or
+    /// has `is_audited == false` — non-audit register blocks
+    /// (and non-register-block automata routed elsewhere) emit
+    /// byte-identical IR.
+    fn emit_audit_marker_for_automaton(&mut self, automaton: &str, kind: &str) {
+        let is_audited = self
+            .automatons
+            .get(automaton)
+            .map(|info| info.is_audited)
+            .unwrap_or(false);
+        if is_audited {
+            writeln!(
+                &mut self.out,
+                "  ; audit-wrap site for {automaton} ({kind}) ; Decision #18",
             )
             .ok();
         }
@@ -3022,6 +3086,13 @@ impl<'a> Emitter<'a> {
             // operation atomicity contract holds at the LLVM level
             // because volatile loads of word-sized integers are
             // single-instruction on every supported target.
+            //
+            // Slice 23 (Decision #18): emit an audit marker if
+            // the peripheral is `#audit`-marked. Same marker
+            // shape as the write-side path; future
+            // instrumentation dispatches through
+            // `PointerAuditor::validate_load`.
+            self.emit_audit_marker_for_automaton(auto_name, "volatile_load");
             let val = self.fresh_value();
             writeln!(
                 &mut self.out,
@@ -8092,6 +8163,187 @@ mod tests {
         assert!(
             ir.contains("; audit-wrap site for P (volatile_store) ; Decision #18"),
             "expected volatile_store marker in interrupt body; got:\n{ir}"
+        );
+    }
+
+    // ─── Slice 23: audit markers on register-block volatile ops ─────────
+
+    #[test]
+    fn s23_audit_register_block_write_via_mutate_short_emits_marker() {
+        // `#audit #automaton Uart { #address: 0x4000_4000;
+        // tx_data: u32 #offset: 0x00; }` — a write through the
+        // mutation-sugar form lowers to `store volatile` and
+        // must emit a `; audit-wrap site for Uart (volatile_store)`
+        // marker.
+        let src = "\
+            #audit #automaton Uart { \n  \
+              #address: 0x4000_4000; \n  \
+              tx_data: u32 #offset: 0x00; \n\
+            }\n\
+            #effect send() #mutates: [Uart] { \n  \
+              Uart.tx_data = 85u32; \n  \
+              return; \n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower audit register block");
+        assert!(
+            ir.contains("; audit-wrap site for Uart (volatile_store) ; Decision #18"),
+            "expected register-block write marker; got:\n{ir}"
+        );
+        // Sanity: the actual volatile store still appears.
+        assert!(
+            ir.contains("store volatile i32 85"),
+            "expected the underlying volatile store; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s23_non_audit_register_block_write_emits_no_marker() {
+        // Same shape minus the `#audit` modifier — no marker.
+        let src = "\
+            #automaton Uart { \n  \
+              #address: 0x4000_4000; \n  \
+              tx_data: u32 #offset: 0x00; \n\
+            }\n\
+            #effect send() #mutates: [Uart] { \n  \
+              Uart.tx_data = 85u32; \n  \
+              return; \n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower non-audit register block");
+        assert!(
+            !ir.contains("audit-wrap site"),
+            "non-audit register block must emit no markers; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s23_audit_register_block_read_emits_marker() {
+        // Reading a register-block field via `@snapshot` lowers
+        // through `emit_field_load`'s `RegisterBlock` arm and
+        // emits a `volatile_load` marker.
+        let src = "\
+            #audit #automaton Uart { \n  \
+              #address: 0x4000_4000; \n  \
+              tx_data: u32 #offset: 0x00; \n\
+            }\n\
+            @fn read_tx() -> u32 $ [Readable] { return @snapshot Uart.tx_data; }\n\
+        ";
+        let ir = lower_str(src).expect("lower audit register-block read");
+        assert!(
+            ir.contains("; audit-wrap site for Uart (volatile_load) ; Decision #18"),
+            "expected register-block read marker; got:\n{ir}"
+        );
+        // Sanity: the actual volatile load still appears.
+        assert!(
+            ir.contains("load volatile i32"),
+            "expected the underlying volatile load; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s23_audit_register_block_mutate_block_form_emits_marker() {
+        // The bulk-form `#mutate Uart { tx_data = 7u32 }` also
+        // routes through `emit_field_store`'s RegisterBlock arm.
+        let src = "\
+            #audit #automaton Uart { \n  \
+              #address: 0x4000_4000; \n  \
+              tx_data: u32 #offset: 0x00; \n\
+            }\n\
+            #effect send() #mutates: [Uart] { \n  \
+              #mutate Uart { tx_data = 7u32 }; \n  \
+              return; \n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower audit #mutate block");
+        assert!(
+            ir.contains("; audit-wrap site for Uart (volatile_store) ; Decision #18"),
+            "expected marker for #mutate-block on audit RB; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s23_audit_register_block_compound_assign_marks_both_sides() {
+        // `Uart.tx_data += 1u32` is a load-modify-store on an
+        // audit register block — both the volatile_load and the
+        // volatile_store get markers, in that order.
+        let src = "\
+            #audit #automaton Counter { \n  \
+              #address: 0x4000_4000; \n  \
+              n: u32 #offset: 0x00; \n\
+            }\n\
+            #effect bump() #mutates: [Counter] { \n  \
+              Counter.n += 1u32; \n  \
+              return; \n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower audit RB compound");
+        // Order: the load fires first (to fetch the current
+        // value), then the store. Both markers must appear and
+        // the load's marker must precede the store's.
+        let load_at = ir
+            .find("audit-wrap site for Counter (volatile_load)")
+            .expect("load marker");
+        let store_at = ir
+            .find("audit-wrap site for Counter (volatile_store)")
+            .expect("store marker");
+        assert!(load_at < store_at, "load marker must precede store marker");
+    }
+
+    #[test]
+    fn s23_audit_register_block_marker_uses_touched_automaton_name() {
+        // An effect with `#mutates: [Pose, Uart]` where BOTH are
+        // audited but only Uart is the register block being
+        // touched. The slice-22 callable-level
+        // `current_audited_owner` is `"Pose"` (first audited in
+        // mutates) — but slice 23 emits the marker naming the
+        // SPECIFIC touched automaton (`Uart`), not the callable
+        // owner. This is the precision win the slice-23 helper
+        // buys us.
+        let src = "\
+            #audit #automaton Pose { x: u32; } \n\
+            #audit #automaton Uart { \n  \
+              #address: 0x4000_4000; \n  \
+              tx_data: u32 #offset: 0x00; \n\
+            }\n\
+            #effect bump_uart() #mutates: [Pose, Uart] { \n  \
+              Uart.tx_data = 1u32; \n  \
+              return; \n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower mixed audit");
+        assert!(
+            ir.contains("audit-wrap site for Uart (volatile_store)"),
+            "expected marker naming the touched automaton (Uart); got:\n{ir}"
+        );
+        // The slice-22 callable marker on `unchecked_*` would
+        // name Pose — but there are no `#unchecked_*` ops here,
+        // so the only marker present must be the Uart one.
+        assert!(
+            !ir.contains("audit-wrap site for Pose"),
+            "must not emit a Pose marker for a Uart write; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s23_audit_register_block_indexed_write_emits_marker() {
+        // Indexed register-block writes — `Uart.buf[i] = …` —
+        // route through `emit_indexed_field_store`'s
+        // RegisterBlock branch. Slice 23 adds a marker there.
+        let src = "\
+            #audit #automaton Buf { \n  \
+              #address: 0x4000_5000; \n  \
+              data: [u32; 4] #offset: 0x00; \n\
+            }\n\
+            #effect fill() #mutates: [Buf] { \n  \
+              #mutate Buf { data[0u32] = 1u32 }; \n  \
+              return; \n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower audit indexed RB");
+        assert!(
+            ir.contains("; audit-wrap site for Buf (volatile_store) ; Decision #18"),
+            "expected indexed-RB write marker; got:\n{ir}"
         );
     }
 
