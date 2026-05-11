@@ -785,6 +785,14 @@ impl<'a> Emitter<'a> {
     fn emit_effect(&mut self, decl: &EffectDecl) {
         // Reset per-function state.
         self.reset_per_function_state();
+        // Slice 22 (Decision #18): if this effect's `#mutates: [...]`
+        // names any audited automaton, set the audit context so
+        // every unsafe-primitive emission inside the body emits a
+        // `; audit-wrap site for <Owner>` IR comment. The first
+        // audited mutated automaton is used as the marker owner;
+        // see `first_audited_in_mutates` for the rationale.
+        // Cleared by the next `reset_per_function_state` call.
+        self.current_audited_owner = self.first_audited_in_mutates(&decl.mutates);
 
         let ret_ty = self.lower_return_type(decl.return_type.as_ref());
 
@@ -841,6 +849,13 @@ impl<'a> Emitter<'a> {
     fn emit_interrupt(&mut self, decl: &InterruptDecl) {
         // Reset per-function state.
         self.reset_per_function_state();
+        // Slice 22 (Decision #18): same audit-context propagation
+        // as `emit_effect`. Interrupts that handle audited
+        // automatons (typical: an ISR that pokes a `#audit
+        // #automaton Uart` register block) get markers wrapping
+        // every `#unchecked_*` / `#volatile_*` / `#unchecked_cast`
+        // in the handler body.
+        self.current_audited_owner = self.first_audited_in_mutates(&decl.mutates);
 
         let ret_ty = self.lower_return_type(decl.return_type.as_ref());
 
@@ -2323,6 +2338,32 @@ impl<'a> Emitter<'a> {
             )
             .ok();
         }
+    }
+
+    /// Slice 22 (Decision #18): given a `#mutates: [A, B, C]`
+    /// list, return the **first** automaton that is registered
+    /// as `#audit`-marked, or `None` if none of the mutated
+    /// automata are audited.
+    ///
+    /// Used by `emit_effect` and `emit_interrupt` to set
+    /// `current_audited_owner` for the duration of the body. The
+    /// "first" choice is deliberate: the marker is a wiring
+    /// signpost, not a complete description of the wrap target.
+    /// A future instrumentation pass that turns markers into
+    /// real `PointerAuditor` dispatch will consult the AST's
+    /// full `#mutates: [...]` list to determine which Sanitizer
+    /// instances to call into; the marker only needs to be
+    /// present where the wrap should land.
+    ///
+    /// Iteration is in source-order so marker text is
+    /// deterministic across compilations of the same source.
+    fn first_audited_in_mutates(&self, mutates: &[String]) -> Option<String> {
+        mutates.iter().find_map(|name| {
+            self.automatons
+                .get(name)
+                .filter(|info| info.is_audited)
+                .map(|info| info.name.clone())
+        })
     }
 
     fn emit_unchecked_load(
@@ -7945,13 +7986,14 @@ mod tests {
         );
     }
 
+    // ─── Slice 22: audit markers extended to effects + interrupts ────────
+
     #[test]
-    fn s21_audit_marker_does_not_appear_in_effects() {
-        // Slice 21 scope: only TRANSITION bodies of audit
-        // automatons get markers. An effect that targets an
-        // audit automaton via `#mutates: [...]` does NOT
-        // produce markers — that wider semantics is a
-        // documented future-slice extension.
+    fn s22_audit_marker_appears_in_effect_targeting_audit_automaton() {
+        // Slice 22 (was-deferred-from-slice-21): an effect whose
+        // `#mutates: [...]` lists an audited automaton emits
+        // `; audit-wrap site for <Owner>` markers in its body
+        // wherever an unsafe primitive is lowered.
         let src = "\
             #audit #automaton P { \n  \
               v: u32; \n\
@@ -7963,11 +8005,132 @@ mod tests {
             }\n\
         ";
         let ir = lower_str(src).expect("lower effect");
-        // The effect body has no marker because the marker is
-        // transition-scoped in slice 21.
+        assert!(
+            ir.contains("; audit-wrap site for P (unchecked_cast) ; Decision #18"),
+            "expected cast marker in effect body; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("; audit-wrap site for P (unchecked_store) ; Decision #18"),
+            "expected store marker in effect body; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s22_effect_without_audited_mutates_emits_no_marker() {
+        // The inverse: an effect whose `#mutates: [...]` lists
+        // only non-audited automata emits zero markers, even if
+        // the body contains unsafe primitives.
+        let src = "\
+            #automaton P { v: u32; }\n\
+            #effect tick() #mutates: [P] { \n  \
+              let p: &u32 = #unchecked_cast<u64, &u32>(\"mmio\", 0x4000u64); \n  \
+              #unchecked_store<u32>(p, 1u32); \n  \
+              return; \n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower effect");
         assert!(
             !ir.contains("audit-wrap site"),
-            "slice 21 effects must not emit markers; got:\n{ir}"
+            "non-audited effect must emit no markers; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s22_effect_with_empty_mutates_emits_no_marker() {
+        // A pure-ish effect with `#mutates: []` cannot target an
+        // audited automaton by definition, so no markers — even
+        // when the body has unsafe primitives.
+        let src = "\
+            #effect tick() #mutates: [] { \n  \
+              let p: &u32 = #unchecked_cast<u64, &u32>(\"mmio\", 0x4000u64); \n  \
+              #unchecked_store<u32>(p, 1u32); \n  \
+              return; \n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower empty-mutates effect");
+        assert!(
+            !ir.contains("audit-wrap site"),
+            "empty-#mutates effect must emit no markers; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s22_effect_with_mixed_mutates_uses_first_audited_owner() {
+        // When `#mutates: [Plain, Audited]`, the marker names the
+        // *first* audited automaton in source order (the wrap
+        // pass consults the AST for the full list; the marker
+        // only needs to be present at the wrap site).
+        let src = "\
+            #automaton Plain { p: u32; }\n\
+            #audit #automaton Audited { a: u32; }\n\
+            #effect tick() #mutates: [Plain, Audited] { \n  \
+              let p: &u32 = #unchecked_cast<u64, &u32>(\"mmio\", 0x4000u64); \n  \
+              #unchecked_store<u32>(p, 1u32); \n  \
+              return; \n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower mixed-mutates effect");
+        assert!(
+            ir.contains("audit-wrap site for Audited"),
+            "expected marker naming the audited automaton; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s22_audit_marker_appears_in_interrupt_targeting_audit_automaton() {
+        // Same propagation rule for `#interrupt`s — a handler
+        // that mutates an audited automaton gets markers.
+        let src = "\
+            #audit #automaton P { v: u32; }\n\
+            #interrupt SysTick() #mutates: [P] #priority: HIGH { \n  \
+              let p: &u32 = #unchecked_cast<u64, &u32>(\"mmio\", 0x4000u64); \n  \
+              #volatile_store<u32>(p, 1u32); \n  \
+              return; \n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower interrupt");
+        assert!(
+            ir.contains("; audit-wrap site for P (volatile_store) ; Decision #18"),
+            "expected volatile_store marker in interrupt body; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s22_audit_context_clears_between_effects() {
+        // Two effects in one program: the first targets an
+        // audited automaton, the second doesn't. The
+        // `reset_per_function_state` between them must clear
+        // `current_audited_owner` so the second effect's body
+        // emits no markers.
+        let src = "\
+            #audit #automaton A { x: u32; }\n\
+            #automaton B { y: u32; }\n\
+            #effect with_audit() #mutates: [A] { \n  \
+              let p: &u32 = #unchecked_cast<u64, &u32>(\"mmio\", 0x4000u64); \n  \
+              #unchecked_store<u32>(p, 1u32); \n  \
+              return; \n\
+            }\n\
+            #effect without_audit() #mutates: [B] { \n  \
+              let p: &u32 = #unchecked_cast<u64, &u32>(\"mmio\", 0x4004u64); \n  \
+              #unchecked_store<u32>(p, 2u32); \n  \
+              return; \n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower two effects");
+        let with_def = ir.find("define void @with_audit()").expect("with_audit");
+        let without_def = ir
+            .find("define void @without_audit()")
+            .expect("without_audit");
+        assert!(with_def < without_def);
+        let with_body = &ir[with_def..without_def];
+        let without_body = &ir[without_def..];
+        assert!(
+            with_body.contains("audit-wrap site"),
+            "expected marker in with_audit; got:\n{with_body}"
+        );
+        assert!(
+            !without_body.contains("audit-wrap site"),
+            "without_audit must not inherit a marker; got:\n{without_body}"
         );
     }
 

@@ -67,3 +67,36 @@
     #unchecked_store<u32>(base, 0u32);
   }
 }
+
+
+// ─── Slice 22: markers extend to effects + interrupts ───────────────
+//
+// An `#effect` whose `#mutates: [...]` clause names an audited
+// automaton picks up the same wrap-site markers as the
+// audited automaton's own transitions. Same for `#interrupt`.
+//
+// `poke_audited_via_effect` writes to AuditedRing through an
+// MMIO pointer and gets markers because `AuditedRing` is in
+// the `#mutates` list. `poke_plain_via_effect` writes to
+// PlainRing only — no markers, byte-identical to slice-21
+// non-audit IR.
+
+#effect poke_audited_via_effect() #mutates: [AuditedRing] {
+  let base: &u32 = #unchecked_cast<u64, &u32>("aux", 0x4000_4040u64);
+  #volatile_store<u32>(base, 0xCAFE_F00Du32);
+  return;
+}
+
+#effect poke_plain_via_effect() #mutates: [PlainRing] {
+  let base: &u32 = #unchecked_cast<u64, &u32>("aux", 0x4000_5040u64);
+  #volatile_store<u32>(base, 0xDEAD_BEEFu32);
+  return;
+}
+
+// An ISR that handles AuditedRing — markers fire on every
+// unsafe primitive in the handler body.
+#interrupt SysTick() #mutates: [AuditedRing] #priority: HIGH {
+  let base: &u32 = #unchecked_cast<u64, &u32>("aux", 0x4000_4044u64);
+  #volatile_store<u32>(base, 1u32);
+  return;
+}
