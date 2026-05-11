@@ -7,6 +7,40 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 30: lexer label/char-lit disambiguation hardening tests (2026-05-09)
+
+Slice 27 introduced the `'label` token and the heuristic
+that distinguishes labels from char literals at lex time.
+Slice 30 adds **8 explicit test cases** covering the
+disambiguation edge surface so the next refactor of the
+lexer's char-literal path doesn't silently regress label
+handling:
+
+- `label_basic_lexes_to_label_token` — `'outer`,
+  `'inner_loop`, `'a1` all produce `Label`.
+- `label_with_underscore_start_lexes` — `'_outer`,
+  `'a_b_c` confirm underscore-start and embedded
+  underscores work.
+- `single_char_literal_still_lexes_as_char` — `'a'`,
+  `'_'`, `'Z'` confirm peek(2) closing-apostrophe
+  correctly picks the char-lit path.
+- `escape_sequences_still_lex_as_char_literals` —
+  `'\n'`, `'\t'`, `'\r'`, `'\\'`, `'\''`, `'\0'`
+  confirm peek(1)=`\\` falls through to the char-lit
+  path.
+- `label_followed_by_punctuation_terminates_correctly`
+  — `'outer;` produces `Label("outer"), Semi`.
+- `break_with_label_round_trips_through_lexer` and
+  `sigma_with_label_round_trips_through_lexer` —
+  realistic slice-27 surface produces the right
+  token sequence for the parser.
+- `two_char_label_lexes` — minimum-length label
+  (`'ab`) confirms the heuristic accepts the smallest
+  valid case.
+
+No code changes — pure test additions hardening the
+slice-27 lexer surface.
+
 ### Added — Slice 29: end-to-end v0.2 firmware showcase sample (2026-05-09)
 
 `examples/v02_showcase.cl` — a single .cl file that
