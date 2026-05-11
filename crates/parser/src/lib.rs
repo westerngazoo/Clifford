@@ -2368,26 +2368,42 @@ impl<'t> Parser<'t> {
     /// v0.1 scope: single-ident loop variable only. The
     /// `(index, value)` pattern from §5.8 lands when array sources
     /// arrive.
-    /// Parse `break;` per slice 17. The keyword + semicolon is
-    /// the entire syntax; lexical nesting (must be inside a
-    /// `sigma` loop) is enforced by the resolver, not the parser.
+    /// Parse `break;` (slice 17) or `break 'label;` (slice 27).
+    /// Lexical nesting and label resolution are enforced by
+    /// the resolver, not the parser.
     fn parse_break_stmt(&mut self, start: usize) -> Result<Stmt, ParseError> {
         self.advance(); // `break`
+        let label = self.parse_optional_label_target();
         let close = self.expect(TokenKind::Semi, "`;` to terminate `break` statement")?;
         Ok(Stmt {
-            kind: StmtKind::Break,
+            kind: StmtKind::Break { label },
             span: Span::new(start, close.end),
         })
     }
 
-    /// Parse `continue;` per slice 17. Mirrors `parse_break_stmt`.
+    /// Parse `continue;` / `continue 'label;` per slices 17+27.
+    /// Mirrors `parse_break_stmt`.
     fn parse_continue_stmt(&mut self, start: usize) -> Result<Stmt, ParseError> {
         self.advance(); // `continue`
+        let label = self.parse_optional_label_target();
         let close = self.expect(TokenKind::Semi, "`;` to terminate `continue` statement")?;
         Ok(Stmt {
-            kind: StmtKind::Continue,
+            kind: StmtKind::Continue { label },
             span: Span::new(start, close.end),
         })
+    }
+
+    /// Slice 27: consume an optional `'label` token after a
+    /// `break` / `continue` keyword. Returns the label name
+    /// (without the leading apostrophe) if present, else None.
+    fn parse_optional_label_target(&mut self) -> Option<String> {
+        if let TokenKind::Label(name) = &self.peek().kind {
+            let name = name.clone();
+            self.advance();
+            Some(name)
+        } else {
+            None
+        }
     }
 
     /// Parse `#flush Name;` per slice 18 (Decision #12).
@@ -2412,13 +2428,18 @@ impl<'t> Parser<'t> {
 
     fn parse_sigma_stmt(&mut self, start: usize) -> Result<Stmt, ParseError> {
         self.advance(); // `sigma`
+        // Slice 27: optional `'label` between `sigma` and the
+        // loop variable. `sigma 'outer i in 0..n { … }` allows
+        // `break 'outer;` / `continue 'outer;` to target this
+        // loop from any nested position.
+        let label = self.parse_optional_label_target();
         let (var, _) = self.expect_ident("loop variable name after `sigma`")?;
         self.expect(TokenKind::KwIn, "`in` after sigma loop variable")?;
         let source = self.parse_expr()?;
         let body = self.parse_block()?;
         let end = body.span.end;
         Ok(Stmt {
-            kind: StmtKind::Sigma { var, source, body },
+            kind: StmtKind::Sigma { label, var, source, body },
             span: Span::new(start, end),
         })
     }
@@ -6737,13 +6758,13 @@ mod tests {
     #[test]
     fn break_stmt_parses_as_unit() {
         let stmt = parse_stmt_str("break;");
-        assert!(matches!(stmt.kind, StmtKind::Break));
+        assert!(matches!(stmt.kind, StmtKind::Break { label: None }));
     }
 
     #[test]
     fn continue_stmt_parses_as_unit() {
         let stmt = parse_stmt_str("continue;");
-        assert!(matches!(stmt.kind, StmtKind::Continue));
+        assert!(matches!(stmt.kind, StmtKind::Continue { label: None }));
     }
 
     #[test]
@@ -6752,7 +6773,7 @@ mod tests {
         match &stmt.kind {
             StmtKind::Sigma { body, .. } => {
                 assert_eq!(body.stmts.len(), 1);
-                assert!(matches!(body.stmts[0].kind, StmtKind::Break));
+                assert!(matches!(body.stmts[0].kind, StmtKind::Break { label: None }));
             }
             other => panic!("expected Sigma, got {:?}", other),
         }
@@ -6767,6 +6788,87 @@ mod tests {
             msg.contains("`;`") || msg.contains("Semi"),
             "expected error to mention `;`; got: {msg}"
         );
+    }
+
+    // ─── Slice 27: labelled break/continue + labelled sigma loops ─────────
+
+    #[test]
+    fn labelled_sigma_parses_with_label() {
+        // `sigma 'outer i in 0..n { … }` carries the label
+        // through to the AST.
+        let stmt = parse_stmt_str("sigma 'outer i in 0u32..10u32 { }");
+        match &stmt.kind {
+            StmtKind::Sigma { label, var, .. } => {
+                assert_eq!(label.as_deref(), Some("outer"));
+                assert_eq!(var, "i");
+            }
+            other => panic!("expected Sigma, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unlabelled_sigma_keeps_label_none() {
+        let stmt = parse_stmt_str("sigma i in 0u32..10u32 { }");
+        match &stmt.kind {
+            StmtKind::Sigma { label, .. } => {
+                assert!(label.is_none());
+            }
+            other => panic!("expected Sigma, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn break_with_label_parses() {
+        let stmt = parse_stmt_str("break 'outer;");
+        match &stmt.kind {
+            StmtKind::Break { label } => {
+                assert_eq!(label.as_deref(), Some("outer"));
+            }
+            other => panic!("expected Break, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn continue_with_label_parses() {
+        let stmt = parse_stmt_str("continue 'outer;");
+        match &stmt.kind {
+            StmtKind::Continue { label } => {
+                assert_eq!(label.as_deref(), Some("outer"));
+            }
+            other => panic!("expected Continue, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn nested_labelled_sigma_round_trips() {
+        let p = parse_str(
+            "@fn t() { sigma 'outer i in 0u32..4u32 { sigma j in 0u32..4u32 { break 'outer; } } return; }",
+        )
+        .expect("parse nested labelled");
+        match &p.items[0] {
+            Item::Fn(decl) => {
+                let outer = &decl.body.stmts[0];
+                match &outer.kind {
+                    StmtKind::Sigma { label, body, .. } => {
+                        assert_eq!(label.as_deref(), Some("outer"));
+                        let inner = &body.stmts[0];
+                        match &inner.kind {
+                            StmtKind::Sigma { label, body, .. } => {
+                                assert!(label.is_none());
+                                let brk = &body.stmts[0];
+                                assert!(matches!(
+                                    brk.kind,
+                                    StmtKind::Break { label: Some(ref l) } if l == "outer"
+                                ));
+                            }
+                            other => panic!("expected inner Sigma, got {:?}", other),
+                        }
+                    }
+                    other => panic!("expected outer Sigma, got {:?}", other),
+                }
+            }
+            other => panic!("expected Fn, got {:?}", other),
+        }
     }
 
     // ─── Slice 18: `#staged` automaton + `#flush` stmt (Decision #12) ─────
@@ -7038,9 +7140,10 @@ mod tests {
         // `sigma i in 0..n { … }` — half-open range source.
         let stmt = parse_stmt_str("sigma i in 0u32..10u32 { }");
         match &stmt.kind {
-            StmtKind::Sigma { var, source, body } => {
+            StmtKind::Sigma { var, source, body, label } => {
                 assert_eq!(var, "i");
                 assert_eq!(body.stmts.len(), 0);
+                assert!(label.is_none(), "default sigma must be unlabelled");
                 assert!(matches!(
                     source.kind,
                     ExprKind::Range { inclusive: false, .. }

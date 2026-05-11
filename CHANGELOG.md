@@ -7,6 +7,81 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 27: Labelled `break` / `continue` for `sigma` loops (2026-05-09)
+
+Closes the slice-17 deferred extension: `sigma 'outer i in
+0..n { … }` introduces a Rust-style label, and
+`break 'outer;` / `continue 'outer;` from any nested
+position targets that specific loop instead of the
+innermost. Useful for early-exit search patterns over
+nested-loop firmware code.
+
+```clifford
+@fn first_match(n: u32, m: u32) -> u32 {
+  let mut found: u32 = 0u32;
+  sigma 'outer i in 0u32..n {
+    sigma j in 0u32..m {
+      if i + j > 5u32 { found = i; break 'outer; }
+    }
+  }
+  return found;
+}
+```
+
+**Pipeline:**
+
+- **Lexer:** new `TokenKind::Label(String)` for `'name`,
+  disambiguated from char literals at lex time. The
+  heuristic: `'X'` (apostrophe + 1 char + closing
+  apostrophe) stays as `CharLiteral`; `'name`
+  (apostrophe + ident-start + at least one
+  ident-continue byte) becomes `Label("name")`.
+  Escapes `'\n'` are unaffected because peek(1)=`\\`
+  fails the alpha test.
+- **AST:**
+  - `StmtKind::Sigma` gains an `Option<String>` `label`
+    field.
+  - `StmtKind::Break` and `StmtKind::Continue` change
+    from unit variants to `{ label: Option<String> }`
+    structs.
+- **Parser:** new `parse_optional_label_target` helper
+  consumes a `'label` token after `sigma` /
+  `break` / `continue`. 5 new parser tests.
+- **Resolver:**
+  - New `loop_labels: Vec<Option<String>>` Walker field
+    parallels `loop_depth`. `Sigma` walking pushes
+    `label.clone()` and pops after the body.
+  - New `check_loop_keyword(keyword, label, at)` helper
+    dispatches between **E0411 `KeywordOutsideLoop`**
+    (unlabelled outside any loop) and **E0415
+    `UnknownLoopLabel`** (labelled with no matching
+    enclosing label). 5 new resolver tests.
+- **Codegen:** `sigma_loop_stack` entries change from
+  `(continue, exit)` to `(label, continue, exit)`. New
+  `find_sigma_loop_for_target(target)` walks the stack
+  innermost-first; for `target = None` returns the
+  innermost (slice-17 default), for `target = Some(name)`
+  returns the matching labelled entry. 4 new codegen
+  tests cover labelled break, labelled continue,
+  unlabelled-stays-innermost regression, and
+  three-deep-nest skip-intermediate.
+
+**14 new tests total** (5 parser, 5 resolver, 4 codegen).
+
+**Deliberately NOT in slice 27:**
+
+- **Labels on `@fn` / `#effect` / `#interrupt` bodies.**
+  Labels are loop-only; there is no `'fn_body: @fn …`
+  syntax.
+- **`break <expr>;` (break-with-value).** Sigma loops
+  are statements, not expressions; they don't yield
+  values.
+- **Label collision rejection.** Two nested loops with
+  the same label compile fine — the inner binding
+  shadows the outer for `break/continue` targeting.
+  This matches Rust's behaviour. A future slice could
+  add a `warn_label_shadow` lint if confusion arises.
+
 ### Added — Slice 26: Multi-owner audit marker text (2026-05-09)
 
 Closes the "multiple audited owners" gap explicitly noted

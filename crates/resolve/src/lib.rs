@@ -285,6 +285,27 @@ pub enum ResolveError {
         /// Byte offset of the offending expression.
         at: usize,
     },
+
+    /// **E0415 UnknownLoopLabel.** A `break 'name;` /
+    /// `continue 'name;` statement names a label that is not
+    /// in scope on the enclosing `sigma` loop stack.
+    ///
+    /// Slice 27: labelled control-flow targets a non-innermost
+    /// `sigma` loop. The label must appear on a `sigma 'name …`
+    /// loop in the lexically enclosing nest. A typo or
+    /// out-of-scope reference fires this error.
+    #[error(
+        "E0415: `{keyword} '{label}` at byte {at} — no enclosing `sigma '{label} …` loop in scope \
+         (slice 27 labelled control-flow walks the lexical sigma-nest only)"
+    )]
+    UnknownLoopLabel {
+        /// `"break"` or `"continue"`.
+        keyword: &'static str,
+        /// The label name (without leading apostrophe).
+        label: String,
+        /// Byte offset of the offending statement.
+        at: usize,
+    },
 }
 
 /// Which kind of top-level item a [`Symbol`] refers to.
@@ -667,6 +688,7 @@ pub fn resolve(program: &Program) -> Result<Resolution, Vec<ResolveError>> {
         scopes: Vec::new(),
         enclosing: None,
         loop_depth: 0,
+        loop_labels: Vec::new(),
     };
 
     for item in &program.items {
@@ -773,6 +795,13 @@ struct Walker<'a> {
     /// per-callable (reset implicitly because each callable is
     /// walked separately with a fresh body).
     loop_depth: u32,
+    /// Slice 27: stack of label names for the currently-open
+    /// `sigma` loops, innermost-last. `None` entries are
+    /// unlabelled loops; `Some(name)` are labelled. A
+    /// labelled `break 'outer;` walks this stack from the
+    /// top looking for the matching label; if no entry
+    /// matches, `E0415 UnknownLoopLabel` fires.
+    loop_labels: Vec<Option<String>>,
 }
 
 /// Body-context information needed by `#> proc` resolution and by `Self`
@@ -1015,6 +1044,49 @@ impl<'a> Walker<'a> {
         });
     }
 
+    /// Slice 27: validate a `break` / `continue` statement
+    /// against the current `sigma`-loop label stack.
+    ///
+    /// - **Unlabelled** (`break;` / `continue;`): valid iff
+    ///   `loop_depth > 0`. Otherwise E0411 (`KeywordOutsideLoop`).
+    /// - **Labelled** (`break 'name;` / `continue 'name;`):
+    ///   valid iff some entry in `loop_labels` matches
+    ///   `Some(name)`. Otherwise E0415 (`UnknownLoopLabel`).
+    ///   Note: a labelled `break` in a callable with no open
+    ///   sigma loops raises E0415, not E0411 — the label is
+    ///   the more specific signal of intent.
+    fn check_loop_keyword(
+        &mut self,
+        keyword: &'static str,
+        label: Option<&str>,
+        at: usize,
+    ) {
+        match label {
+            None => {
+                if self.loop_depth == 0 {
+                    self.errors.push(ResolveError::KeywordOutsideLoop {
+                        keyword,
+                        at,
+                    });
+                }
+            }
+            Some(name) => {
+                let found = self
+                    .loop_labels
+                    .iter()
+                    .rev()
+                    .any(|entry| entry.as_deref() == Some(name));
+                if !found {
+                    self.errors.push(ResolveError::UnknownLoopLabel {
+                        keyword,
+                        label: name.to_owned(),
+                        at,
+                    });
+                }
+            }
+        }
+    }
+
     /// Returns the `staged` flag of the named automaton, or `None`
     /// if `name` does not refer to any automaton in the program.
     ///
@@ -1199,7 +1271,7 @@ impl<'a> Walker<'a> {
             // open a new scope, declare the loop var inside it, and
             // walk the body. The var is invisible after the loop
             // ends.
-            StmtKind::Sigma { var, source, body } => {
+            StmtKind::Sigma { label, var, source, body } => {
                 self.walk_expr(source);
                 self.push_scope();
                 self.declare(LocalBinding {
@@ -1209,33 +1281,29 @@ impl<'a> Walker<'a> {
                 });
                 // Slice 17: increment loop depth so `break;` /
                 // `continue;` in the body resolve. Decrement on
-                // exit. Nested sigmas stack naturally because the
-                // counter is monotone in/out.
+                // exit.
                 self.loop_depth += 1;
+                // Slice 27: push the loop's label (or None) so
+                // labelled `break 'name;` / `continue 'name;`
+                // statements can validate their target.
+                self.loop_labels.push(label.clone());
                 for s in &body.stmts {
                     self.walk_stmt(s);
                 }
+                self.loop_labels.pop();
                 self.loop_depth -= 1;
                 self.pop_scope();
             }
-            // Slice 17: `break;` / `continue;` — only valid
-            // lexically nested inside a `sigma` body. Otherwise
-            // E0411.
-            StmtKind::Break => {
-                if self.loop_depth == 0 {
-                    self.errors.push(ResolveError::KeywordOutsideLoop {
-                        keyword: "break",
-                        at: stmt.span.start,
-                    });
-                }
+            // Slices 17+27: `break;` / `continue;` (with
+            // optional `'label` per slice 27) — must be
+            // lexically nested inside a `sigma` body (E0411).
+            // If labelled, the label must appear on some
+            // enclosing `sigma 'label …` loop (E0415).
+            StmtKind::Break { label } => {
+                self.check_loop_keyword("break", label.as_deref(), stmt.span.start);
             }
-            StmtKind::Continue => {
-                if self.loop_depth == 0 {
-                    self.errors.push(ResolveError::KeywordOutsideLoop {
-                        keyword: "continue",
-                        at: stmt.span.start,
-                    });
-                }
+            StmtKind::Continue { label } => {
+                self.check_loop_keyword("continue", label.as_deref(), stmt.span.start);
             }
             // Slice 18 (Decision #12): `#flush Name;` — commit
             // a `#staged` automaton's shadow state. Two checks:
@@ -3079,6 +3147,87 @@ mod tests {
                 if automaton == "Counter" && field == "bogus"
         ));
         assert!(saw, "expected E0405 UnknownField for `Counter.bogus`; got {errors:?}");
+    }
+
+    // ─── Slice 27: labelled break/continue (E0415 UnknownLoopLabel) ──────
+
+    #[test]
+    fn labelled_break_resolves_to_outer_loop() {
+        let src = "\
+            @fn t() {\n  \
+              sigma 'outer i in 0u32..4u32 {\n    \
+                sigma j in 0u32..4u32 {\n      \
+                  break 'outer;\n    \
+                }\n  \
+              }\n  \
+              return;\n\
+            }\n\
+        ";
+        let _ = resolve_str(src).expect("labelled break should resolve");
+    }
+
+    #[test]
+    fn labelled_continue_resolves_to_outer_loop() {
+        let src = "\
+            @fn t() {\n  \
+              sigma 'outer i in 0u32..4u32 {\n    \
+                sigma j in 0u32..4u32 {\n      \
+                  continue 'outer;\n    \
+                }\n  \
+              }\n  \
+              return;\n\
+            }\n\
+        ";
+        let _ = resolve_str(src).expect("labelled continue should resolve");
+    }
+
+    #[test]
+    fn unknown_label_is_e0415() {
+        let src = "\
+            @fn t() {\n  \
+              sigma 'outer i in 0u32..4u32 {\n    \
+                break 'inner;\n  \
+              }\n  \
+              return;\n\
+            }\n\
+        ";
+        let errors = resolve_str(src).expect_err("expected E0415");
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            ResolveError::UnknownLoopLabel { keyword: "break", label, .. }
+                if label == "inner"
+        ));
+        assert!(saw, "expected E0415 for `break 'inner`; got {errors:?}");
+    }
+
+    #[test]
+    fn labelled_break_outside_any_loop_is_e0415_not_e0411() {
+        // A labelled break in a callable with no open sigma
+        // loops surfaces E0415 (the label is the more
+        // specific signal of intent), not E0411.
+        let src = "@fn t() { break 'gone; }";
+        let errors = resolve_str(src).expect_err("expected E0415");
+        let saw_e0415 = errors.iter().any(|e| matches!(
+            e,
+            ResolveError::UnknownLoopLabel { label, .. } if label == "gone"
+        ));
+        assert!(saw_e0415, "expected E0415; got {errors:?}");
+    }
+
+    #[test]
+    fn unlabelled_break_inside_inner_unlabelled_loop_still_resolves() {
+        // Sanity regression: slice-17 unlabelled `break;` in a
+        // nested unlabelled sigma still resolves under the
+        // slice-27 stack-based machinery.
+        let src = "\
+            @fn t() {\n  \
+              sigma i in 0u32..4u32 {\n    \
+                sigma j in 0u32..4u32 { break; }\n  \
+              }\n  \
+              return;\n\
+            }\n\
+        ";
+        let _ = resolve_str(src).expect("unlabelled break should still resolve");
     }
 
     // ─── Slice 24: `@shadow` resolution (E0414 ShadowOnNonStaged) ────────

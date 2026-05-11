@@ -1366,6 +1366,16 @@ pub enum StmtKind {
     /// (`sigma x in &arr`) forms in §5.8 land in subsequent slices
     /// once slice-indexing infrastructure is in place.
     Sigma {
+        /// Slice 27: optional Rust-style loop label.
+        /// `Some("outer")` for `sigma 'outer i in lo..hi { … }`;
+        /// `None` for the default `sigma i in lo..hi { … }` form.
+        /// The label is stored without the leading apostrophe.
+        /// Consumed by `break 'outer;` / `continue 'outer;`
+        /// statements to target this loop from a nested
+        /// position. Anonymous (no-label) loops can only be
+        /// targeted by unlabelled `break;` / `continue;` which
+        /// always pick the innermost loop.
+        label: Option<String>,
         /// The loop variable's source name.
         var: String,
         /// The range source — typed as `ExprKind::Range` after
@@ -1416,7 +1426,17 @@ pub enum StmtKind {
     /// v0.2-ι scope: only valid inside `sigma` loops. A future
     /// slice may extend to `loop`/`while` once those keywords
     /// have AST nodes.
-    Break,
+    ///
+    /// Slice 27: optional `label` field targets a non-innermost
+    /// `sigma` loop. `None` = innermost (slice-17 default);
+    /// `Some(name)` = the enclosing `sigma` whose own `label`
+    /// matches. Resolver E0415 fires if no enclosing loop has
+    /// the named label.
+    Break {
+        /// The labelled target loop, if any. The label is
+        /// stored without the leading apostrophe.
+        label: Option<String>,
+    },
 
     /// `continue;` — skip to the next iteration of the
     /// innermost enclosing `sigma` loop. Resolver enforces
@@ -1433,7 +1453,14 @@ pub enum StmtKind {
     /// rather than directly to the header. See
     /// `crates/codegen/src/lib.rs::emit_sigma` for the
     /// emission shape.
-    Continue,
+    ///
+    /// Slice 27: optional `label` field targets a non-innermost
+    /// `sigma` loop, same semantics as `Break`. Resolver E0415
+    /// fires for unknown labels.
+    Continue {
+        /// The labelled target loop, if any.
+        label: Option<String>,
+    },
 
     /// `#flush Name;` — commit a `#staged` automaton's shadow
     /// state into its live state (Decision #12, v0.2).
