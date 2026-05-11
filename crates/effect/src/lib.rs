@@ -1111,6 +1111,14 @@ fn walk_expr_for_reads(
         // recursively because `automaton`/`field` are bare
         // identifiers in the AST, not nested expressions.
         ExprKind::Snapshot { .. } => {}
+        // Slice 24: `@shadow Auto.field` — pending shadow
+        // read of a `#staged` automaton. Like `@snapshot`,
+        // the user has explicitly opted into a race-free read
+        // boundary (the shadow is a private buffer until
+        // `#flush`); we don't record it in the
+        // race-detectable read set. The resolver enforces the
+        // staged-only invariant (E0414).
+        ExprKind::Shadow { .. } => {}
         // `Auto@state` reads the state-tag — for v0.2-β we treat
         // this as a read of an implicit "tag" pseudo-field of the
         // automaton. Today the tag isn't a named field in the

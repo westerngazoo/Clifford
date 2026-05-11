@@ -1966,6 +1966,14 @@ impl<'a> Emitter<'a> {
             ExprKind::Snapshot { automaton, field } => {
                 self.emit_snapshot(automaton, field)
             }
+            // Slice 24 (Decision #12): `@shadow Auto.field`
+            // reads from `@<Auto>.shadow` (the pending shadow
+            // global) instead of `@<Auto>.state`. Same
+            // single-word constraint as `@snapshot` — the load
+            // must be atomic at the IR level.
+            ExprKind::Shadow { automaton, field } => {
+                self.emit_shadow(automaton, field)
+            }
             // Slice 5: indexed read on an automaton-array field.
             // `Counter.buf[3]` parses as
             // `Index { obj: FieldAccess(Path([Counter]), "buf"), index: 3 }`.
@@ -3194,6 +3202,88 @@ impl<'a> Emitter<'a> {
         self.emit_field_access_by_name(&auto_name, field)
     }
 
+    /// Slice 24 (Decision #12): lower `@shadow Auto.field` to a
+    /// load from the shadow global rather than live state.
+    ///
+    /// The IR is a GEP into `@<Auto>.shadow` plus a `load`. We
+    /// reuse the same atomicity restriction as `@snapshot`: the
+    /// loaded field must be a single-word primitive so the load
+    /// is one hardware instruction. Aggregate fields surface
+    /// `NotYetImplemented` (same path as snapshot).
+    ///
+    /// The shadow global only exists for `#staged` automata —
+    /// the resolver enforces this via **E0414** before we get
+    /// here. If the registered automaton's `is_staged` flag is
+    /// `false`, we emit a defensive `NotYetImplemented` (the
+    /// resolver should have rejected this; the codegen error is
+    /// a defence-in-depth).
+    fn emit_shadow(
+        &mut self,
+        automaton: &str,
+        field: &str,
+    ) -> Result<String, CodegenError> {
+        // Resolve `Self` like `emit_snapshot` does.
+        let auto_name: String = if automaton == "Self" {
+            self.enclosing_owner
+                .clone()
+                .ok_or(CodegenError::NotYetImplemented {
+                    what: "@shadow Self.field outside a #transition body",
+                })?
+        } else {
+            automaton.to_owned()
+        };
+
+        // Look up the field's IR type and check the staged
+        // invariant.
+        let (ir_ty, idx, is_staged) = {
+            let info = self.automatons.get(&auto_name).ok_or_else(|| {
+                CodegenError::UnresolvedName {
+                    name: auto_name.clone(),
+                }
+            })?;
+            let (raw_idx, ty) = info
+                .fields
+                .iter()
+                .enumerate()
+                .find_map(|(i, (n, t, _))| {
+                    if n == field {
+                        Some((i, t.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| CodegenError::UnresolvedName {
+                    name: format!("{auto_name}.{field}"),
+                })?;
+            (ty, info.llvm_field_index(raw_idx), info.is_staged)
+        };
+
+        if !is_staged {
+            return Err(CodegenError::NotYetImplemented {
+                what: "@shadow on a non-staged automaton (resolver should have caught this; please file a bug)",
+            });
+        }
+        if !is_primitive_ir_ty_for_snapshot(&ir_ty) {
+            return Err(CodegenError::NotYetImplemented {
+                what: "@shadow of non-primitive field (aggregate types tear at the load level)",
+            });
+        }
+
+        // GEP into `@<Auto>.shadow` then load. Same shape as
+        // `emit_field_load`'s `Struct` arm except the global
+        // pointer is the shadow.
+        let struct_name = format!("%struct.{auto_name}");
+        let ptr = self.fresh_value();
+        writeln!(
+            &mut self.out,
+            "  {ptr} = getelementptr {struct_name}, {struct_name}* @{auto_name}.shadow, i32 0, i32 {idx}",
+        )
+        .ok();
+        let val = self.fresh_value();
+        writeln!(&mut self.out, "  {val} = load {ir_ty}, {ir_ty}* {ptr}").ok();
+        Ok(val)
+    }
+
     /// Emit an SSA-binding identity instruction so a value gets a
     /// stable name. For integer types we use `add ty 0, v`; for
     /// floats `fadd ty 0.0, v`. LLVM's optimiser flattens these
@@ -4066,6 +4156,7 @@ const fn expr_kind_name(e: &ExprKind) -> &'static str {
         ExprKind::Path(_) => "path expression",
         ExprKind::StateRead(_) => "Auto@state expression",
         ExprKind::Snapshot { .. } => "@snapshot expression",
+        ExprKind::Shadow { .. } => "@shadow expression",
         ExprKind::Paren(_) => "parenthesised expression",
         ExprKind::Tuple(_) => "tuple expression",
         ExprKind::Array(_) => "array literal",
@@ -8344,6 +8435,83 @@ mod tests {
         assert!(
             ir.contains("; audit-wrap site for Buf (volatile_store) ; Decision #18"),
             "expected indexed-RB write marker; got:\n{ir}"
+        );
+    }
+
+    // ─── Slice 24: `@shadow Auto.field` codegen (Decision #12) ──────────
+
+    #[test]
+    fn s24_shadow_reads_from_shadow_global() {
+        // `@shadow S.v` lowers to a GEP into `@S.shadow` plus a
+        // load — distinct from `@snapshot S.v` which loads
+        // from `@S.state` (live).
+        let src = "\
+            #staged #automaton S { v: u32; }\n\
+            @fn read_v() -> u32 $ [Readable] { return @shadow S.v; }\n\
+        ";
+        let ir = lower_str(src).expect("lower @shadow");
+        assert!(
+            ir.contains("getelementptr %struct.S, %struct.S* @S.shadow, i32 0, i32 0"),
+            "expected GEP into @S.shadow; got:\n{ir}"
+        );
+        // Sanity: must NOT read from live state.
+        assert!(
+            !ir.contains("@S.state, i32 0, i32 0"),
+            "must not read from @S.state; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s24_snapshot_still_reads_from_live() {
+        // Regression check: `@snapshot` keeps the slice-ζ
+        // behavior of reading from `.state`, regardless of
+        // whether the target is `#staged`.
+        let src = "\
+            #staged #automaton S { v: u32; }\n\
+            @fn read_v() -> u32 $ [Readable] { return @snapshot S.v; }\n\
+        ";
+        let ir = lower_str(src).expect("lower @snapshot on staged");
+        assert!(
+            ir.contains("getelementptr %struct.S, %struct.S* @S.state, i32 0, i32 0"),
+            "expected GEP into @S.state; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s24_shadow_and_snapshot_yield_distinct_pointers() {
+        // Same field accessed both ways in one function. Two
+        // GEPs — one to .shadow, one to .state — and two loads.
+        let src = "\
+            #staged #automaton S { v: u32; }\n\
+            @fn delta() -> u32 $ [Readable] {\n  \
+              let live: u32 = @snapshot S.v;\n  \
+              let pending: u32 = @shadow S.v;\n  \
+              return pending;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower mixed shadow + snapshot");
+        assert!(
+            ir.contains("@S.state, i32 0, i32 0"),
+            "expected GEP into @S.state for snapshot; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("@S.shadow, i32 0, i32 0"),
+            "expected GEP into @S.shadow for shadow; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s24_shadow_field_at_nonzero_index() {
+        // Multi-field staged automaton — confirm the shadow GEP
+        // uses the correct field index.
+        let src = "\
+            #staged #automaton M { a: u32; b: u32; c: u32; }\n\
+            @fn read_b() -> u32 $ [Readable] { return @shadow M.b; }\n\
+        ";
+        let ir = lower_str(src).expect("lower @shadow at idx 1");
+        assert!(
+            ir.contains("getelementptr %struct.M, %struct.M* @M.shadow, i32 0, i32 1"),
+            "expected shadow GEP at idx 1 (field b); got:\n{ir}"
         );
     }
 

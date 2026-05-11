@@ -1026,6 +1026,39 @@ pub enum ExprKind {
         field: String,
     },
 
+    /// `@shadow Auto.field` — read the *pending shadow* value of a
+    /// `#staged` automaton's field (Decision #12, slice 24).
+    ///
+    /// `@snapshot Auto.field` always reads from the committed
+    /// live state. `@shadow Auto.field` instead reads from the
+    /// shadow global where `#mutate`/`Auto.field <op>= …` writes
+    /// have been buffered since the last `#flush`. Useful for
+    /// "did the producer start filling this buffer?" ISR
+    /// introspection without observing partially-committed
+    /// state through the live path.
+    ///
+    /// **Resolver enforcement (E0414 `ShadowOnNonStaged`):**
+    /// the target automaton must be `#staged`. The check is
+    /// strict because the shadow global only exists for staged
+    /// automata; reading `@shadow Counter.value` against a
+    /// non-staged `Counter` would have no observable
+    /// difference from `@snapshot Counter.value` and is almost
+    /// certainly user error.
+    ///
+    /// **Codegen contract:** lowers to the same GEP + load
+    /// pattern as `@snapshot`, except the global pointer is
+    /// `@<Auto>.shadow` instead of `@<Auto>.state`. No fence
+    /// is inserted — the shadow's writes are already ordered
+    /// against the reader on a single core; cross-core
+    /// readers need an explicit `Acquire` trait on the
+    /// enclosing callable.
+    Shadow {
+        /// The `#staged` automaton being read from.
+        automaton: String,
+        /// The field being read.
+        field: String,
+    },
+
     /// Parenthesised single expression. Distinguished from a 1-tuple
     /// (which doesn't exist; use `Tuple(vec![one])` only for ≥ 2 elements).
     /// Preserved so round-tripping reproduces source.

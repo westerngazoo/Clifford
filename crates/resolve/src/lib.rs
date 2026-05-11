@@ -255,6 +255,36 @@ pub enum ResolveError {
         /// Byte offset of the offending statement.
         at: usize,
     },
+
+    /// **E0414 ShadowOnNonStaged.** A `@shadow Auto.field`
+    /// expression names an automaton that was declared without
+    /// the `#staged` modifier.
+    ///
+    /// `@shadow` reads the pending shadow value of a `#staged`
+    /// automaton's field — a value that only exists when the
+    /// automaton was declared `#staged`. For a non-staged
+    /// automaton there is no shadow global, so the read would
+    /// be semantically meaningless (or, worse, would resolve to
+    /// the same address as `@snapshot` and silently produce
+    /// indistinguishable behaviour). The strict rejection is
+    /// the v0.2 stance; if a use case for "read live but call
+    /// it shadow" emerges, the rule can be relaxed.
+    ///
+    /// Companion to E0412 `FlushOnNonStaged` — both errors
+    /// guard the same invariant from opposite sides.
+    #[error(
+        "E0414: `@shadow {automaton}.{field}` targets a non-staged automaton at byte {at} \
+         (the shadow global only exists for `#staged #automaton` declarations; \
+         use `@snapshot {automaton}.{field}` for non-staged reads, or add `#staged`)"
+    )]
+    ShadowOnNonStaged {
+        /// The automaton named in the `@shadow` expression.
+        automaton: String,
+        /// Field accessed (carried for the error message).
+        field: String,
+        /// Byte offset of the offending expression.
+        at: usize,
+    },
 }
 
 /// Which kind of top-level item a [`Symbol`] refers to.
@@ -1382,6 +1412,59 @@ impl<'a> Walker<'a> {
                 } else {
                     self.require_automaton(automaton, expr.span);
                     self.require_field(automaton, field, expr.span);
+                }
+            }
+
+            // Slice 24 (Decision #12): `@shadow Auto.field`
+            // — pending shadow-read for `#staged` automata.
+            // Same checks as `@snapshot` (target must exist,
+            // field must exist, hidden-visibility enforced via
+            // `require_field`) PLUS the staged-only check
+            // (E0414 `ShadowOnNonStaged`). `Self.field` inside
+            // a transition resolves the owner from the
+            // enclosing context.
+            ExprKind::Shadow { automaton, field } => {
+                let resolved_owner = if automaton == "Self" {
+                    match &self.enclosing {
+                        Some(EnclosingContext {
+                            transition_of: Some(owner),
+                            ..
+                        }) => Some(owner.clone()),
+                        _ => {
+                            self.errors.push(ResolveError::NotAnAutomaton {
+                                name: "Self".to_owned(),
+                                at: expr.span.start,
+                                found: "undefined",
+                            });
+                            None
+                        }
+                    }
+                } else {
+                    Some(automaton.clone())
+                };
+                if let Some(owner) = resolved_owner {
+                    self.require_automaton(&owner, expr.span);
+                    self.require_field(&owner, field, expr.span);
+                    // Staged-only check: the shadow global
+                    // only exists for `#staged` automata, so
+                    // `@shadow` against a non-staged target is
+                    // user error.
+                    match self.lookup_automaton_staged(&owner) {
+                        Some(true) => {
+                            // Happy path — staged, shadow exists.
+                        }
+                        Some(false) => {
+                            self.errors.push(ResolveError::ShadowOnNonStaged {
+                                automaton: owner,
+                                field: field.clone(),
+                                at: expr.span.start,
+                            });
+                        }
+                        None => {
+                            // `require_automaton` already pushed
+                            // `NotAnAutomaton`; don't double-report.
+                        }
+                    }
                 }
             }
 
@@ -2996,6 +3079,54 @@ mod tests {
                 if automaton == "Counter" && field == "bogus"
         ));
         assert!(saw, "expected E0405 UnknownField for `Counter.bogus`; got {errors:?}");
+    }
+
+    // ─── Slice 24: `@shadow` resolution (E0414 ShadowOnNonStaged) ────────
+
+    #[test]
+    fn shadow_on_staged_automaton_resolves() {
+        let src = "\
+            #staged #automaton S { v: u32; } \
+            @fn read_v() -> u32 $ [Readable] { return @shadow S.v; }\
+        ";
+        let _ = resolve_str(src).expect("@shadow on staged automaton should resolve");
+    }
+
+    #[test]
+    fn shadow_on_non_staged_automaton_is_e0414() {
+        let src = "\
+            #automaton P { v: u32; } \
+            @fn read_v() -> u32 $ [Readable] { return @shadow P.v; }\
+        ";
+        let errors = resolve_str(src).expect_err("expected ShadowOnNonStaged");
+        let saw = errors.iter().any(|e| matches!(
+            e,
+            ResolveError::ShadowOnNonStaged { automaton, field, .. }
+                if automaton == "P" && field == "v"
+        ));
+        assert!(saw, "expected E0414 for `@shadow P.v`; got {errors:?}");
+    }
+
+    #[test]
+    fn shadow_of_unknown_automaton_pushes_not_an_automaton() {
+        // `@shadow Bogus.v` — Bogus doesn't resolve. The
+        // existing `require_automaton` machinery emits
+        // `NotAnAutomaton`; we don't duplicate that as E0414.
+        let src = "@fn r() -> u32 $ [Readable] { return @shadow Bogus.v; }";
+        let errors = resolve_str(src).expect_err("expected an error");
+        let saw_not_auto = errors.iter().any(|e| matches!(
+            e,
+            ResolveError::NotAnAutomaton { name, .. } if name == "Bogus"
+        ));
+        let saw_e0414 = errors.iter().any(|e| matches!(
+            e,
+            ResolveError::ShadowOnNonStaged { .. }
+        ));
+        assert!(saw_not_auto, "expected NotAnAutomaton for `Bogus`; got {errors:?}");
+        assert!(
+            !saw_e0414,
+            "must not double-report E0414 alongside NotAnAutomaton; got {errors:?}"
+        );
     }
 
     #[test]
