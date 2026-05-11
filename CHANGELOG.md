@@ -7,6 +7,38 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 31: Reject duplicate nested sigma-loop labels (E0416) (2026-05-09)
+
+Closes the slice-27 deferred "label collision rejection"
+gap. A `sigma 'L … { sigma 'L … { … } }` pattern (an
+inner labelled loop shadowing an outer with the same
+label) is almost always user error rather than intent —
+Rust treats it as a warning; Clifford treats it as a hard
+error to keep the surface tight.
+
+**Resolver change (`crates/resolve/src/lib.rs`):**
+
+- New `ResolveError::DuplicateLoopLabel { label, at }`
+  variant (E0416).
+- The `Sigma` walking arm checks for the new label
+  against the currently-open `loop_labels` stack
+  *before* pushing — if the name is already present, an
+  E0416 is recorded.
+- Sibling same-label loops (one closes before the next
+  opens) are NOT a duplicate: the outer is popped from
+  the stack first, so the second `sigma 'L` finds an
+  empty slot.
+
+**Tests added (2 resolver):**
+
+- `duplicate_nested_loop_label_is_e0416` — confirms
+  the inner shadowing surfaces E0416.
+- `sibling_same_label_sigmas_resolve` — regression
+  check that sibling same-label loops still work.
+  (Note: labels must be ≥2 chars per the lexer's
+  label/char-lit disambiguation; `'l` would lex as a
+  char-literal start.)
+
 ### Added — Slice 30: lexer label/char-lit disambiguation hardening tests (2026-05-09)
 
 Slice 27 introduced the `'label` token and the heuristic
