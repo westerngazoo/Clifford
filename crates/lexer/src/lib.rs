@@ -2095,6 +2095,135 @@ mod tests {
         ));
     }
 
+    // ─── Slice 30: lexer label/char-lit disambiguation hardening ─────────
+
+    #[test]
+    fn label_basic_lexes_to_label_token() {
+        assert_eq!(
+            kinds("'outer 'inner_loop 'a1"),
+            vec![
+                TokenKind::Label("outer".into()),
+                TokenKind::Label("inner_loop".into()),
+                TokenKind::Label("a1".into()),
+                TokenKind::Eof,
+            ],
+        );
+    }
+
+    #[test]
+    fn label_with_underscore_start_lexes() {
+        // `_x` is a valid ident; `'_x` should lex as Label("_x").
+        assert_eq!(
+            kinds("'_outer 'a_b_c"),
+            vec![
+                TokenKind::Label("_outer".into()),
+                TokenKind::Label("a_b_c".into()),
+                TokenKind::Eof,
+            ],
+        );
+    }
+
+    #[test]
+    fn single_char_literal_still_lexes_as_char() {
+        // `'a'` and `'_'` are single-char literals — peek(2) is
+        // the closing apostrophe (not ident-continue), so the
+        // disambiguation correctly picks the char-literal path.
+        assert_eq!(
+            kinds("'a' '_' 'Z'"),
+            vec![
+                TokenKind::CharLiteral('a'),
+                TokenKind::CharLiteral('_'),
+                TokenKind::CharLiteral('Z'),
+                TokenKind::Eof,
+            ],
+        );
+    }
+
+    #[test]
+    fn escape_sequences_still_lex_as_char_literals() {
+        // `'\n'` etc. — peek(1)=`\\` fails the alpha test,
+        // so the disambiguation falls through to the char-
+        // literal path. Regression-safety after slice 27.
+        assert_eq!(
+            kinds(r"'\n' '\t' '\r' '\\' '\'' '\0'"),
+            vec![
+                TokenKind::CharLiteral('\n'),
+                TokenKind::CharLiteral('\t'),
+                TokenKind::CharLiteral('\r'),
+                TokenKind::CharLiteral('\\'),
+                TokenKind::CharLiteral('\''),
+                TokenKind::CharLiteral('\0'),
+                TokenKind::Eof,
+            ],
+        );
+    }
+
+    #[test]
+    fn label_followed_by_punctuation_terminates_correctly() {
+        // `'outer;` → Label("outer"), Semi. The ident-
+        // continue scan stops at `;`.
+        assert_eq!(
+            kinds("'outer;"),
+            vec![
+                TokenKind::Label("outer".into()),
+                TokenKind::Semi,
+                TokenKind::Eof,
+            ],
+        );
+    }
+
+    #[test]
+    fn break_with_label_round_trips_through_lexer() {
+        // The realistic slice-27 surface: `break 'outer;` and
+        // `continue 'outer;` should produce the right token
+        // sequence so the parser can handle them.
+        assert_eq!(
+            kinds("break 'outer;"),
+            vec![
+                TokenKind::KwBreak,
+                TokenKind::Label("outer".into()),
+                TokenKind::Semi,
+                TokenKind::Eof,
+            ],
+        );
+        assert_eq!(
+            kinds("continue 'inner;"),
+            vec![
+                TokenKind::KwContinue,
+                TokenKind::Label("inner".into()),
+                TokenKind::Semi,
+                TokenKind::Eof,
+            ],
+        );
+    }
+
+    #[test]
+    fn sigma_with_label_round_trips_through_lexer() {
+        // The label-source position after `sigma`: `sigma
+        // 'outer i in 0..n { … }`.
+        assert_eq!(
+            kinds("sigma 'outer i in"),
+            vec![
+                TokenKind::KwSigma,
+                TokenKind::Label("outer".into()),
+                TokenKind::Ident("i".into()),
+                TokenKind::KwIn,
+                TokenKind::Eof,
+            ],
+        );
+    }
+
+    #[test]
+    fn two_char_label_lexes() {
+        // Smallest valid label: 2 ident chars (one start +
+        // one continue). `'ab` — confirms the heuristic
+        // accepts the minimum-length label.
+        assert_eq!(
+            kinds("'ab"),
+            vec![TokenKind::Label("ab".into()), TokenKind::Eof],
+        );
+    }
+
     #[test]
     fn ident_starting_with_b_is_not_byte_literal() {
         // `b` followed by `'` → byte literal. `b` followed by anything
