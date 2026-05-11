@@ -7,6 +7,88 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 24: `@shadow Auto.field` operator (Decision #12) (2026-05-09)
+
+Adds the symmetric companion to `@snapshot` for `#staged`
+automata. `@snapshot S.field` always reads from the
+committed live state at `@S.state`; `@shadow S.field`
+instead reads from the in-flight shadow at `@S.shadow` where
+`#mutate` writes have been buffered since the last `#flush`.
+Useful for ISR-side introspection patterns like "did the
+producer task start filling this buffer?" without observing
+partially-committed state through the live path.
+
+**Surface syntax:**
+
+```clifford
+#staged #automaton Pose { x: i32; y: i32; theta: i32; }
+
+@fn pending_x() -> i32 $ [Readable] {
+  return @shadow Pose.x;
+}
+
+@fn delta_x() -> i32 $ [Readable] {
+  return @shadow Pose.x - @snapshot Pose.x;
+}
+```
+
+**Resolver enforcement (E0414 `ShadowOnNonStaged`):** the
+target automaton must be declared `#staged`. The shadow
+global only exists for staged automata; reading
+`@shadow Counter.value` against a non-staged `Counter`
+would be semantically indistinguishable from `@snapshot
+Counter.value` and is almost certainly user error.
+
+**Pipeline:**
+
+- **Lexer:** new `KwAtShadow` token recognising the
+  `@shadow` keyword.
+- **AST:** new `ExprKind::Shadow { automaton, field }`
+  variant, paralleling `ExprKind::Snapshot`.
+- **Parser:** new `parse_shadow_expr` dispatched from the
+  primary-expression entry. Same grammar as `@snapshot` —
+  `@shadow <Ident-or-Self>.<Ident>`. Four new parser
+  tests cover happy-path, `Self` target, missing dot, and
+  missing field.
+- **Resolver:** new `ExprKind::Shadow` arm runs the same
+  automaton + field existence checks as `Snapshot`, plus
+  the staged-only check (`lookup_automaton_staged` from
+  slice 18). Three new resolver tests cover the happy
+  path, E0414, and the no-double-report invariant when
+  the target is unknown.
+- **Types:** `Shadow` shares typing with `Snapshot` —
+  yields an owned copy of the field's declared type. Both
+  variants count toward the `Readable`-row gate (ADR
+  0003).
+- **Check:** `Shadow` is a no-op for the slice-2β
+  redundancy check (we deliberately defer the
+  `@shadow Self.field` redundancy check pending real
+  firmware usage patterns).
+- **Effect:** `Shadow` is excluded from `actual_reads`
+  the same way `Snapshot` is — both are explicit
+  boundary-crossing reads where the user has taken
+  responsibility for the load semantics.
+- **Codegen:** new `emit_shadow(automaton, field)` mirrors
+  `emit_snapshot` but emits the GEP against
+  `@<Auto>.shadow` instead of `@<Auto>.state`. Same
+  single-word atomicity constraint applies. Four new
+  codegen tests cover the shadow-side GEP, the snapshot
+  regression (still reads live), distinct pointers in
+  one function, and indexed access at non-zero field
+  index.
+
+**11 new tests total** (4 parser, 3 resolver, 4 codegen).
+
+**Deliberately NOT in slice 24:**
+
+- **No `@shadow Self.field` redundancy check.** The
+  symmetric `@snapshot Self.field` is caught as a
+  redundancy at check-time; the `@shadow` symmetric case
+  is deferred until concrete usage patterns surface.
+- **No composite paths.** Single field access only;
+  `@shadow Auto.field[i]` and `@shadow Auto.sub.field`
+  are out of scope (same as `@snapshot` per ADR 0004 Q3).
+
 ### Added — Slice 23: audit markers on register-block volatile loads/stores (2026-05-09)
 
 Closes the most-firmware-relevant remaining gap in the

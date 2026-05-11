@@ -1581,7 +1581,11 @@ impl SnapshotFinder {
             return;
         }
         match &expr.kind {
-            ExprKind::Snapshot { .. } => {
+            ExprKind::Snapshot { .. } | ExprKind::Shadow { .. } => {
+                // Slice 24: `@shadow` is treated the same as
+                // `@snapshot` for the `Readable`-row gate (ADR
+                // 0003); both are boundary-crossing reads from
+                // automaton state.
                 self.found_at = Some(expr.span.start);
             }
             ExprKind::Call { callee, args } => {
@@ -1996,6 +2000,22 @@ impl<'a> Inferer<'a> {
                 .and_then(|fs| fs.get(field).cloned())
                 .unwrap_or(Type::Unknown(
                     "snapshot of unresolved automaton/field (resolver reported)",
+                )),
+
+            // Slice 24: `@shadow` shares its typing with
+            // `@snapshot` — yields an owned copy of the named
+            // field's value. The fact that the load comes from
+            // the shadow global rather than live state is a
+            // codegen-only distinction; types see the same
+            // field-declared type. Resolver E0414 has already
+            // rejected non-staged targets; we don't double-
+            // report here.
+            ExprKind::Shadow { automaton, field } => self
+                .automaton_field_types
+                .get(automaton)
+                .and_then(|fs| fs.get(field).cloned())
+                .unwrap_or(Type::Unknown(
+                    "shadow of unresolved automaton/field (resolver reported)",
                 )),
 
             ExprKind::Paren(inner) => self.infer_expr(inner),

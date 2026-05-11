@@ -701,6 +701,17 @@ impl<'a, 'errs> SelfSnapshotScanner<'a, 'errs> {
                     });
                 }
             }
+            // Slice 24: `@shadow` inside an imperative
+            // transition body is fine for `Self` (an ISR-style
+            // transition can introspect its own pending state)
+            // — but the same redundancy check that applies to
+            // `@snapshot Self.field` would fire here. v0.2
+            // scope: defer the `@shadow Self.field` redundancy
+            // check to a follow-up slice (the symmetric one
+            // doesn't have established usage patterns yet).
+            // For now, recursing into the AST is a no-op; the
+            // resolver already rejected non-staged targets.
+            ExprKind::Shadow { .. } => {}
             ExprKind::Call { callee, args } => {
                 self.walk_expr(callee);
                 for a in args {

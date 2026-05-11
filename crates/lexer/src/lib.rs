@@ -267,6 +267,14 @@ pub enum TokenKind {
     /// (Decision #24 / ADR 0004). Expression form; carries an
     /// owned copy of the field's value across the `#`/`@` boundary.
     KwAtSnapshot,
+    /// `@shadow Auto.field` pending-shadow-read operator for
+    /// `#staged` automata (Decision #12, slice 24). Reads the
+    /// in-flight value from the shadow global rather than the
+    /// committed live state — useful for ISR-side introspection
+    /// like "did the producer start filling the buffer?" before
+    /// the `#flush` lands. Resolver enforces that the target is
+    /// a `#staged` automaton (E0414).
+    KwAtShadow,
 
     // ─ Composite sigils ─────────────────────────────────────────────────────
     /// `#>` effect-procedure call operator (Decision #3)
@@ -1129,6 +1137,9 @@ impl<'src> Lexer<'src> {
             "partial" => TokenKind::KwAtPartial,
             // Decision #24 / ADR 0004 — boundary-crossing read operator
             "snapshot" => TokenKind::KwAtSnapshot,
+            // Decision #12 / slice 24 — pending shadow-read operator
+            // for `#staged` automata.
+            "shadow" => TokenKind::KwAtShadow,
             other => {
                 return Err(LexError::UnknownAtForm {
                     name: other.to_owned(),

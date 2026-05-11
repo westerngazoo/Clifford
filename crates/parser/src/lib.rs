@@ -2719,6 +2719,11 @@ impl<'t> Parser<'t> {
             TokenKind::KwHashUncheckedOffset => self.parse_unchecked_offset_expr(start),
             // Decision #24 / ADR 0004 — `@snapshot Auto.field` boundary read.
             TokenKind::KwAtSnapshot => self.parse_snapshot_expr(start),
+            // Slice 24 (Decision #12): `@shadow Auto.field` reads
+            // the pending shadow value of a `#staged` automaton.
+            // Resolver enforces that the target is `#staged`
+            // (E0414); the parser only checks the grammar.
+            TokenKind::KwAtShadow => self.parse_shadow_expr(start),
             TokenKind::Eof => Err(ParseError::UnexpectedEof {
                 context: "expression",
             }),
@@ -3049,6 +3054,40 @@ impl<'t> Parser<'t> {
         let (field, field_span) = self.expect_ident("field name after `.` in `@snapshot`")?;
         Ok(Expr {
             kind: ExprKind::Snapshot { automaton, field },
+            span: Span::new(start, field_span.end),
+        })
+    }
+
+    /// Parse `@shadow Auto.field` per slice 24 (Decision #12).
+    /// Mirrors `parse_snapshot_expr` exactly at the grammar
+    /// level — only the resolver and codegen differ (E0414
+    /// rejects non-staged targets; codegen reads from the
+    /// shadow global instead of live state).
+    fn parse_shadow_expr(&mut self, start: usize) -> Result<Expr, ParseError> {
+        self.advance(); // `@shadow`
+        let tok = self.peek().clone();
+        let automaton = match tok.kind {
+            TokenKind::Ident(s) => {
+                self.advance();
+                s
+            }
+            TokenKind::KwSelfType => {
+                self.advance();
+                "Self".to_owned()
+            }
+            other => {
+                return Err(ParseError::Expected {
+                    expected:
+                        "automaton name or `Self` after `@shadow` (e.g. `@shadow Pose.x`)",
+                    found: other,
+                    at: tok.span.start,
+                });
+            }
+        };
+        self.expect(TokenKind::Dot, "`.` between automaton name and field in `@shadow`")?;
+        let (field, field_span) = self.expect_ident("field name after `.` in `@shadow`")?;
+        Ok(Expr {
+            kind: ExprKind::Shadow { automaton, field },
             span: Span::new(start, field_span.end),
         })
     }
@@ -6849,6 +6888,52 @@ mod tests {
         assert!(
             msg.contains("#automaton"),
             "expected error to mention #automaton; got: {msg}"
+        );
+    }
+
+    // ─── Slice 24: `@shadow Auto.field` operator (Decision #12) ──────────
+
+    #[test]
+    fn shadow_expr_parses_with_path() {
+        let e = parse_expr_str("@shadow Pose.x").unwrap();
+        match e.kind {
+            ExprKind::Shadow { automaton, field } => {
+                assert_eq!(automaton, "Pose");
+                assert_eq!(field, "x");
+            }
+            other => panic!("expected Shadow, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn shadow_expr_with_self_target_parses() {
+        let e = parse_expr_str("@shadow Self.x").unwrap();
+        match e.kind {
+            ExprKind::Shadow { automaton, field } => {
+                assert_eq!(automaton, "Self");
+                assert_eq!(field, "x");
+            }
+            other => panic!("expected Shadow, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn shadow_missing_dot_errors() {
+        let err = parse_expr_str("@shadow Pose x").expect_err("missing dot");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("`.`") || msg.contains("Dot"),
+            "expected dot diagnostic; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn shadow_missing_field_errors() {
+        let err = parse_expr_str("@shadow Pose.").expect_err("missing field");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("field name") || msg.contains("Ident"),
+            "expected field-name diagnostic; got: {msg}"
         );
     }
 
