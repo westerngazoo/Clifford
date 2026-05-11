@@ -7,6 +7,60 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 29: end-to-end v0.2 firmware showcase sample (2026-05-09)
+
+`examples/v02_showcase.cl` — a single .cl file that
+exercises every v0.2 language addition together so the
+"v0.2 firmware story" is demonstrable in one compile.
+
+**What it covers:**
+
+- **Decision #12** — `#staged #automaton Pose { … }` +
+  `#flush Pose;` (slices 18-19)
+- **Decision #12** — `@shadow Pose.x` operator
+  (slice 24)
+- **Decision #18** — `#audit #automaton Uart { … }` with
+  audit markers on every register-block volatile op
+  (slices 20-23, 26)
+- **Decision #14 / slice 27** — labelled `sigma 'scan`
+  + `break 'scan;` for early-exit out of nested loops
+- **Decision #6** — register-block automaton with
+  `#address: 0x4000_4000;`
+- **Decision #9** — multi-state automaton (`#states:
+  [Booting, Running]`) with `#transition boot -> Running`
+  and a state-tag write that routes through the staged
+  shadow alongside the field updates
+- **Decision #22** — `$ [Release]` trait list emitting
+  a release fence before `ret`
+- **v0.2-ε `#atomic: interrupt_critical;`** wrapping an
+  ISR body with `cpsid i` / `cpsie i`
+
+**The cliffordc-CLI compile produces ~4.5 KB of LLVM IR
+exhibiting all of:**
+
+- Two globals per staged automaton (`@Pose.state` +
+  `@Pose.shadow`); one global per non-staged
+  (`@Counter.state` only)
+- The `@llvm.memcpy.p0.p0.i64` intrinsic declaration
+  (emitted exactly once, on demand, per slice 18)
+- Shadow-routed writes inside the ISR + boot transition
+- A flush memcpy that commits shadow → live in one go
+- `cpsid i` / `cpsie i` framing the ISR body
+- `; audit-wrap site for Uart (volatile_store) ; Decision #18`
+  marker at the UART status write
+- A labelled break correctly branching to
+  `%sigma.exit.0` (the outer loop) from the inner
+  loop's body, verifying slice 27's stack search
+- `@Pose.shadow` GEP for `@shadow`, `@Pose.state`
+  GEP for `@snapshot` — distinct paths in the same
+  function via `pending_x_diff`
+- The non-staged, non-audit `Counter` sibling produces
+  byte-identical IR to slice-17 baseline
+
+No new code — this slice is a single example file. Useful
+as a v0.2 release-post artifact and as a reference for
+contributors learning the surface.
+
 ### Documentation — Slice 28: Sync `docs/DECISIONS.md` with `#staged` + `#audit` implementation status (2026-05-09)
 
 Decisions #12 (`#staged`) and #18 (`#audit`) had been marked
