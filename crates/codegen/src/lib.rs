@@ -260,24 +260,31 @@ struct Emitter<'a> {
     /// `#transition` body. `None` outside of transitions. Used to
     /// resolve `Self.field` to the correct automaton.
     enclosing_owner: Option<String>,
-    /// Slice 21 (Decision #18): name of the audited automaton
-    /// whose transition body is currently being emitted, if any.
-    /// `Some(name)` ⇒ every unsafe-primitive emission site
-    /// (`#unchecked_load` / `#unchecked_store` /
-    /// `#unchecked_offset` / `#unchecked_cast` /
-    /// `#volatile_load` / `#volatile_store`) prepends a
-    /// `; audit-wrap site for <name>` IR comment indicating
-    /// where a debug-build `PointerAuditor` call would be
-    /// injected. `None` ⇒ no marker emitted; the unsafe op
-    /// lowers as before, byte-identical to slice-20 output.
+    /// Slice 21+26 (Decision #18): the audited owners for the
+    /// current callable, in source order. Empty ⇒ no audit
+    /// context; non-empty ⇒ every unsafe-primitive emission
+    /// site emits a `; audit-wrap site for <…>` IR marker.
     ///
-    /// The marker is established by [`Self::emit_audited_owner_if_needed`]
-    /// which is called at the top of `emit_automaton_transitions`'
-    /// per-transition loop (after the per-function reset, before
-    /// any body statements). Cleared by `reset_per_function_state`
-    /// so effects/interrupts (which run AFTER the transitions in
-    /// `lower`'s pass-3 loop) start with a fresh `None`.
-    current_audited_owner: Option<String>,
+    /// **Marker text format (slice 26):**
+    /// - 1 owner  → `audit-wrap site for X (kind)`
+    /// - ≥2 owners → `audit-wrap site for [X, Y] (kind)`
+    ///
+    /// The single-owner shape preserves slice-21/22 marker
+    /// substrings so existing tests / instrumentation
+    /// expectations stay valid; the bracketed list signals to
+    /// the future wrap pass that the wrap should dispatch
+    /// through every named `PointerAuditor` instance.
+    ///
+    /// **How it's set:**
+    /// - Transitions of an `#audit` automaton: pushed with
+    ///   `[Owner]` in `emit_transition`.
+    /// - Effects / interrupts: populated by
+    ///   `audited_in_mutates(&decl.mutates)` which preserves
+    ///   the source-order subset of `#mutates: [...]` whose
+    ///   members are `#audit`-marked.
+    ///
+    /// Cleared by `reset_per_function_state`.
+    current_audited_owners: Vec<String>,
     /// Decision #22 codegen consumer: when the current callable is
     /// marked `Release` / `SeqCst`, this carries the LLVM fence
     /// ordering that must be emitted **before each `ret`**. `None`
@@ -507,7 +514,7 @@ impl<'a> Emitter<'a> {
             automatons: HashMap::new(),
             transition_owners: HashMap::new(),
             enclosing_owner: None,
-            current_audited_owner: None,
+            current_audited_owners: Vec::new(),
             pending_exit_fence: None,
             pending_transition_tag_write: None,
             current_block: "entry".to_owned(),
@@ -785,14 +792,14 @@ impl<'a> Emitter<'a> {
     fn emit_effect(&mut self, decl: &EffectDecl) {
         // Reset per-function state.
         self.reset_per_function_state();
-        // Slice 22 (Decision #18): if this effect's `#mutates: [...]`
-        // names any audited automaton, set the audit context so
-        // every unsafe-primitive emission inside the body emits a
-        // `; audit-wrap site for <Owner>` IR comment. The first
-        // audited mutated automaton is used as the marker owner;
-        // see `first_audited_in_mutates` for the rationale.
-        // Cleared by the next `reset_per_function_state` call.
-        self.current_audited_owner = self.first_audited_in_mutates(&decl.mutates);
+        // Slices 22+26 (Decision #18): set the audit context to
+        // every `#audit`-marked automaton named in this effect's
+        // `#mutates: [...]`, in source order. Single-owner case
+        // produces a slice-22-style marker (`audit-wrap site for
+        // X`); multi-owner case produces a slice-26 bracketed
+        // list (`audit-wrap site for [X, Y]`). Cleared by the
+        // next `reset_per_function_state` call.
+        self.current_audited_owners = self.audited_in_mutates(&decl.mutates);
 
         let ret_ty = self.lower_return_type(decl.return_type.as_ref());
 
@@ -849,13 +856,14 @@ impl<'a> Emitter<'a> {
     fn emit_interrupt(&mut self, decl: &InterruptDecl) {
         // Reset per-function state.
         self.reset_per_function_state();
-        // Slice 22 (Decision #18): same audit-context propagation
-        // as `emit_effect`. Interrupts that handle audited
-        // automatons (typical: an ISR that pokes a `#audit
+        // Slices 22+26 (Decision #18): same audit-context
+        // propagation as `emit_effect`. Interrupts that handle
+        // audited automata (typical: an ISR that pokes a `#audit
         // #automaton Uart` register block) get markers wrapping
         // every `#unchecked_*` / `#volatile_*` / `#unchecked_cast`
-        // in the handler body.
-        self.current_audited_owner = self.first_audited_in_mutates(&decl.mutates);
+        // in the handler body. Multiple audited automata in
+        // `#mutates: [...]` produce a bracketed list per slice 26.
+        self.current_audited_owners = self.audited_in_mutates(&decl.mutates);
 
         let ret_ty = self.lower_return_type(decl.return_type.as_ref());
 
@@ -933,14 +941,16 @@ impl<'a> Emitter<'a> {
         self.reset_per_function_state();
         self.enclosing_owner = Some(owner.to_owned());
         // Slice 21 (Decision #18): if the owning automaton is
-        // `#audit`-marked, set the audit context so every
-        // unsafe-primitive emission inside the body emits a
-        // `; audit-wrap site for <Owner>` IR comment. Cleared
-        // by the next `reset_per_function_state` call so this
-        // is strictly transition-scoped.
+        // `#audit`-marked, push it into the audit-owner list so
+        // every unsafe-primitive emission inside the body emits
+        // a `; audit-wrap site for <Owner>` IR comment.
+        // Transitions only ever have one audit owner (the
+        // owning automaton); the multi-owner form
+        // (slice 26) applies to effects/interrupts via the
+        // `#mutates: [...]` clause.
         if let Some(info) = self.automatons.get(owner) {
             if info.is_audited {
-                self.current_audited_owner = Some(owner.to_owned());
+                self.current_audited_owners.push(owner.to_owned());
             }
         }
 
@@ -1022,11 +1032,12 @@ impl<'a> Emitter<'a> {
         self.next_label_id = 0;
         self.locals.clear();
         self.enclosing_owner = None;
-        // Slice 21: clear the audit-context marker. Re-set per
-        // transition body in `emit_automaton_transitions` when the
-        // owning automaton is `#audit`-marked. Effects, interrupts,
-        // and `@fn`s start with `None` and stay there for v0.21.
-        self.current_audited_owner = None;
+        // Slice 21+26: clear the audit-owner list. Re-populated
+        // per callable by `emit_transition` (slice 21 — single
+        // owner = the audit automaton) and by `emit_effect` /
+        // `emit_interrupt` (slice 22 + 26 — every audited
+        // automaton in `#mutates: [...]`).
+        self.current_audited_owners.clear();
         self.current_block = "entry".to_owned();
         self.current_block_terminated = false;
         self.pending_atomic_exit_unmask = false;
@@ -2364,12 +2375,29 @@ impl<'a> Emitter<'a> {
     /// transitions, effects, interrupts, and `@fn`s emit
     /// byte-identical IR to slice-20 output.
     fn emit_audit_marker_if_needed(&mut self, kind: &str) {
-        if let Some(owner) = &self.current_audited_owner {
-            writeln!(
-                &mut self.out,
-                "  ; audit-wrap site for {owner} ({kind}) ; Decision #18",
-            )
-            .ok();
+        match self.current_audited_owners.as_slice() {
+            [] => {}
+            [single] => {
+                writeln!(
+                    &mut self.out,
+                    "  ; audit-wrap site for {single} ({kind}) ; Decision #18",
+                )
+                .ok();
+            }
+            many => {
+                // Slice 26: multi-owner format. Brackets +
+                // comma-separated names so the future wrap pass
+                // can dispatch through every named
+                // `PointerAuditor`. Slice-21/22 single-owner
+                // substring matches (`audit-wrap site for X`)
+                // continue to work for the single case above.
+                let list = many.join(", ");
+                writeln!(
+                    &mut self.out,
+                    "  ; audit-wrap site for [{list}] ({kind}) ; Decision #18",
+                )
+                .ok();
+            }
         }
     }
 
@@ -2412,30 +2440,29 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// Slice 22 (Decision #18): given a `#mutates: [A, B, C]`
-    /// list, return the **first** automaton that is registered
-    /// as `#audit`-marked, or `None` if none of the mutated
-    /// automata are audited.
+    /// Slice 22+26 (Decision #18): given a `#mutates: [A, B, C]`
+    /// list, return every automaton in the list that is
+    /// registered as `#audit`-marked, in source order. Empty
+    /// `Vec` ⇒ no audit context for this callable.
     ///
-    /// Used by `emit_effect` and `emit_interrupt` to set
-    /// `current_audited_owner` for the duration of the body. The
-    /// "first" choice is deliberate: the marker is a wiring
-    /// signpost, not a complete description of the wrap target.
-    /// A future instrumentation pass that turns markers into
-    /// real `PointerAuditor` dispatch will consult the AST's
-    /// full `#mutates: [...]` list to determine which Sanitizer
-    /// instances to call into; the marker only needs to be
-    /// present where the wrap should land.
+    /// Used by `emit_effect` and `emit_interrupt` to populate
+    /// `current_audited_owners` for the duration of the body.
+    /// Slice 22 used the FIRST audited (a `first_…` helper);
+    /// slice 26 extends to ALL audited so the marker text can
+    /// list every relevant peripheral for the future wrap pass.
     ///
-    /// Iteration is in source-order so marker text is
-    /// deterministic across compilations of the same source.
-    fn first_audited_in_mutates(&self, mutates: &[String]) -> Option<String> {
-        mutates.iter().find_map(|name| {
-            self.automatons
-                .get(name)
-                .filter(|info| info.is_audited)
-                .map(|info| info.name.clone())
-        })
+    /// Iteration preserves source order so marker text is
+    /// deterministic across compilations.
+    fn audited_in_mutates(&self, mutates: &[String]) -> Vec<String> {
+        mutates
+            .iter()
+            .filter_map(|name| {
+                self.automatons
+                    .get(name)
+                    .filter(|info| info.is_audited)
+                    .map(|info| info.name.clone())
+            })
+            .collect()
     }
 
     fn emit_unchecked_load(
@@ -8254,6 +8281,110 @@ mod tests {
         assert!(
             ir.contains("; audit-wrap site for P (volatile_store) ; Decision #18"),
             "expected volatile_store marker in interrupt body; got:\n{ir}"
+        );
+    }
+
+    // ─── Slice 26: multi-owner audit markers ─────────────────────────────
+
+    #[test]
+    fn s26_effect_with_two_audited_mutates_emits_bracketed_list() {
+        // `#mutates: [A, B]` where BOTH are audited: marker
+        // text uses the bracketed list form `[A, B]`.
+        let src = "\
+            #audit #automaton A { x: u32; }\n\
+            #audit #automaton B { y: u32; }\n\
+            #effect tick() #mutates: [A, B] { \n  \
+              let p: &u32 = #unchecked_cast<u64, &u32>(\"mmio\", 0x4000u64); \n  \
+              #unchecked_store<u32>(p, 1u32); \n  \
+              return; \n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower two-audited");
+        assert!(
+            ir.contains("; audit-wrap site for [A, B] (unchecked_store) ; Decision #18"),
+            "expected bracketed multi-owner marker; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("; audit-wrap site for [A, B] (unchecked_cast) ; Decision #18"),
+            "expected bracketed marker for unchecked_cast too; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s26_effect_with_three_audited_mutates_preserves_source_order() {
+        // Three audited automatons listed in `#mutates: [B, A, C]`
+        // produce a marker `[B, A, C]` — source order, not
+        // alphabetical or declaration order.
+        let src = "\
+            #audit #automaton A { x: u32; }\n\
+            #audit #automaton B { y: u32; }\n\
+            #audit #automaton C { z: u32; }\n\
+            #effect tick() #mutates: [B, A, C] { \n  \
+              let p: &u32 = #unchecked_cast<u64, &u32>(\"mmio\", 0x4000u64); \n  \
+              #unchecked_store<u32>(p, 1u32); \n  \
+              return; \n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower three-audited");
+        assert!(
+            ir.contains("audit-wrap site for [B, A, C] (unchecked_store)"),
+            "expected source-order multi-owner marker; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s26_effect_with_one_audited_amid_non_audited_uses_single_form() {
+        // `#mutates: [Plain1, AuditedOnly, Plain2]` — only ONE
+        // is audited. Marker uses the bare-name single form
+        // (no brackets), preserving the slice-22 behaviour and
+        // existing tests' substring matches.
+        let src = "\
+            #automaton Plain1 { p: u32; }\n\
+            #audit #automaton AuditedOnly { x: u32; }\n\
+            #automaton Plain2 { q: u32; }\n\
+            #effect tick() #mutates: [Plain1, AuditedOnly, Plain2] { \n  \
+              let p: &u32 = #unchecked_cast<u64, &u32>(\"mmio\", 0x4000u64); \n  \
+              #unchecked_store<u32>(p, 1u32); \n  \
+              return; \n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower single-audited mixed");
+        assert!(
+            ir.contains("; audit-wrap site for AuditedOnly (unchecked_store) ; Decision #18"),
+            "expected bare-name single-owner marker; got:\n{ir}"
+        );
+        // No brackets in the marker — confirms single-form.
+        assert!(
+            !ir.contains("audit-wrap site for [AuditedOnly]"),
+            "single owner must use bare name, not bracketed list; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s26_register_block_marker_stays_bare_name() {
+        // The slice-23 register-block marker emitter
+        // (`emit_audit_marker_for_automaton`) names exactly
+        // ONE automaton (the touched peripheral). It does not
+        // participate in the slice-26 multi-owner format —
+        // there's only ever one peripheral at a register-block
+        // store / load site. Sanity check that the bracketed
+        // form doesn't leak into RB markers.
+        let src = "\
+            #audit #automaton A { x: u32; }\n\
+            #audit #automaton Uart { \n  \
+              #address: 0x4000_4000; \n  \
+              tx_data: u32 #offset: 0x00; \n\
+            }\n\
+            #effect tick() #mutates: [A, Uart] { \n  \
+              Uart.tx_data = 1u32; \n  \
+              return; \n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower RB + multi-audit");
+        // RB marker names Uart specifically — bare name.
+        assert!(
+            ir.contains("; audit-wrap site for Uart (volatile_store) ; Decision #18"),
+            "expected RB marker naming Uart; got:\n{ir}"
         );
     }
 
