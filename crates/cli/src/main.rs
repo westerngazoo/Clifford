@@ -891,4 +891,61 @@ mod tests {
             CompileError::Io(_) => panic!("unexpected I/O error"),
         }
     }
+
+    // ─── Slice 34: integration — every example .cl compiles cleanly ─────
+
+    /// Locate the workspace root by walking up from this source
+    /// file until we find `examples/`. Returns the absolute path
+    /// to `examples/` or panics if not found within 10 levels.
+    fn examples_dir() -> std::path::PathBuf {
+        let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        for _ in 0..10 {
+            let candidate = p.join("examples");
+            if candidate.is_dir() {
+                return candidate;
+            }
+            if !p.pop() {
+                break;
+            }
+        }
+        panic!("could not locate examples/ relative to CARGO_MANIFEST_DIR");
+    }
+
+    /// Read every `.cl` file in `examples/` and invoke
+    /// `compile_source` on it. The full pipeline (lex → parse →
+    /// resolve → types → check → effect → ortho → codegen) runs
+    /// per file; if any phase emits an error the test fails with
+    /// the file's name and the diagnostic. Locks in the v0.2
+    /// "every shipped example compiles cleanly" invariant.
+    #[test]
+    fn s34_every_example_cl_file_compiles_cleanly() {
+        let dir = examples_dir();
+        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .expect("read examples/")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("cl"))
+            .collect();
+        entries.sort();
+        assert!(
+            !entries.is_empty(),
+            "no .cl files found in {}",
+            dir.display()
+        );
+        for path in &entries {
+            let src = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            let module = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("example");
+            let res = compile_source(&src, module);
+            if let Err(e) = res {
+                panic!(
+                    "example {} failed to compile: {e:?}",
+                    path.display()
+                );
+            }
+        }
+    }
 }

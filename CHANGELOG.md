@@ -7,6 +7,30 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 34: integration test that every `examples/*.cl` compiles cleanly (2026-05-09)
+
+`s34_every_example_cl_file_compiles_cleanly` in
+`crates/cli/src/main.rs::tests` reads every `.cl` file in
+`examples/` and runs the full pipeline (lex → parse →
+resolve → types → check → effect → ortho → codegen) per
+file via `compile_source`. Any phase emitting an error
+fails the test with the file's name and the diagnostic.
+
+This locks in the v0.2 invariant that every shipped
+sample is a working compile, so adding a new example
+always exercises the whole pipeline before merge. The
+test currently covers all 8 example files
+(`buffer_init_sigma`, `crc32`, `dual_uart_telemetry`,
+`sequential_attribute_demo`, `traffic_classifier`,
+`uart_fsm`, `audit_marker_demo`, `staged_pose_handoff`,
+and the slice-29 `v02_showcase`).
+
+The test uses `env!("CARGO_MANIFEST_DIR")` + an upward
+search for `examples/`, so it works regardless of the
+test runner's current directory.
+
+No code changes to the compiler — pure integration test.
+
 ### Added — Slice 33: ortho-engine tests verifying slice-19 `#flush` race detection (2026-05-09)
 
 Slice 19 claimed: "`#flush A;` flows into the §6.2
