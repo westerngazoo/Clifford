@@ -7,6 +7,95 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 39: `#impl` method bodies + permissive `ShadowSanitizer` default (2026-05-13)
+
+Closes the slice-38 deferred gap. The parser now accepts
+`effect name(params) -> ret { body }` method declarations
+inside `#impl Interface for Automaton { … }` blocks, and
+the `ShadowSanitizer` placeholder is upgraded from an
+empty-body scaffold to a fully-implemented permissive
+default — all four `PointerAuditor` methods are no-ops,
+with `validate_load` / `validate_store` returning `true`.
+
+```clifford
+#impl PointerAuditor for ShadowSanitizer {
+  effect record_alloc(ptr: access<u8>, size: u32) { return; }
+  effect record_free(ptr: access<u8>) { return; }
+  effect validate_load(ptr: access<u8>, size: u32) -> bool { return true; }
+  effect validate_store(ptr: access<u8>, size: u32) -> bool { return true; }
+}
+```
+
+The permissive default lets v0.2 firmware that adds
+`#audit` to an automaton compile + link + boot cleanly
+even without a configured Sanitizer — the future wrap-
+emitting pass (slice 41) generates calls that resolve
+to no-ops, no validation actually happens, but no
+spurious crashes either. Firmware authors can swap in
+real allocation-tracking Sanitizers via Decision #16's
+`#impl` mechanism when the runway lands.
+
+**Pipeline:**
+
+- **AST (`crates/ast/src/lib.rs`):** new
+  `ImplMethod { name, params, return_type, body, span }`
+  struct. `ImplDecl` gains a
+  `methods: Vec<ImplMethod>` field. Empty `methods`
+  is still valid (matches the pre-slice-39 surface).
+- **Parser (`crates/parser/src/lib.rs`):**
+  - `parse_impl_decl` now loops on `Ident("effect")`
+    inside the impl braces, parsing each method via
+    the new `parse_impl_method` helper.
+  - `parse_impl_method` mirrors `parse_interface_method`
+    for the signature head, then parses a `{ … }`
+    body (no terminating `;`).
+  - Anything other than `effect <method>` or `}` is a
+    parse error citing the expected shape.
+- **`crates/stdlib/cl/audit_shadow_sanitizer.cl`** —
+  the `#impl PointerAuditor for ShadowSanitizer { }`
+  block is filled in with all four no-op methods.
+  Doc comments updated to remove the "post-slice-39"
+  conditional language and document the permissive
+  default's design intent.
+
+**Tests added (4 parser):**
+
+- `s39_impl_method_body_parses` — single method with
+  a return type and a body.
+- `s39_impl_multiple_methods_preserve_order` — all
+  four `PointerAuditor` methods, source-order
+  preserved in the AST.
+- `s39_impl_unknown_keyword_inside_body_errors` —
+  `@fn` inside an impl body cleanly errors citing
+  `effect` / `}`.
+- `s39_empty_impl_body_still_parses_as_zero_methods`
+  — regression check that the pre-slice-39
+  `#impl I for A { }` surface still parses.
+
+The existing slice-38 stdlib tests
+(`audit_module_source_parses_and_resolves`) continue
+to pass with the now-populated `ShadowSanitizer` —
+the combined-source translation unit resolves
+through the full pipeline.
+
+**Audit runway status after slice 39:**
+
+| Slice | Landed |
+|-------|--------|
+| 20    | `#audit` modifier surface |
+| 21–23, 26 | Codegen markers |
+| 28    | DECISIONS.md sync |
+| 37    | `PointerAuditor` interface |
+| 38    | `ShadowSanitizer` registration |
+| **39** | **`#impl` method bodies + permissive default** |
+
+Remaining: **slice 40** — compiler-side stdlib-loading
+path so an `#audit` automaton picks up the
+`clifford::audit` module automatically. **Slice 41** —
+the codegen rewrite pass that turns
+`; audit-wrap site for <Owner> (<primitive>)` markers
+into `PointerAuditor::validate_*` dispatch calls.
+
 ### Added — Slice 38: `ShadowSanitizer` placeholder default impl scaffolding (2026-05-13)
 
 Second piece of stdlib audit scaffolding. The
