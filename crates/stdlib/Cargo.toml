@@ -19,3 +19,10 @@ clifford-codegen.workspace = true
 
 # Phase 5 will add a build.rs that drives cliffordc against the .cl source
 # tree to produce shipped artifacts. Empty for v0.1 scaffolding.
+
+[dev-dependencies]
+# Slice 37: stdlib tests verify the canonical `audit.cl` source
+# parses + resolves cleanly through the upstream pipeline.
+clifford-lexer.workspace = true
+clifford-parser.workspace = true
+clifford-resolve.workspace = true
