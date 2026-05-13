@@ -1376,7 +1376,23 @@ pub enum StmtKind {
         /// targeted by unlabelled `break;` / `continue;` which
         /// always pick the innermost loop.
         label: Option<String>,
-        /// The loop variable's source name.
+        /// Slice 36: optional index variable for the
+        /// `sigma (i, x) in &arr { … }` pattern. `None` for
+        /// the single-ident `sigma x in <source> { … }` form
+        /// (slice 11/35). `Some(name)` carries the index
+        /// binding name; the loop counter is bound to it
+        /// alongside the element binding (`var`).
+        ///
+        /// Combinations:
+        /// - `index_var: None,    var: "x"`  → single-ident
+        ///   pattern (slice 11 range form, slice 35 array form).
+        /// - `index_var: Some("i"), var: "x"` → index+value
+        ///   pattern (slice 36, array source only). Resolver
+        ///   rejects this on range sources (E0417).
+        index_var: Option<String>,
+        /// The element binding's source name. Bound to the
+        /// loop counter for range sources, or the loaded
+        /// element for array sources.
         var: String,
         /// The range source — typed as `ExprKind::Range` after
         /// parsing. Stored as `Expr` rather than the narrowed

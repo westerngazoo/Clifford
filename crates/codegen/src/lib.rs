@@ -1440,8 +1440,14 @@ impl<'a> Emitter<'a> {
             // bounded-iteration loop. Lowers to a counted-loop CFG
             // (header + body + exit blocks) per spec §8.4. v0.1
             // scope: range sources only.
-            StmtKind::Sigma { label, var, source, body } => {
-                if let Err(e) = self.emit_sigma(label.as_deref(), var, source, body) {
+            StmtKind::Sigma { label, index_var, var, source, body } => {
+                if let Err(e) = self.emit_sigma(
+                    label.as_deref(),
+                    index_var.as_deref(),
+                    var,
+                    source,
+                    body,
+                ) {
                     self.errors.push(e);
                 }
             }
@@ -2857,13 +2863,15 @@ impl<'a> Emitter<'a> {
     fn emit_sigma(
         &mut self,
         label: Option<&str>,
+        index_var: Option<&str>,
         var: &str,
         source: &Expr,
         body: &Block,
     ) -> Result<(), CodegenError> {
         // Slice 35 dispatch: range vs array source. Range is the
         // slice-11 happy path. Array is `&Auto.field` where
-        // `field` is a static-size array `[T; N]`.
+        // `field` is a static-size array `[T; N]`. Slice 36
+        // adds the `(i, x)` pattern for array sources.
         match &source.kind {
             ExprKind::Range { lo, hi, inclusive } => self.emit_sigma_over_range(
                 label,
@@ -2874,9 +2882,14 @@ impl<'a> Emitter<'a> {
                 body,
             ),
             ExprKind::Ref { operand, .. } => match &operand.kind {
-                ExprKind::FieldAccess { obj, field } => {
-                    self.emit_sigma_over_field_array(label, var, obj, field, body)
-                }
+                ExprKind::FieldAccess { obj, field } => self.emit_sigma_over_field_array(
+                    label,
+                    index_var,
+                    var,
+                    obj,
+                    field,
+                    body,
+                ),
                 _ => Err(CodegenError::NotYetImplemented {
                     what: "sigma over `&<expr>` where the operand is not an automaton field access (Refinement #14a future scope: locals + slices)",
                 }),
@@ -3110,6 +3123,7 @@ impl<'a> Emitter<'a> {
     fn emit_sigma_over_field_array(
         &mut self,
         label: Option<&str>,
+        index_var: Option<&str>,
         var: &str,
         obj: &Expr,
         field: &str,
@@ -3234,6 +3248,18 @@ impl<'a> Emitter<'a> {
             ir_type: elem_ir_ty.clone(),
             storage: LocalStorage::Ssa,
         });
+        // Slice 36: also bind the index variable if the user
+        // wrote the `(i, x)` pattern. The index is the loop
+        // counter SSA name (i32), bound as an immutable SSA
+        // local for the body's scope.
+        if let Some(idx_name) = index_var {
+            self.locals.push(LocalBinding {
+                name: idx_name.to_owned(),
+                value: i_name.clone(),
+                ir_type: "i32".to_owned(),
+                storage: LocalStorage::Ssa,
+            });
+        }
 
         self.sigma_loop_stack.push((
             label.map(str::to_owned),
@@ -8764,6 +8790,81 @@ mod tests {
         assert!(
             ir.contains("; audit-wrap site for Buf (unchecked_cast) ; Decision #18"),
             "expected audit marker for Buf; got:\n{ir}"
+        );
+    }
+
+    // ─── Slice 36: sigma `(i, x)` index+value pattern ───────────────────
+
+    #[test]
+    fn s36_sigma_tuple_pattern_binds_both_index_and_element() {
+        // `sigma (i, x) in &Buf.data` — body can reference both
+        // `i` (the index, u32) and `x` (the element, u32). The
+        // generated IR uses the loop counter `%sigma.i.0` for `i`
+        // and the load result for `x`.
+        let src = "\
+            #automaton Buf { data: [u32; 4]; total: u32; }\n\
+            #effect sum_index_weighted() #mutates: [Buf] {\n  \
+              sigma (i, x) in &Buf.data {\n    \
+                Buf.total += x;\n  \
+                Buf.total += i;\n  \
+              }\n  \
+              return;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower (i, x) pattern");
+        // Per-iteration element load + use of the load result.
+        assert!(
+            ir.contains("load i32, i32* %tmp."),
+            "expected element load; got:\n{ir}"
+        );
+        // The body uses `%sigma.i.0` (the counter) for `i`.
+        assert!(
+            ir.contains("%sigma.i.0"),
+            "expected loop counter %sigma.i.0; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s36_tuple_pattern_on_range_source_is_e0417() {
+        // `sigma (i, x) in 0..n` is meaningless — for ranges
+        // the iterator var IS the value. Resolver rejects with
+        // E0417.
+        let src = "\
+            @fn t() { sigma (i, x) in 0u32..4u32 { } return; }\n\
+        ";
+        let tokens = clifford_lexer::tokenize(src).expect("tokenize");
+        let program = clifford_parser::parse(&tokens).expect("parse");
+        let res = clifford_resolve::resolve(&program);
+        assert!(res.is_err(), "expected E0417");
+        let errs = res.unwrap_err();
+        let saw = errs.iter().any(|e| {
+            let s = format!("{e}");
+            s.contains("E0417")
+        });
+        assert!(saw, "expected E0417 message; got {errs:?}");
+    }
+
+    #[test]
+    fn s36_tuple_pattern_composes_with_labelled_break() {
+        // The slice-27 labelled break works inside the `(i, x)`
+        // body — break out of the outer range loop when the
+        // element exceeds a threshold.
+        let src = "\
+            #automaton Buf { data: [u32; 4]; found: u32; }\n\
+            #effect first_match() #mutates: [Buf] {\n  \
+              sigma 'outer _r in 0u32..1u32 {\n    \
+                sigma (i, x) in &Buf.data {\n      \
+                  if x > 5u32 { Buf.found = i; break 'outer; }\n    \
+                }\n  \
+              }\n  \
+              return;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower nested (i, x) break");
+        // Outer loop is .0; break 'outer targets exit.0.
+        assert!(
+            ir.contains("br label %sigma.exit.0"),
+            "expected break to outer exit (.0); got:\n{ir}"
         );
     }
 

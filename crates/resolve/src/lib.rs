@@ -329,6 +329,28 @@ pub enum ResolveError {
         /// Byte offset of the inner (offending) `sigma`.
         at: usize,
     },
+
+    /// **E0417 TupleSigmaPatternOnRangeSource.** A
+    /// `sigma (i, x) in <range> { … }` pattern was used with a
+    /// range source (e.g. `0..n`). The index/element
+    /// distinction is meaningless for ranges where the
+    /// iterator variable IS the value; the user almost
+    /// certainly meant either:
+    ///   - `sigma i in <range> { … }` (single-ident form), or
+    ///   - `sigma (i, x) in &arr { … }` (array source).
+    ///
+    /// Slice 36: closes the design ambiguity introduced by
+    /// adding the tuple pattern. Range sources accept only
+    /// the single-ident form.
+    #[error(
+        "E0417: `sigma (i, x) in <range> {{ … }}` is not allowed at byte {at} — \
+         tuple pattern is only meaningful with array sources \
+         (`sigma (i, x) in &arr`); use `sigma i in <range>` for ranges"
+    )]
+    TupleSigmaPatternOnRangeSource {
+        /// Byte offset of the offending `sigma` statement.
+        at: usize,
+    },
 }
 
 /// Which kind of top-level item a [`Symbol`] refers to.
@@ -1294,7 +1316,7 @@ impl<'a> Walker<'a> {
             // open a new scope, declare the loop var inside it, and
             // walk the body. The var is invisible after the loop
             // ends.
-            StmtKind::Sigma { label, var, source, body } => {
+            StmtKind::Sigma { label, index_var, var, source, body } => {
                 self.walk_expr(source);
                 // Slice 31: reject duplicate loop labels. An
                 // inner `sigma 'L …` whose label is already
@@ -1321,6 +1343,23 @@ impl<'a> Walker<'a> {
                     kind: LocalKind::Sigma,
                     def_span: stmt.span,
                 });
+                // Slice 36: `(i, x)` pattern — also declare the
+                // index binding. Reject if the source is a
+                // range expression (the index/value distinction
+                // is meaningless for ranges where the iterator
+                // var IS the value).
+                if let Some(idx) = index_var {
+                    if matches!(source.kind, ExprKind::Range { .. }) {
+                        self.errors.push(ResolveError::TupleSigmaPatternOnRangeSource {
+                            at: stmt.span.start,
+                        });
+                    }
+                    self.declare(LocalBinding {
+                        name: idx.clone(),
+                        kind: LocalKind::Sigma,
+                        def_span: stmt.span,
+                    });
+                }
                 // Slice 17: increment loop depth so `break;` /
                 // `continue;` in the body resolve. Decrement on
                 // exit.
