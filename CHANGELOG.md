@@ -7,6 +7,69 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 38: `ShadowSanitizer` placeholder default impl scaffolding (2026-05-13)
+
+Second piece of stdlib audit scaffolding. The
+`ShadowSanitizer` placeholder lands at
+`crates/stdlib/cl/audit_shadow_sanitizer.cl` with an
+`#automaton ShadowSanitizer { }` (no fields yet) plus
+an `#impl PointerAuditor for ShadowSanitizer { }` (empty
+body).
+
+**Scope (slice 38):** the *registration* parses and
+resolves cleanly through the upstream pipeline so the
+relationship is established. The four method bodies
+(`record_alloc` / `record_free` / `validate_load` /
+`validate_store` returning `true`) are deferred to slice
+39 because the parser's current `#impl` body grammar
+accepts only `{ }`. Once slice 39 lands `#impl` method
+bodies, this Sanitizer becomes the "permissive default"
+that returns `true` from every validation call — useful
+as the no-op variant for firmware that doesn't yet wire
+in real allocation tracking.
+
+**Pipeline additions:**
+
+- **`crates/stdlib/cl/audit_shadow_sanitizer.cl`** —
+  canonical placeholder. Doc-commented with the v0.2-α
+  scope, the post-slice-39 design (no-op default), and
+  the rationale for the empty-body limitation.
+- **`crates/stdlib/src/lib.rs`** —
+  - new `AUDIT_SHADOW_SANITIZER_CL_SOURCE: &str` via
+    `include_str!`.
+  - new `audit_module_source() -> String` — concatenates
+    the interface and the impl into a single
+    translation unit, the shape the future stdlib-loader
+    will consume.
+
+**Tests added (2 stdlib):**
+
+- `audit_shadow_sanitizer_source_registers_impl` — locks
+  in the `#automaton` + `#impl` registration shape.
+- `audit_module_source_parses_and_resolves` — runs the
+  combined source through lex/parse/resolve, the
+  canonical translation-unit shape.
+
+**Status of the `#audit` runway after slice 38:**
+
+| Slice | What landed |
+|-------|-------------|
+| 20    | `#audit` modifier surface |
+| 21–23, 26 | Codegen markers at every unsafe site |
+| 28    | DECISIONS.md sync |
+| 37    | `PointerAuditor` interface in stdlib |
+| **38** | **`ShadowSanitizer` placeholder + registration** |
+
+Remaining:
+- **39:** parser support for `#impl` method bodies + fill
+  in the four no-op methods.
+- **40:** compiler-side stdlib-loading path to make
+  `clifford::audit` automatically available when an
+  `#audit` automaton is declared.
+- **41:** the codegen pass that rewrites
+  `; audit-wrap site` markers into
+  `PointerAuditor::validate_*` dispatch calls.
+
 ### Added — Slice 37: `clifford::audit::PointerAuditor` stdlib scaffolding (2026-05-13)
 
 First concrete piece of Clifford-source stdlib: the
