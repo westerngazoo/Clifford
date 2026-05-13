@@ -347,8 +347,57 @@ fn run_compile(
 /// - `error[effect]:`  — categorical / mutation-profile / call-graph
 /// - `error[ortho]:`   — §7 GA orthogonality (write-write race detection)
 /// - `error[codegen]:` — IR-emission gap (NotYetImplemented surface)
+/// Slice 40: textual heuristic — does the source declare or
+/// reference any `#audit` automaton? If yes, the CLI prepends
+/// the canonical `clifford::audit` module (interface + default
+/// `ShadowSanitizer`) so the user doesn't have to copy-paste
+/// the contract.
+///
+/// The check is intentionally simple: a substring match for
+/// `#audit`. The only contexts in which `#audit` can appear in
+/// well-formed Clifford source are:
+///   - the `#audit` modifier on `#automaton`
+///   - inside a comment / string literal (false positive — but
+///     prepending the audit module in that case is harmless;
+///     the prepended source compiles cleanly on its own).
+///
+/// Returns `false` for the vast majority of programs — the
+/// auto-include is opt-in by way of the `#audit` keyword.
+fn needs_audit_stdlib(source: &str) -> bool {
+    // Bail out quickly if the user's source already declares
+    // its own `PointerAuditor` interface — they're providing
+    // their own; auto-prepending would conflict.
+    if source.contains("#interface PointerAuditor") {
+        return false;
+    }
+    source.contains("#audit")
+}
+
 fn compile_source(source: &str, module_name: &str) -> Result<String, CompileError> {
-    let tokens = tokenize(source).map_err(|e| CompileError::Phase {
+    // Slice 40: auto-include the `clifford::audit` module if the
+    // user's source contains an `#audit` automaton. Detection is
+    // textual: we look for the `#audit` keyword. Any false positive
+    // (e.g. inside a string literal or comment) is harmless — the
+    // prepended source is the canonical PointerAuditor interface
+    // + ShadowSanitizer permissive default, which can sit unused.
+    //
+    // This is the v0.2 stop-gap pending a real module-import system.
+    // Once `use clifford::audit::*;` lands, this auto-detection
+    // becomes opt-out and eventually retired.
+    //
+    // We re-export the source-with-prepend as the active source for
+    // the rest of the pipeline. The `module_name` reflects the user
+    // intent; codegen sees the prepended audit module as part of
+    // the same translation unit.
+    let prepended;
+    let active_source: &str = if needs_audit_stdlib(source) {
+        prepended = clifford_stdlib::audit_module_source() + "\n" + source;
+        &prepended
+    } else {
+        source
+    };
+
+    let tokens = tokenize(active_source).map_err(|e| CompileError::Phase {
         name: "lex",
         diags: PhaseDiag::from_single(&e),
     })?;
@@ -947,5 +996,96 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ─── Slice 40: auto-include `clifford::audit` for #audit programs ───
+
+    #[test]
+    fn s40_audit_program_compiles_without_user_supplied_interface() {
+        // The user's source declares an `#audit` register-block
+        // automaton + an effect that pokes it. The user does NOT
+        // supply `#interface PointerAuditor`. Slice 40's
+        // auto-include prepends the canonical interface +
+        // ShadowSanitizer so this still compiles cleanly.
+        let src = "\
+            #audit #automaton Uart {\n  \
+              #address: 0x4000_4000;\n  \
+              tx_data: u32 #offset: 0x00;\n\
+            }\n\
+            #effect send(b: u32) #mutates: [Uart] { Uart.tx_data = b; return; }\n\
+        ";
+        let ir = compile_source(src, "fw").expect("audit-using program compiles");
+        // Both stdlib and user code present.
+        assert!(
+            ir.contains("%struct.ShadowSanitizer"),
+            "expected ShadowSanitizer struct from auto-included stdlib; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("define void @send"),
+            "expected user effect; got:\n{ir}"
+        );
+        // The slice-23 audit marker fires for the Uart write.
+        assert!(
+            ir.contains("audit-wrap site for Uart"),
+            "expected audit marker for Uart; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s40_non_audit_program_does_not_trigger_auto_include() {
+        // Mirror of the above without `#audit` — verifies the
+        // auto-include is opt-in. The IR must NOT contain any
+        // ShadowSanitizer / PointerAuditor artefacts.
+        let src = "\
+            #automaton Uart {\n  \
+              #address: 0x4000_4000;\n  \
+              tx_data: u32 #offset: 0x00;\n\
+            }\n\
+            #effect send(b: u32) #mutates: [Uart] { Uart.tx_data = b; return; }\n\
+        ";
+        let ir = compile_source(src, "fw").expect("non-audit compiles");
+        assert!(
+            !ir.contains("ShadowSanitizer"),
+            "non-audit program must not get ShadowSanitizer; got:\n{ir}"
+        );
+        assert!(
+            !ir.contains("PointerAuditor"),
+            "non-audit program must not get PointerAuditor; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s40_user_supplied_pointer_auditor_suppresses_auto_include() {
+        // If the user declares their own `#interface
+        // PointerAuditor { … }`, the auto-include must back off
+        // to avoid a duplicate-symbol conflict. The user's
+        // interface is the one used.
+        let src = "\
+            #interface PointerAuditor { effect record_alloc(p: access<u8>, n: u32); }\n\
+            #automaton MySanitizer { }\n\
+            #impl PointerAuditor for MySanitizer { effect record_alloc(p: access<u8>, n: u32) { return; } }\n\
+            #audit #automaton Buf { v: u32; }\n\
+        ";
+        // Should compile (user supplies a single-method
+        // interface so the impl matches their version, not
+        // ours).
+        let res = compile_source(src, "fw");
+        assert!(
+            res.is_ok(),
+            "user-supplied PointerAuditor should compile cleanly; got {res:?}"
+        );
+    }
+
+    #[test]
+    fn s40_needs_audit_stdlib_textual_heuristic() {
+        // Direct unit test on the heuristic.
+        assert!(needs_audit_stdlib("#audit #automaton X { }"));
+        assert!(needs_audit_stdlib("// some comment\n#audit #automaton X { }"));
+        assert!(!needs_audit_stdlib("#automaton X { }"));
+        assert!(!needs_audit_stdlib(""));
+        // User-supplied PointerAuditor suppresses auto-include.
+        assert!(!needs_audit_stdlib(
+            "#interface PointerAuditor { } #audit #automaton X { }"
+        ));
     }
 }

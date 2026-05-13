@@ -7,6 +7,90 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 40: auto-include `clifford::audit` for `#audit` programs (2026-05-13)
+
+A user program that declares `#audit #automaton …` no
+longer needs to copy-paste the `PointerAuditor`
+interface or the `ShadowSanitizer` default — `cliffordc`
+auto-prepends the canonical
+`crates/stdlib/cl/audit.cl` + `audit_shadow_sanitizer.cl`
+sources before compilation. Programs without `#audit`
+are byte-identical to before.
+
+```clifford
+#audit #automaton Uart {
+  #address: 0x4000_4000;
+  tx_data: u32 #offset: 0x00;
+}
+
+#effect send(b: u32) #mutates: [Uart] {
+  Uart.tx_data = b;
+  return;
+}
+```
+
+The above compiles without any user-side `#interface
+PointerAuditor` declaration. The IR contains both the
+auto-included `ShadowSanitizer` struct + impl AND the
+user's `send` effect with the slice-23 audit marker.
+
+**Detection heuristic:**
+
+- Source contains the substring `#audit` → auto-include
+  fires.
+- Source ALSO contains `#interface PointerAuditor` →
+  auto-include backs off (the user is bringing their
+  own contract; auto-prepending would conflict).
+
+The textual heuristic is the v0.2 stop-gap pending a
+real module-import system. False positives (e.g.
+`#audit` inside a comment or string literal) are
+harmless — the prepended source is the canonical
+contract and compiles cleanly on its own.
+
+**CLI changes (`crates/cli/src/main.rs`):**
+
+- New `needs_audit_stdlib(source: &str) -> bool` —
+  the substring-based detection + back-off heuristic.
+- `compile_source` checks `needs_audit_stdlib` up
+  front and prepends `clifford_stdlib::audit_module_source()`
+  when true. The rest of the pipeline runs against the
+  combined source.
+
+**Tests added (4 cli):**
+
+- `s40_audit_program_compiles_without_user_supplied_interface`
+  — end-to-end: a user `#audit` program compiles to IR
+  containing both stdlib symbols and user code.
+- `s40_non_audit_program_does_not_trigger_auto_include`
+  — opt-in confirmation: no `#audit` → no
+  `ShadowSanitizer` / `PointerAuditor` in the IR.
+- `s40_user_supplied_pointer_auditor_suppresses_auto_include`
+  — bring-your-own contract confirms back-off.
+- `s40_needs_audit_stdlib_textual_heuristic` — direct
+  unit test on the helper.
+
+**Audit runway after slice 40:**
+
+| Slice | Landed |
+|-------|--------|
+| 20    | `#audit` modifier surface |
+| 21–23, 26 | Codegen markers |
+| 28    | DECISIONS.md sync |
+| 37    | `PointerAuditor` interface |
+| 38    | `ShadowSanitizer` registration |
+| 39    | `#impl` method bodies + permissive default |
+| **40** | **Compiler auto-includes `clifford::audit`** |
+
+Remaining: **slice 41** — the codegen rewrite pass
+that turns `; audit-wrap site for <Owner> (<primitive>)`
+markers into actual `PointerAuditor::validate_*`
+dispatch calls. After that, the chain is
+end-to-end: a user adds `#audit` to an automaton, the
+compiler wires up the default Sanitizer transparently,
+and unsafe primitives become validated calls in the
+emitted IR.
+
 ### Added — Slice 39: `#impl` method bodies + permissive `ShadowSanitizer` default (2026-05-13)
 
 Closes the slice-38 deferred gap. The parser now accepts
