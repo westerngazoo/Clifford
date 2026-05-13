@@ -115,6 +115,9 @@ name = "clifford-stdlib"
 version = "0.1.0"
 dependencies = [
  "clifford-codegen",
+ "clifford-lexer",
+ "clifford-parser",
+ "clifford-resolve",
 ]
 
 [[package]]

@@ -7,6 +7,78 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 37: `clifford::audit::PointerAuditor` stdlib scaffolding (2026-05-13)
+
+First concrete piece of Clifford-source stdlib: the
+canonical `PointerAuditor` interface per Decision #18
+lands at `crates/stdlib/cl/audit.cl`. The interface
+defines the four-method contract that future Sanitizer
+implementations satisfy:
+
+```clifford
+#interface PointerAuditor {
+  effect record_alloc(ptr: access<u8>, size: u32);
+  effect record_free(ptr: access<u8>);
+  effect validate_load(ptr: access<u8>, size: u32) -> bool;
+  effect validate_store(ptr: access<u8>, size: u32) -> bool;
+}
+```
+
+The `access<u8>` byte-pointer type (per Decision #19)
+replaces the `*mut u8` shape from the original Decision
+#18 sketch — Clifford uses `access<T>` as its narrow-
+unsafe pointer surface, not raw C-style pointers.
+
+**Pipeline:**
+
+- **`crates/stdlib/cl/audit.cl`** — canonical interface
+  source. Doc-commented with the v0.2 status (interface
+  is canonical; default `ShadowSanitizer` impl + the
+  wrap-emitting codegen pass land in slices 38+) and
+  the rationale for each method.
+- **`crates/stdlib/src/lib.rs`** — new
+  `pub const AUDIT_CL_SOURCE: &str = include_str!("../cl/audit.cl");`
+  exposes the source text for the future wrap-emitting
+  pass to parse + resolve against. `include_str!`
+  makes the .cl file participate in `cargo build`
+  dependency tracking.
+- **`crates/stdlib/Cargo.toml`** — dev-deps on
+  `clifford-lexer` / `clifford-parser` /
+  `clifford-resolve` so stdlib tests can verify the
+  canonical source parses + resolves through the
+  upstream pipeline.
+
+**Tests added (2 stdlib):**
+
+- `audit_pointer_auditor_interface_parses_and_resolves`
+  — runs the full lex/parse/resolve pipeline on
+  `AUDIT_CL_SOURCE`, catching backwards-incompatible
+  compiler changes that silently break the stdlib
+  bootstrap.
+- `audit_cl_source_declares_pointer_auditor` — light
+  sanity check that the interface name and four
+  required method names are present in the embedded
+  text (catches accidental deletion).
+
+**Status of the `#audit` runway after slice 37:**
+
+| Slice | What landed |
+|-------|-------------|
+| 20    | `#audit` modifier surface (AST + parser) |
+| 21–23, 26 | Codegen markers at every unsafe-primitive site, multi-owner format, register-block markers |
+| 28    | `docs/DECISIONS.md` updated |
+| **37** | **`PointerAuditor` interface in stdlib** |
+
+Remaining slices on this runway:
+- **38:** default `ShadowSanitizer` impl in
+  `crates/stdlib/cl/audit.cl` (or a sibling file)
+- **39:** compiler-side path to auto-include the
+  stdlib audit module when an `#audit` automaton is
+  declared
+- **40:** the codegen pass that rewrites `; audit-wrap
+  site for <Owner> (<primitive>)` markers into
+  `PointerAuditor::validate_*` dispatch calls
+
 ### Added — Slice 36: `sigma (i, x) in &arr` index+element pattern (2026-05-13)
 
 Closes the second half of Refinement #14a — the
