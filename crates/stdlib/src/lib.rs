@@ -68,6 +68,40 @@
 /// (a change to `audit.cl` rebuilds this crate).
 pub const AUDIT_CL_SOURCE: &str = include_str!("../cl/audit.cl");
 
+/// Slice 38: canonical Clifford-source text for the
+/// placeholder default `ShadowSanitizer` impl of
+/// `PointerAuditor` (Decision #18). Like
+/// [`AUDIT_CL_SOURCE`], this is embedded via
+/// `include_str!` so the future runtime-audit wrap-
+/// emitting pass can parse and resolve against the
+/// canonical text without a path-resolution step.
+///
+/// **Slice-38 scope:** the `#impl PointerAuditor for
+/// ShadowSanitizer { }` registration is parsed and
+/// resolved; the method bodies are not yet present
+/// because the parser's `#impl` body grammar currently
+/// accepts only `{ }`. Method-body support lands in
+/// slice 39; this constant becomes the actual default
+/// (no-op / always-`true`) impl at that point.
+pub const AUDIT_SHADOW_SANITIZER_CL_SOURCE: &str =
+    include_str!("../cl/audit_shadow_sanitizer.cl");
+
+/// Slice 38: the canonical full `clifford::audit` module
+/// source — interface + default impl concatenated. Future
+/// stdlib-loading work (slice 39+) will parse this as a
+/// single translation unit so the
+/// `#impl PointerAuditor for ShadowSanitizer` registration
+/// has the interface in scope.
+pub fn audit_module_source() -> String {
+    let mut s = String::with_capacity(
+        AUDIT_CL_SOURCE.len() + AUDIT_SHADOW_SANITIZER_CL_SOURCE.len() + 2,
+    );
+    s.push_str(AUDIT_CL_SOURCE);
+    s.push('\n');
+    s.push_str(AUDIT_SHADOW_SANITIZER_CL_SOURCE);
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,5 +146,35 @@ mod tests {
                 "missing required method `{required}` in audit.cl",
             );
         }
+    }
+
+    /// Slice 38: the placeholder `ShadowSanitizer` declares an
+    /// `#impl PointerAuditor for ShadowSanitizer { }`. The
+    /// body is empty until slice 39 lands `#impl` method
+    /// bodies; this test locks in the registration shape.
+    #[test]
+    fn audit_shadow_sanitizer_source_registers_impl() {
+        assert!(
+            AUDIT_SHADOW_SANITIZER_CL_SOURCE
+                .contains("#automaton ShadowSanitizer"),
+            "expected ShadowSanitizer automaton",
+        );
+        assert!(
+            AUDIT_SHADOW_SANITIZER_CL_SOURCE
+                .contains("#impl PointerAuditor for ShadowSanitizer"),
+            "expected #impl PointerAuditor for ShadowSanitizer registration",
+        );
+    }
+
+    /// Slice 38: the combined `audit_module_source()` —
+    /// interface + impl concatenated — parses + resolves
+    /// cleanly. This is the canonical translation-unit shape
+    /// the future stdlib-loading pass will consume.
+    #[test]
+    fn audit_module_source_parses_and_resolves() {
+        let src = audit_module_source();
+        let tokens = tokenize(&src).expect("tokenize combined audit module");
+        let program = parse(&tokens).expect("parse combined audit module");
+        resolve(&program).expect("resolve combined audit module");
     }
 }
