@@ -7,6 +7,62 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 36: `sigma (i, x) in &arr` index+element pattern (2026-05-13)
+
+Closes the second half of Refinement #14a — the
+index+element pattern for array sources:
+
+```clifford
+#automaton Buf { data: [u32; 4]; found: u32; }
+#effect first_match() #mutates: [Buf] {
+  sigma (i, x) in &Buf.data {
+    if x > 5u32 { Buf.found = i; break; }
+  }
+  return;
+}
+```
+
+**Pipeline:**
+
+- **AST (`crates/ast/src/lib.rs`):** `StmtKind::Sigma`
+  gains an `index_var: Option<String>` field paralleling
+  `var`. `None` = single-ident pattern (slice 11/35);
+  `Some(name)` = index binding name.
+- **Parser (`crates/parser/src/lib.rs`):** after
+  `sigma [label]?`, detect `(` and parse
+  `(ident, ident)` into `(index_var, var)`. The
+  single-ident path is unchanged.
+- **Resolver (`crates/resolve/src/lib.rs`):**
+  - Declares both bindings in the body scope.
+  - **E0417 `TupleSigmaPatternOnRangeSource`** if the
+    source is a `Range` expression (the index/value
+    distinction is meaningless for ranges where the
+    iterator var IS the value).
+- **Types (`crates/types/src/lib.rs`):** index var
+  types as `u32` (the loop counter).
+- **Codegen (`crates/codegen/src/lib.rs`):**
+  `emit_sigma_over_field_array` binds the index var
+  (when present) to the loop counter SSA name
+  (`%sigma.i.<id>`) as an immutable SSA local in the
+  body's scope. The element load is unchanged.
+
+**Tests (3 codegen):**
+
+- `s36_sigma_tuple_pattern_binds_both_index_and_element`
+  — body references both `i` and `x` and the IR shows
+  the counter (`%sigma.i.0`) plus the element load.
+- `s36_tuple_pattern_on_range_source_is_e0417` —
+  surfaces E0417 with the canonical message.
+- `s36_tuple_pattern_composes_with_labelled_break` —
+  the slice-27 labelled break works from inside an
+  `(i, x)` body.
+
+After slice 36, Refinement #14a is implemented for all
+v0.2 firmware patterns. Remaining future-slice work:
+local-array sources, runtime-sized slices, and
+register-block array sources (each cleanly errors today
+and is a separate slice).
+
 ### Added — Slice 35: sigma over array sources (Refinement #14a) (2026-05-09)
 
 Implements **Refinement #14a** (sigma over runtime-sized

@@ -1903,7 +1903,7 @@ impl<'a> Inferer<'a> {
             // v0.1 scope: range sources only. Array sources (which
             // would type the var as the array's element type) land
             // when slice-indexing infrastructure is built out.
-            StmtKind::Sigma { var, source, body, .. } => {
+            StmtKind::Sigma { index_var, var, source, body, .. } => {
                 let source_ty = self.infer_expr(source);
                 let var_ty = match &source_ty {
                     Type::Range { element, .. } => (**element).clone(),
@@ -1924,6 +1924,14 @@ impl<'a> Inferer<'a> {
                 };
                 self.push_scope();
                 self.declare(var, var_ty);
+                // Slice 36: index var (when present) types as
+                // `u32` — the loop counter. Resolver E0417 has
+                // already rejected the tuple pattern on range
+                // sources, so this only applies to array
+                // sources where the counter is the array index.
+                if let Some(idx) = index_var {
+                    self.declare(idx, Type::Primitive(PrimitiveType::U32));
+                }
                 for s in &body.stmts {
                     self.walk_stmt(s);
                 }

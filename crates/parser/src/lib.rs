@@ -2429,17 +2429,29 @@ impl<'t> Parser<'t> {
     fn parse_sigma_stmt(&mut self, start: usize) -> Result<Stmt, ParseError> {
         self.advance(); // `sigma`
         // Slice 27: optional `'label` between `sigma` and the
-        // loop variable. `sigma 'outer i in 0..n { … }` allows
-        // `break 'outer;` / `continue 'outer;` to target this
-        // loop from any nested position.
+        // loop variable.
         let label = self.parse_optional_label_target();
-        let (var, _) = self.expect_ident("loop variable name after `sigma`")?;
-        self.expect(TokenKind::KwIn, "`in` after sigma loop variable")?;
+        // Slice 36: pattern is either a single ident `x` (slice
+        // 11/35) or `(i, x)` for index+element binding. The
+        // tuple form requires array source; resolver E0417
+        // rejects it on range sources.
+        let (index_var, var) = if matches!(self.peek().kind, TokenKind::LParen) {
+            self.advance(); // `(`
+            let (idx_name, _) = self.expect_ident("index variable name in `sigma (i, x) in …`")?;
+            self.expect(TokenKind::Comma, "`,` between index and element bindings in `sigma (i, x) …`")?;
+            let (val_name, _) = self.expect_ident("element variable name after `,` in `sigma (i, x) in …`")?;
+            self.expect(TokenKind::RParen, "`)` to close `(i, x)` sigma pattern")?;
+            (Some(idx_name), val_name)
+        } else {
+            let (var, _) = self.expect_ident("loop variable name after `sigma`")?;
+            (None, var)
+        };
+        self.expect(TokenKind::KwIn, "`in` after sigma loop pattern")?;
         let source = self.parse_expr()?;
         let body = self.parse_block()?;
         let end = body.span.end;
         Ok(Stmt {
-            kind: StmtKind::Sigma { label, var, source, body },
+            kind: StmtKind::Sigma { label, index_var, var, source, body },
             span: Span::new(start, end),
         })
     }
@@ -7140,7 +7152,7 @@ mod tests {
         // `sigma i in 0..n { … }` — half-open range source.
         let stmt = parse_stmt_str("sigma i in 0u32..10u32 { }");
         match &stmt.kind {
-            StmtKind::Sigma { var, source, body, label } => {
+            StmtKind::Sigma { var, source, body, label, .. } => {
                 assert_eq!(var, "i");
                 assert_eq!(body.stmts.len(), 0);
                 assert!(label.is_none(), "default sigma must be unlabelled");
