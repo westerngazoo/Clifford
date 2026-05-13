@@ -7,6 +7,83 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 35: sigma over array sources (Refinement #14a) (2026-05-09)
+
+Implements **Refinement #14a** (sigma over runtime-sized
+slices) for the most common firmware case: an automaton
+field of static-array type. `sigma x in &Auto.field` where
+`field: [T; N]` now lowers to a counted loop `0..N` with
+the element bound per-iteration via a GEP+load.
+
+```clifford
+#automaton Buf { data: [u32; 4]; total: u32; }
+
+#effect sum() #mutates: [Buf] {
+  sigma x in &Buf.data {
+    Buf.total += x;
+  }
+  return;
+}
+```
+
+**Pipeline:**
+
+- **AST/Parser:** no new surface — `sigma x in <expr>`
+  already accepted any expression as source; the
+  pre-existing error was cited at codegen.
+- **Types (`crates/types/src/lib.rs`):** `Sigma`'s typing
+  arm gains a `Type::Ref` branch — if the source is a
+  reference to an array, the loop var binds to the
+  element type.
+- **Codegen (`crates/codegen/src/lib.rs`):**
+  - `emit_sigma` now dispatches on the source kind:
+    `Range` → existing slice-11 path (extracted into
+    `emit_sigma_over_range`); `Ref { operand:
+    FieldAccess }` → new `emit_sigma_over_field_array`.
+  - The array path resolves `Auto` (or `Self` inside a
+    transition), looks up the field's IR type, parses
+    `[N x T]` into `(N, T)` via the new
+    `parse_array_ir_type` helper, then emits the CFG
+    with `0..N` bounds, an element GEP+load at the top
+    of the body block, and the loop variable bound to
+    the load result.
+  - Composes cleanly with slice-17 break/continue,
+    slice-27 labelled control flow, and slices-22/26
+    audit markers.
+
+**Tests (5 codegen):**
+
+- `s35_sigma_over_field_array_emits_per_iter_gep_load`
+- `s35_sigma_over_field_array_with_break_targets_outer`
+  (labelled break from inner array-loop to outer
+  range-loop)
+- `s35_sigma_over_self_field_array_resolves_owner`
+  (`Self` resolves to the enclosing transition's
+  automaton)
+- `s35_sigma_over_non_array_field_surfaces_e0810`
+  (`sigma x in &Buf.total` where `total: u32` cleanly
+  errors with NotYetImplemented citing the array-shape
+  requirement)
+- `s35_sigma_over_array_inside_audit_emits_audit_marker`
+  (composition with slices 22/23)
+
+**Deliberately NOT in slice 35:**
+
+- **`(i, x)` index+element pattern** — Refinement #14a
+  also defines `sigma (i, x) in &arr { … }`; deferred
+  to slice 36 because it requires a small AST + parser
+  extension.
+- **Local-array sources** — `sigma x in &local_arr`
+  requires alloca + GEP infrastructure for local
+  arrays (they currently lower as SSA `insertvalue`
+  chains with no addressable storage).
+- **Runtime-sized slices** — `sigma x in some_slice`
+  for `&[T]` fat-pointer sources requires
+  slice-type infrastructure.
+- **Register-block array sources** — per-iteration
+  volatile loads for a register-block array field;
+  cleanly errors today.
+
 ### Added — Slice 34: integration test that every `examples/*.cl` compiles cleanly (2026-05-09)
 
 `s34_every_example_cl_file_compiles_cleanly` in

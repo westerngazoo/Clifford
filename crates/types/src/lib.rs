@@ -1907,7 +1907,20 @@ impl<'a> Inferer<'a> {
                 let source_ty = self.infer_expr(source);
                 let var_ty = match &source_ty {
                     Type::Range { element, .. } => (**element).clone(),
-                    _ => Type::Unknown("sigma source not a range (v0.1 supports range sources only)"),
+                    // Slice 35 (Refinement #14a): `sigma x in
+                    // &Auto.field` — the source typed as `&[T; N]`
+                    // (a reference to an array). The loop var is
+                    // bound to the element type T.
+                    Type::Ref { inner, .. } => match inner.as_ref() {
+                        Type::Array { element: t, .. } => (**t).clone(),
+                        _ => Type::Unknown(
+                            "sigma over `&<expr>` requires the operand to be an array",
+                        ),
+                    },
+                    _ => Type::Unknown(
+                        "sigma source must be a range (`lo..hi`) or `&Auto.field` array \
+                         (Refinement #14a)",
+                    ),
                 };
                 self.push_scope();
                 self.declare(var, var_ty);

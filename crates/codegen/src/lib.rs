@@ -2849,8 +2849,11 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
-    /// Array sources (`sigma x in &arr`) need the slice-indexing
-    /// infrastructure and land in a future slice.
+    /// Slice 35 (Refinement #14a): sigma over an array-field
+    /// source — `sigma x in &Auto.field` where `field: [T; N]`.
+    /// Lowers identically to a counted loop `0..N` with the
+    /// element binding emitted at the top of the body block as
+    /// a GEP + load.
     fn emit_sigma(
         &mut self,
         label: Option<&str>,
@@ -2858,17 +2861,46 @@ impl<'a> Emitter<'a> {
         source: &Expr,
         body: &Block,
     ) -> Result<(), CodegenError> {
-        // Extract the range bounds. v0.1 supports range sources
-        // only; array sources surface a structured error.
-        let (lo, hi, inclusive) = match &source.kind {
-            ExprKind::Range { lo, hi, inclusive } => (lo.as_ref(), hi.as_ref(), *inclusive),
-            _ => {
-                return Err(CodegenError::NotYetImplemented {
-                    what: "sigma over a non-range source (array source needs the slice-indexing slice)",
-                });
-            }
-        };
+        // Slice 35 dispatch: range vs array source. Range is the
+        // slice-11 happy path. Array is `&Auto.field` where
+        // `field` is a static-size array `[T; N]`.
+        match &source.kind {
+            ExprKind::Range { lo, hi, inclusive } => self.emit_sigma_over_range(
+                label,
+                var,
+                lo.as_ref(),
+                hi.as_ref(),
+                *inclusive,
+                body,
+            ),
+            ExprKind::Ref { operand, .. } => match &operand.kind {
+                ExprKind::FieldAccess { obj, field } => {
+                    self.emit_sigma_over_field_array(label, var, obj, field, body)
+                }
+                _ => Err(CodegenError::NotYetImplemented {
+                    what: "sigma over `&<expr>` where the operand is not an automaton field access (Refinement #14a future scope: locals + slices)",
+                }),
+            },
+            _ => Err(CodegenError::NotYetImplemented {
+                what: "sigma source must be a range (`lo..hi`) or `&Auto.field` array (Refinement #14a)",
+            }),
+        }
+    }
 
+    /// Slice 11 + 17 + 27: counted-loop emission for
+    /// `sigma <var> in <lo>..<hi> { body }` (and the inclusive
+    /// `..=` form). Extracted from the slice-11 monolithic
+    /// `emit_sigma` body so slice 35 can share the same CFG
+    /// shape with the array-source path.
+    fn emit_sigma_over_range(
+        &mut self,
+        label: Option<&str>,
+        var: &str,
+        lo: &Expr,
+        hi: &Expr,
+        inclusive: bool,
+        body: &Block,
+    ) -> Result<(), CodegenError> {
         // Iteration type + signedness from the lower bound.
         // §5.8 says `lo` and `hi` must be the same integer type;
         // upstream typing already enforces this (BinaryTypeMismatch
@@ -3027,6 +3059,214 @@ impl<'a> Emitter<'a> {
         // along with the rest of the loop.
 
         // Exit block: subsequent statements emit here.
+        writeln!(&mut self.out, "{exit_label}:").ok();
+        self.current_block = exit_label;
+        self.current_block_terminated = false;
+
+        Ok(())
+    }
+
+    /// Slice 35 (Refinement #14a): lower
+    /// `sigma <var> in &<Auto>.<field> { body }` where
+    /// `field` has IR type `[N x T]`. The lowering is:
+    ///
+    /// ```text
+    ///   <pred>:
+    ///     %field_ptr = getelementptr %struct.Auto, %struct.Auto* @Auto.state, i32 0, i32 <idx>
+    ///     br label %sigma.header.<id>
+    ///   sigma.header.<id>:
+    ///     %sigma.i.<id> = phi i32 [ 0, %<pred> ], [ %sigma.i_next.<id>, %sigma.continue.<id> ]
+    ///     %sigma.cond.<id> = icmp ult i32 %sigma.i.<id>, <N>
+    ///     br i1 %sigma.cond.<id>, label %sigma.body.<id>, label %sigma.exit.<id>
+    ///   sigma.body.<id>:
+    ///     %elem_ptr = getelementptr [<N> x <T>], [<N> x <T>]* %field_ptr, i32 0, i32 %sigma.i.<id>
+    ///     %<var>    = load <T>, <T>* %elem_ptr
+    ///     ; <body, with <var> bound to %<var>>
+    ///     br label %sigma.continue.<id>          ; suppressed if body terminated
+    ///   sigma.continue.<id>:
+    ///     %sigma.i_next.<id> = add nuw i32 %sigma.i.<id>, 1
+    ///     br label %sigma.header.<id>
+    ///   sigma.exit.<id>:
+    /// ```
+    ///
+    /// **Scope (slice 35):**
+    /// - The receiver of `Auto.field` must be a single-segment
+    ///   path (`Auto` or `Self`) — same constraint as the
+    ///   slice-5 indexed-read path.
+    /// - `field` must have a static-array IR type `[N x T]`.
+    /// - The element type `T` becomes the loop variable's
+    ///   inferred type.
+    /// - The counter is `i32` (matches the slice-11
+    ///   default for range-source loops over `0..N`).
+    ///
+    /// Out of scope (future slices):
+    /// - Indexing pattern `(i, x)` — slice 36.
+    /// - Local-array sources (`sigma x in &local_arr`) —
+    ///   needs alloca + GEP infrastructure for locals.
+    /// - Runtime-sized slices (`&[T]` fat pointers) — needs
+    ///   the slice-type infrastructure.
+    /// - Register-block array fields — the per-iteration
+    ///   load would need to be `load volatile`; deferred.
+    fn emit_sigma_over_field_array(
+        &mut self,
+        label: Option<&str>,
+        var: &str,
+        obj: &Expr,
+        field: &str,
+        body: &Block,
+    ) -> Result<(), CodegenError> {
+        // Resolve the automaton name (with `Self` mapping to
+        // the enclosing transition's owner, like other field
+        // accesses).
+        let auto_name: String = match &obj.kind {
+            ExprKind::Path(segs) if segs.len() == 1 => {
+                if segs[0] == "Self" {
+                    self.enclosing_owner.clone().ok_or(
+                        CodegenError::NotYetImplemented {
+                            what: "sigma x in &Self.field outside a #transition body",
+                        },
+                    )?
+                } else {
+                    segs[0].clone()
+                }
+            }
+            _ => {
+                return Err(CodegenError::NotYetImplemented {
+                    what: "sigma over &<expr>.field where the receiver isn't a single-ident automaton path",
+                });
+            }
+        };
+
+        // Look up the field's IR type and (LLVM) struct index.
+        let (field_ir_ty, field_idx, is_register_block) = {
+            let info = self.automatons.get(&auto_name).ok_or_else(|| {
+                CodegenError::UnresolvedName { name: auto_name.clone() }
+            })?;
+            let (raw_idx, ir_ty, _offset) = info
+                .fields
+                .iter()
+                .enumerate()
+                .find_map(|(i, (n, t, off))| {
+                    if n == field { Some((i, t.clone(), *off)) } else { None }
+                })
+                .ok_or_else(|| CodegenError::UnresolvedName {
+                    name: format!("{auto_name}.{field}"),
+                })?;
+            (ir_ty, info.llvm_field_index(raw_idx), info.is_register_block)
+        };
+
+        if is_register_block {
+            return Err(CodegenError::NotYetImplemented {
+                what: "sigma over a register-block array field (per-iteration volatile load deferred)",
+            });
+        }
+
+        // Parse `[N x T]` → (N, T).
+        let (n, elem_ir_ty) = parse_array_ir_type(&field_ir_ty).ok_or(
+            CodegenError::NotYetImplemented {
+                what: "sigma source `&Auto.field` requires `field` to be a static-size array `[T; N]`",
+            },
+        )?;
+
+        // Allocate fresh label IDs (same shape as the
+        // range-source path).
+        let id = self.next_label_id;
+        self.next_label_id += 1;
+        let header_label = format!("sigma.header.{id}");
+        let body_label = format!("sigma.body.{id}");
+        let continue_label = format!("sigma.continue.{id}");
+        let exit_label = format!("sigma.exit.{id}");
+        let i_name = format!("%sigma.i.{id}");
+        let i_next_name = format!("%sigma.i_next.{id}");
+        let cond_name = format!("%sigma.cond.{id}");
+
+        // Predecessor block: compute the field pointer once.
+        let field_ptr = self.fresh_value();
+        writeln!(
+            &mut self.out,
+            "  {field_ptr} = getelementptr %struct.{auto_name}, %struct.{auto_name}* @{auto_name}.state, i32 0, i32 {field_idx}",
+        )
+        .ok();
+        let pred_block = self.current_block.clone();
+        writeln!(&mut self.out, "  br label %{header_label}").ok();
+
+        // Header: phi + ult counter < N + cond branch.
+        writeln!(&mut self.out, "{header_label}:").ok();
+        self.current_block = header_label.clone();
+        self.current_block_terminated = false;
+        writeln!(
+            &mut self.out,
+            "  {i_name} = phi i32 [ 0, %{pred_block} ], [ {i_next_name}, %{continue_label} ]",
+        )
+        .ok();
+        writeln!(
+            &mut self.out,
+            "  {cond_name} = icmp ult i32 {i_name}, {n}",
+        )
+        .ok();
+        writeln!(
+            &mut self.out,
+            "  br i1 {cond_name}, label %{body_label}, label %{exit_label}",
+        )
+        .ok();
+
+        // Body: GEP + load the element, bind as the loop var.
+        writeln!(&mut self.out, "{body_label}:").ok();
+        self.current_block = body_label.clone();
+        self.current_block_terminated = false;
+        let elem_ptr = self.fresh_value();
+        writeln!(
+            &mut self.out,
+            "  {elem_ptr} = getelementptr {field_ir_ty}, {field_ir_ty}* {field_ptr}, i32 0, i32 {i_name}",
+        )
+        .ok();
+        let elem_val = self.fresh_value();
+        writeln!(
+            &mut self.out,
+            "  {elem_val} = load {elem_ir_ty}, {elem_ir_ty}* {elem_ptr}",
+        )
+        .ok();
+
+        let scope_marker = self.locals.len();
+        self.locals.push(LocalBinding {
+            name: var.to_owned(),
+            value: elem_val,
+            ir_type: elem_ir_ty.clone(),
+            storage: LocalStorage::Ssa,
+        });
+
+        self.sigma_loop_stack.push((
+            label.map(str::to_owned),
+            continue_label.clone(),
+            exit_label.clone(),
+        ));
+
+        for stmt in &body.stmts {
+            if self.current_block_terminated {
+                break;
+            }
+            self.emit_stmt(stmt);
+        }
+
+        self.locals.truncate(scope_marker);
+        self.sigma_loop_stack.pop();
+
+        if !self.current_block_terminated {
+            writeln!(&mut self.out, "  br label %{continue_label}").ok();
+        }
+
+        // Continue: increment + back-edge.
+        writeln!(&mut self.out, "{continue_label}:").ok();
+        self.current_block = continue_label.clone();
+        self.current_block_terminated = false;
+        writeln!(
+            &mut self.out,
+            "  {i_next_name} = add nuw i32 {i_name}, 1",
+        )
+        .ok();
+        writeln!(&mut self.out, "  br label %{header_label}").ok();
+
+        // Exit.
         writeln!(&mut self.out, "{exit_label}:").ok();
         self.current_block = exit_label;
         self.current_block_terminated = false;
@@ -3973,6 +4213,18 @@ fn array_element_ir_type(ir_ty: &str) -> Option<String> {
     // types containing spaces (e.g. `[4 x [4 x i8]]`) survive intact.
     let (_n, t) = body.split_once(" x ")?;
     Some(t.trim().to_owned())
+}
+
+/// Slice 35: parse an array IR type `[N x T]` into `(N, T)`.
+/// Returns `None` for non-array IR types. Used by the
+/// `sigma x in &Auto.field` lowering to compute the loop bound
+/// from the field's IR type without a separate type-checker
+/// query.
+fn parse_array_ir_type(ir_ty: &str) -> Option<(u64, String)> {
+    let body = ir_ty.strip_prefix('[')?.strip_suffix(']')?;
+    let (n_str, t_str) = body.split_once(" x ")?;
+    let n: u64 = n_str.trim().parse().ok()?;
+    Some((n, t_str.trim().to_owned()))
 }
 
 /// Slice 8: True if a syntactic `TypeExpr` names a signed integer
@@ -8382,6 +8634,136 @@ mod tests {
         assert!(
             ir.contains("; audit-wrap site for P (volatile_store) ; Decision #18"),
             "expected volatile_store marker in interrupt body; got:\n{ir}"
+        );
+    }
+
+    // ─── Slice 35: sigma over array source (Refinement #14a) ────────────
+
+    #[test]
+    fn s35_sigma_over_field_array_emits_per_iter_gep_load() {
+        // `sigma x in &Buf.data` where `data: [u32; 4]` lowers
+        // to a counted loop 0..4 with per-iteration GEP+load of
+        // the element bound as `x`. Total IR shape exercised:
+        // entry GEP for field pointer, header phi+cond, body
+        // GEP+load, body use, continue increment, exit.
+        let src = "\
+            #automaton Buf { data: [u32; 4]; total: u32; }\n\
+            #effect sum() #mutates: [Buf] {\n  \
+              sigma x in &Buf.data { Buf.total += x; }\n  \
+              return;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower sigma over array");
+        // Field pointer GEP at entry.
+        assert!(
+            ir.contains("getelementptr %struct.Buf, %struct.Buf* @Buf.state, i32 0, i32 0"),
+            "expected field-ptr GEP at entry; got:\n{ir}"
+        );
+        // Per-iteration element GEP using the counter.
+        assert!(
+            ir.contains("getelementptr [4 x i32], [4 x i32]*"),
+            "expected element-ptr GEP via [4 x i32]; got:\n{ir}"
+        );
+        // Loop count is 4 (the array length).
+        assert!(
+            ir.contains("icmp ult i32 %sigma.i.0, 4"),
+            "expected upper bound 4 (array length); got:\n{ir}"
+        );
+        // Element load.
+        assert!(
+            ir.contains("load i32, i32* %tmp."),
+            "expected element load; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s35_sigma_over_field_array_with_break_targets_outer() {
+        // Slice-27 labelled break composes with the slice-35
+        // array-source loop: `break 'outer;` from inside the
+        // array-iter body branches to the OUTER range loop's
+        // exit.
+        let src = "\
+            #automaton Buf { data: [u32; 4]; total: u32; }\n\
+            #effect sum_early() #mutates: [Buf] {\n  \
+              sigma 'outer _i in 0u32..2u32 {\n    \
+                sigma x in &Buf.data { if x > 0u32 { break 'outer; } }\n  \
+              }\n  \
+              return;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower nested break-outer");
+        // The outer (range) loop is .0; the inner (array) loop
+        // is .1. break 'outer targets .0's exit.
+        assert!(
+            ir.contains("br label %sigma.exit.0"),
+            "expected branch to outer exit (.0); got:\n{ir}"
+        );
+        // The array-source loop's per-iter element GEP appears.
+        assert!(
+            ir.contains("getelementptr [4 x i32], [4 x i32]*"),
+            "expected inner array-source GEP; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s35_sigma_over_self_field_array_resolves_owner() {
+        // `sigma x in &Self.field` inside a transition body
+        // resolves Self to the enclosing automaton.
+        let src = "\
+            #automaton M { buf: [u32; 3]; sum: u32;\n  \
+              #transition tally { sigma x in &Self.buf { M.sum += x; } }\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower Self sigma");
+        assert!(
+            ir.contains("getelementptr %struct.M, %struct.M* @M.state, i32 0, i32 0"),
+            "expected Self.buf GEP into @M.state idx 0; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("icmp ult i32 %sigma.i.0, 3"),
+            "expected upper bound 3; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s35_sigma_over_non_array_field_surfaces_e0810() {
+        // `sigma x in &Buf.total` where `total: u32` — not an
+        // array. Codegen surfaces NotYetImplemented citing
+        // Refinement #14a.
+        let src = "\
+            #automaton Buf { total: u32; }\n\
+            #effect bad() #mutates: [Buf] { sigma x in &Buf.total { Buf.total += x; } return; }\n\
+        ";
+        let errs = lower_str(src).expect_err("expected E0810");
+        let saw = errs.iter().any(|e| matches!(
+            e,
+            CodegenError::NotYetImplemented { what }
+                if what.contains("static-size array") || what.contains("`[T; N]`")
+        ));
+        assert!(saw, "expected NYI citing static-size array; got {errs:?}");
+    }
+
+    #[test]
+    fn s35_sigma_over_array_inside_audit_emits_audit_marker() {
+        // Composition with slice 22+26: an effect that mutates
+        // an `#audit` automaton AND iterates its array field
+        // gets audit markers wrapping the unsafe primitives in
+        // the body.
+        let src = "\
+            #audit #automaton Buf { data: [u32; 4]; total: u32; }\n\
+            #effect sum() #mutates: [Buf] {\n  \
+              sigma x in &Buf.data { \n    \
+                let _p: &u32 = #unchecked_cast<u64, &u32>(\"mmio\", 0x4000u64);\n  \
+              }\n  \
+              return;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower audit + array sigma");
+        // The marker for the unchecked_cast inside the sigma
+        // body must appear and name `Buf`.
+        assert!(
+            ir.contains("; audit-wrap site for Buf (unchecked_cast) ; Decision #18"),
+            "expected audit marker for Buf; got:\n{ir}"
         );
     }
 
