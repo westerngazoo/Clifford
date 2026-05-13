@@ -652,16 +652,46 @@ pub struct TraitMethod {
 
 /// An `#impl Interface for Automaton { … }` block (Decision #16).
 ///
-/// Slice-2 scope: interface name + automaton name + span. Method bodies
-/// (the `effect name(params) -> ret { … }` items inside the braces) arrive
-/// in slice 3 alongside body parsing.
+/// Slice 39: method bodies. The `methods` field carries one
+/// [`ImplMethod`] per `effect name(params) -> ret { body }` entry
+/// inside the impl braces. An empty `methods` vec is still
+/// permitted (matches the slice-2 surface) — useful as a
+/// scaffold while the methods are being written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImplDecl {
     /// The interface being implemented.
     pub interface_name: String,
     /// The automaton implementing the interface.
     pub automaton_name: String,
+    /// Method bodies in source order. Each entry is one
+    /// `effect name(params) -> ret { body }` declaration
+    /// inside the impl braces.
+    pub methods: Vec<ImplMethod>,
     /// Source span covering the full declaration.
+    pub span: Span,
+}
+
+/// One `effect name(params) -> ret { body }` entry inside an
+/// `#impl Interface for Automaton { … }` block (slice 39).
+///
+/// Distinct from [`InterfaceMethod`] (which has no body — it
+/// declares a required signature) and from
+/// [`EffectDecl`] (which is a top-level callable with
+/// `#mutates: [...]` / `#priority: …` clauses; impl methods
+/// inherit those from the interface contract).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImplMethod {
+    /// Method name — must match an [`InterfaceMethod`] on the
+    /// interface being implemented.
+    pub name: String,
+    /// Value parameters in source order. Must match the
+    /// signature on the interface side (resolver enforces).
+    pub params: Vec<Param>,
+    /// Optional return type. Must match the interface.
+    pub return_type: Option<TypeExpr>,
+    /// Method body — same shape as an `#effect` body.
+    pub body: Block,
+    /// Source span covering the full method declaration.
     pub span: Span,
 }
 

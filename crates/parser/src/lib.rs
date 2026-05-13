@@ -57,8 +57,8 @@
 use clifford_ast::{
     AccessMode, AccessType, AddressClause, ArraySize, ArrayType, AssignOp, AtomicKind,
     AutomatonDecl, AutomatonField, BasisClause, BinaryOp, Block, EffectDecl, Expr, ExprKind,
-    Field, FieldAssign, FieldKind, FnDecl, FnType, GenericParam, ImplDecl, InterfaceDecl,
-    InterfaceMethod, InterruptDecl, Item, Param, PathType, PriorityLevel, PrimitiveType,
+    Field, FieldAssign, FieldKind, FnDecl, FnType, GenericParam, ImplDecl, ImplMethod,
+    InterfaceDecl, InterfaceMethod, InterruptDecl, Item, Param, PathType, PriorityLevel, PrimitiveType,
     Program, RefType, SequentialAttr, SliceType, StateName, Stmt, StmtKind, TestDecl, TraitDecl,
     TraitMethod, TraitRef, TransitionDecl, TupleType, TypeBody, TypeDecl, TypeExpr, TypeKind,
     UnaryOp, Variant, VariantData,
@@ -1126,11 +1126,68 @@ impl<'t> Parser<'t> {
         let (automaton_name, _) =
             self.expect_ident("automaton name after `for`")?;
         self.expect(TokenKind::LBrace, "`{` to open impl body")?;
+
+        // Slice 39: parse zero or more `effect name(...) -> T
+        // { body }` method declarations. `effect` is a
+        // contextual keyword inside an impl body — the lexer
+        // emits it as `Ident("effect")`. Empty body is still
+        // valid (a registration-only scaffold).
+        let mut methods: Vec<ImplMethod> = Vec::new();
+        while !matches!(self.peek().kind, TokenKind::RBrace) {
+            match &self.peek().kind {
+                TokenKind::Ident(s) if s == "effect" => {
+                    methods.push(self.parse_impl_method()?);
+                }
+                TokenKind::Eof => {
+                    return Err(ParseError::UnexpectedEof {
+                        context: "impl body",
+                    });
+                }
+                other => {
+                    let t = self.peek().clone();
+                    return Err(ParseError::Expected {
+                        expected:
+                            "`effect` to start an impl method body, or `}` to close the impl",
+                        found: other.clone(),
+                        at: t.span.start,
+                    });
+                }
+            }
+        }
         let close = self.expect(TokenKind::RBrace, "`}` to close impl body")?;
         Ok(ImplDecl {
             interface_name,
             automaton_name,
+            methods,
             span: Span::new(start, close.end),
+        })
+    }
+
+    /// Slice 39: parse one
+    /// `effect name(params) -> ret? { body }` entry inside an
+    /// `#impl Interface for Automaton { … }` block. Mirrors
+    /// `parse_interface_method` for the signature head, then
+    /// expects a `{ … }` body (NOT a terminating `;`).
+    fn parse_impl_method(&mut self) -> Result<ImplMethod, ParseError> {
+        let start = self.peek().span.start;
+        // `effect` keyword (contextual; lexed as Ident).
+        self.advance();
+        let (name, _) = self.expect_ident("method name after `effect`")?;
+        let params = self.parse_param_list()?;
+        let return_type = if matches!(self.peek().kind, TokenKind::Arrow) {
+            self.advance();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        let body = self.parse_block()?;
+        let end = body.span.end;
+        Ok(ImplMethod {
+            name,
+            params,
+            return_type,
+            body,
+            span: Span::new(start, end),
         })
     }
 
@@ -3534,11 +3591,92 @@ mod tests {
             Item::Impl(ImplDecl {
                 interface_name,
                 automaton_name,
+                methods,
                 ..
             }) => {
                 assert_eq!(interface_name, "Serial");
                 assert_eq!(automaton_name, "Usart1");
+                assert!(methods.is_empty(), "empty impl body has no methods");
             }
+            other => panic!("expected Impl, got {:?}", other),
+        }
+    }
+
+    // ─── Slice 39: #impl method bodies ───────────────────────────────────
+
+    #[test]
+    fn s39_impl_method_body_parses() {
+        // Single method with a return-type and a trivial body.
+        let p = parse_str(
+            "#impl Auditor for SS { effect validate(ptr: access<u8>) -> bool { return true; } }",
+        )
+        .expect("parse #impl with body");
+        match &p.items[0] {
+            Item::Impl(decl) => {
+                assert_eq!(decl.methods.len(), 1);
+                let m = &decl.methods[0];
+                assert_eq!(m.name, "validate");
+                assert_eq!(m.params.len(), 1);
+                assert_eq!(m.params[0].name, "ptr");
+                assert!(m.return_type.is_some());
+                assert_eq!(m.body.stmts.len(), 1); // the return stmt
+            }
+            other => panic!("expected Impl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn s39_impl_multiple_methods_preserve_order() {
+        let p = parse_str(
+            "#impl PointerAuditor for ShadowSanitizer { \
+               effect record_alloc(p: access<u8>, n: u32) { return; } \
+               effect record_free(p: access<u8>) { return; } \
+               effect validate_load(p: access<u8>, n: u32) -> bool { return true; } \
+               effect validate_store(p: access<u8>, n: u32) -> bool { return true; } \
+             }",
+        )
+        .expect("parse multi-method impl");
+        match &p.items[0] {
+            Item::Impl(decl) => {
+                let names: Vec<&str> =
+                    decl.methods.iter().map(|m| m.name.as_str()).collect();
+                assert_eq!(
+                    names,
+                    vec![
+                        "record_alloc",
+                        "record_free",
+                        "validate_load",
+                        "validate_store",
+                    ],
+                );
+            }
+            other => panic!("expected Impl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn s39_impl_unknown_keyword_inside_body_errors() {
+        // Anything other than `effect <method>` inside the
+        // braces is a parse error citing the expected
+        // shape.
+        let err = parse_str(
+            "#impl Foo for Bar { @fn random() { return; } }",
+        )
+        .expect_err("@fn inside impl body");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("effect") || msg.contains("`}`"),
+            "expected error to mention `effect`/`}}`; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn s39_empty_impl_body_still_parses_as_zero_methods() {
+        // Regression: pre-slice-39 surface `#impl I for A { }`
+        // must keep parsing as a zero-method impl.
+        let p = parse_str("#impl Serial for Usart1 { }").expect("empty impl");
+        match &p.items[0] {
+            Item::Impl(decl) => assert!(decl.methods.is_empty()),
             other => panic!("expected Impl, got {:?}", other),
         }
     }
