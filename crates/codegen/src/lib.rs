@@ -1730,14 +1730,28 @@ impl<'a> Emitter<'a> {
         let store_keyword = if is_register_block { "store volatile" } else { "store" };
         if is_register_block {
             // Slice 23 (Decision #18): mark register-block
-            // indexed-field volatile stores. Mirrors the
-            // non-indexed register-block path in
-            // `emit_field_store`. The `kind` string is the same
-            // because the underlying IR op is `store volatile`;
-            // the future instrumentation pass discriminates
-            // indexed vs. non-indexed via the surrounding GEP
-            // structure, not the marker text.
+            // indexed-field volatile stores. The `kind`
+            // string is the same as the non-indexed RB path
+            // because the underlying IR op is `store volatile`.
             self.emit_audit_marker_for_automaton(automaton, "volatile_store");
+            // Slice 43: real ptr+size args. The element ptr
+            // (`elem_ptr`) is a typed `T*` SSA name from the
+            // GEP above; bitcast it to i8* and pass with the
+            // element's byte size.
+            if self.audit_marker_active_for(automaton) {
+                let i8_ptr = self.fresh_value();
+                writeln!(
+                    &mut self.out,
+                    "  {i8_ptr} = bitcast {element_ir_ty}* {elem_ptr} to i8*",
+                )
+                .ok();
+                let size = ir_type_byte_size(&element_ir_ty).unwrap_or(0);
+                self.emit_audit_validate_call_with_args(
+                    "volatile_store",
+                    &i8_ptr,
+                    size,
+                );
+            }
         }
         writeln!(
             &mut self.out,
@@ -1791,6 +1805,20 @@ impl<'a> Emitter<'a> {
                 // than the callable-level `current_audited_owner`
                 // when an effect lists multiple audited automata.
                 self.emit_audit_marker_for_automaton(automaton, "volatile_store");
+                // Slice 43: real ptr+size args for the
+                // validate_store call. The MMIO address is
+                // already known as a constant; build the i8*
+                // expression inline.
+                if self.audit_marker_active_for(automaton) {
+                    let i8_ptr =
+                        format!("inttoptr (i64 {absolute_address} to i8*)");
+                    let size = ir_type_byte_size(ir_ty).unwrap_or(0);
+                    self.emit_audit_validate_call_with_args(
+                        "volatile_store",
+                        &i8_ptr,
+                        size,
+                    );
+                }
                 writeln!(
                     &mut self.out,
                     "  store volatile {ir_ty} {value}, {ir_ty}* inttoptr (i64 {abs} to {ir_ty}*)",
@@ -1827,11 +1855,19 @@ impl<'a> Emitter<'a> {
             FieldLocation::RegisterBlock { absolute_address } => {
                 // Slice 23 (Decision #18): mark register-block
                 // volatile reads from `#audit`-marked
-                // peripherals. Same marker shape as the
-                // write-side path; the future wrap pass will
-                // dispatch through the appropriate
-                // `PointerAuditor::validate_load` call.
+                // peripherals.
                 self.emit_audit_marker_for_automaton(automaton, "volatile_load");
+                // Slice 43: real ptr+size args.
+                if self.audit_marker_active_for(automaton) {
+                    let i8_ptr =
+                        format!("inttoptr (i64 {absolute_address} to i8*)");
+                    let size = ir_type_byte_size(ir_ty).unwrap_or(0);
+                    self.emit_audit_validate_call_with_args(
+                        "volatile_load",
+                        &i8_ptr,
+                        size,
+                    );
+                }
                 let val = self.fresh_value();
                 writeln!(
                     &mut self.out,
@@ -2464,70 +2500,76 @@ impl<'a> Emitter<'a> {
     /// transitions, effects, interrupts, and `@fn`s emit
     /// byte-identical IR to slice-20 output.
     fn emit_audit_marker_if_needed(&mut self, kind: &str) {
-        match self.current_audited_owners.as_slice() {
-            [] => {}
-            [single] => {
-                writeln!(
-                    &mut self.out,
-                    "  ; audit-wrap site for {single} ({kind}) ; Decision #18",
-                )
-                .ok();
-                self.emit_audit_validate_call(kind);
-            }
-            many => {
-                // Slice 26: multi-owner format. Brackets +
-                // comma-separated names so the future wrap pass
-                // can dispatch through every named
-                // `PointerAuditor`. Slice-21/22 single-owner
-                // substring matches (`audit-wrap site for X`)
-                // continue to work for the single case above.
-                let list = many.join(", ");
-                writeln!(
-                    &mut self.out,
-                    "  ; audit-wrap site for [{list}] ({kind}) ; Decision #18",
-                )
-                .ok();
-                self.emit_audit_validate_call(kind);
-            }
-        }
+        // Slice 43 split: this helper emits ONLY the marker
+        // comment. The validate_* call is now a separate
+        // emission via [`Self::emit_audit_validate_call`] (no
+        // args, slice-41 placeholder) or
+        // [`Self::emit_audit_validate_call_with_args`] (real
+        // ptr+size, slice 43). Splitting lets each call site
+        // pass real args when available without forcing every
+        // site through the same signature.
+        let owners = match self.current_audited_owners.as_slice() {
+            [] => return,
+            [single] => single.clone(),
+            many => format!("[{}]", many.join(", ")),
+        };
+        writeln!(
+            &mut self.out,
+            "  ; audit-wrap site for {owners} ({kind}) ; Decision #18",
+        )
+        .ok();
     }
 
-    /// Slice 41 (Decision #18 MVP): emit a placeholder call to
-    /// the auto-included `ShadowSanitizer`'s
+    /// Slice 41 + 43 (Decision #18): emit a call to the
+    /// auto-included `ShadowSanitizer`'s
     /// `validate_load` / `validate_store` method for load /
-    /// store unsafe primitives. Pointer and size are
-    /// placeholders (`i8* null` / `i32 0`) for v0.2 — real
-    /// argument plumbing (materialise the ptr as an i8* SSA
-    /// value, compute the actual byte count from the IR
-    /// element type) lands in a follow-up slice.
+    /// store unsafe primitives.
     ///
-    /// The placeholder calls prove the dispatch wiring works
-    /// end-to-end: the auto-included `ShadowSanitizer`'s
-    /// permissive default returns `true`, so the calls have
-    /// no runtime effect but the IR shape is correct for the
-    /// future when real arguments + abort-on-false logic
-    /// land.
+    /// **Slice 43:** the call now passes the actual pointer
+    /// (bitcast to `i8*`) and the actual element byte size,
+    /// not the slice-41 placeholders `(i8* null, i32 0)`.
+    /// This is what a real allocation-tracking Sanitizer
+    /// needs to validate `[ptr, ptr+size)` against its shadow
+    /// table. The slice-42 counting Sanitizer ignores the
+    /// arguments (it just increments a counter), but the
+    /// shape is correct for future Sanitizers.
+    ///
+    /// The slice-41 helper variant (no args) is retained as
+    /// `emit_audit_validate_call` for cases where the caller
+    /// can't easily materialize the ptr; new sites should
+    /// prefer `emit_audit_validate_call_with_args`.
     ///
     /// `unchecked_cast` / `unchecked_offset` are not
     /// validated because the `PointerAuditor` interface
     /// doesn't define a hook for them — only the load/store
     /// validation methods. The slice-21+ markers for those
     /// primitives remain in the IR as documentation.
-    fn emit_audit_validate_call(&mut self, kind: &str) {
+    fn emit_audit_validate_call_with_args(
+        &mut self,
+        kind: &str,
+        ptr_i8: &str,
+        size_bytes: u64,
+    ) {
         let method = match kind {
             "unchecked_load" | "volatile_load" => "validate_load",
             "unchecked_store" | "volatile_store" => "validate_store",
-            // No interface hook for cast / offset; the marker
-            // is documentation-only at those sites.
             _ => return,
         };
         let result = self.fresh_value();
         writeln!(
             &mut self.out,
-            "  {result} = call i1 @ShadowSanitizer_{method}(i8* null, i32 0) ; slice-41 placeholder args (real ptr+size plumbed in a follow-up)",
+            "  {result} = call i1 @ShadowSanitizer_{method}(i8* {ptr_i8}, i32 {size_bytes})",
         )
         .ok();
     }
+
+    // Slice 43: the slice-41 placeholder variant
+    // `emit_audit_validate_call(kind)` was removed once all
+    // call sites were upgraded to pass real ptr+size args.
+    // History note: pre-slice-43, this helper emitted
+    // `call i1 @ShadowSanitizer_<method>(i8* null, i32 0)`.
+    // The slice-43 path now uses
+    // `emit_audit_validate_call_with_args` exclusively.
 
     /// Slice 23 (Decision #18): emit a `; audit-wrap site for
     /// <Automaton>` IR comment iff the named automaton is
@@ -2554,6 +2596,10 @@ impl<'a> Emitter<'a> {
     /// (and non-register-block automata routed elsewhere) emit
     /// byte-identical IR.
     fn emit_audit_marker_for_automaton(&mut self, automaton: &str, kind: &str) {
+        // Slice 43 split: comment only — call sites emit the
+        // validate_* call separately via
+        // [`Self::emit_audit_validate_call_with_args`] now
+        // that ptr+size are plumbed.
         let is_audited = self
             .automatons
             .get(automaton)
@@ -2565,11 +2611,28 @@ impl<'a> Emitter<'a> {
                 "  ; audit-wrap site for {automaton} ({kind}) ; Decision #18",
             )
             .ok();
-            // Slice 41: emit the placeholder validate_* call
-            // for register-block volatile load/store sites
-            // the same way the unsafe-primitive path does.
-            self.emit_audit_validate_call(kind);
         }
+    }
+
+    /// Slice 43 helper: returns `true` if the current
+    /// callable's audit context is non-empty (slice-21+
+    /// `current_audited_owners` populated). Used by call
+    /// sites that need to gate their `validate_*` call
+    /// emission alongside the marker.
+    fn audit_context_active(&self) -> bool {
+        !self.current_audited_owners.is_empty()
+    }
+
+    /// Slice 43 helper: returns `true` if the named
+    /// automaton is `#audit`-marked. Used by the register-
+    /// block call sites — same gating that
+    /// `emit_audit_marker_for_automaton` uses for its
+    /// comment.
+    fn audit_marker_active_for(&self, automaton: &str) -> bool {
+        self.automatons
+            .get(automaton)
+            .map(|info| info.is_audited)
+            .unwrap_or(false)
     }
 
     /// Slice 27: locate the `sigma` loop on the stack that a
@@ -2634,13 +2697,26 @@ impl<'a> Emitter<'a> {
     ) -> Result<String, CodegenError> {
         let elem_ir_ty = self.lower_type(ty)?;
         let ptr_value = self.emit_expr(ptr)?;
+        let kind = if is_volatile { "volatile_load" } else { "unchecked_load" };
+        self.emit_audit_marker_if_needed(kind);
+        // Slice 43: bitcast the typed pointer to i8* so we can
+        // pass it to validate_load. The bitcast is free at
+        // runtime (LLVM-15+ opaque pointers) and gives the
+        // Sanitizer the byte-level address it expects.
+        if self.audit_context_active()
+            && matches!(kind, "unchecked_load" | "volatile_load")
+        {
+            let i8_ptr = self.fresh_value();
+            writeln!(
+                &mut self.out,
+                "  {i8_ptr} = bitcast {elem_ir_ty}* {ptr_value} to i8*",
+            )
+            .ok();
+            let size = ir_type_byte_size(&elem_ir_ty).unwrap_or(0);
+            self.emit_audit_validate_call_with_args(kind, &i8_ptr, size);
+        }
         let result = self.fresh_value();
         let keyword = if is_volatile { "load volatile" } else { "load" };
-        self.emit_audit_marker_if_needed(if is_volatile {
-            "volatile_load"
-        } else {
-            "unchecked_load"
-        });
         writeln!(
             &mut self.out,
             "  {result} = {keyword} {elem_ir_ty}, {elem_ir_ty}* {ptr_value}",
@@ -2665,12 +2741,24 @@ impl<'a> Emitter<'a> {
         let elem_ir_ty = self.lower_type(ty)?;
         let ptr_value = self.emit_expr(ptr)?;
         let val_ssa = self.emit_expr(value)?;
+        let kind = if is_volatile { "volatile_store" } else { "unchecked_store" };
+        self.emit_audit_marker_if_needed(kind);
+        // Slice 43: real ptr+size args. Same shape as the
+        // load path — bitcast the typed pointer to i8* and
+        // compute the element byte size.
+        if self.audit_context_active()
+            && matches!(kind, "unchecked_store" | "volatile_store")
+        {
+            let i8_ptr = self.fresh_value();
+            writeln!(
+                &mut self.out,
+                "  {i8_ptr} = bitcast {elem_ir_ty}* {ptr_value} to i8*",
+            )
+            .ok();
+            let size = ir_type_byte_size(&elem_ir_ty).unwrap_or(0);
+            self.emit_audit_validate_call_with_args(kind, &i8_ptr, size);
+        }
         let keyword = if is_volatile { "store volatile" } else { "store" };
-        self.emit_audit_marker_if_needed(if is_volatile {
-            "volatile_store"
-        } else {
-            "unchecked_store"
-        });
         writeln!(
             &mut self.out,
             "  {keyword} {elem_ir_ty} {val_ssa}, {elem_ir_ty}* {ptr_value}",
@@ -3550,11 +3638,19 @@ impl<'a> Emitter<'a> {
             // single-instruction on every supported target.
             //
             // Slice 23 (Decision #18): emit an audit marker if
-            // the peripheral is `#audit`-marked. Same marker
-            // shape as the write-side path; future
-            // instrumentation dispatches through
-            // `PointerAuditor::validate_load`.
+            // the peripheral is `#audit`-marked.
             self.emit_audit_marker_for_automaton(auto_name, "volatile_load");
+            // Slice 43: real ptr+size args.
+            if self.audit_marker_active_for(auto_name) {
+                let i8_ptr =
+                    format!("inttoptr (i64 {abs_addr_or_idx} to i8*)");
+                let size = ir_type_byte_size(&ir_ty).unwrap_or(0);
+                self.emit_audit_validate_call_with_args(
+                    "volatile_load",
+                    &i8_ptr,
+                    size,
+                );
+            }
             let val = self.fresh_value();
             writeln!(
                 &mut self.out,
@@ -4359,6 +4455,28 @@ fn array_element_ir_type(ir_ty: &str) -> Option<String> {
     // types containing spaces (e.g. `[4 x [4 x i8]]`) survive intact.
     let (_n, t) = body.split_once(" x ")?;
     Some(t.trim().to_owned())
+}
+
+/// Slice 43: byte size of a primitive LLVM IR type, used by
+/// the audit wrap-call emitter to pass real `size` arguments
+/// to `PointerAuditor::validate_*`. Returns `None` for
+/// non-primitive types (arrays, structs, fn pointers) — the
+/// caller is expected to handle composite types separately
+/// or pass a conservative default.
+///
+/// Pointer width is assumed 64-bit (matches the v0.2 codegen
+/// default; a future target-data-layout pass will parameterise
+/// this).
+fn ir_type_byte_size(ir_ty: &str) -> Option<u64> {
+    match ir_ty {
+        "i1" | "i8" => Some(1),
+        "i16" => Some(2),
+        "i32" | "float" => Some(4),
+        "i64" | "double" => Some(8),
+        // Pointer types end with `*` — assume 64-bit target.
+        s if s.ends_with('*') => Some(8),
+        _ => None,
+    }
 }
 
 /// Slice 35: parse an array IR type `[N x T]` into `(N, T)`.
@@ -9033,6 +9151,123 @@ mod tests {
                 "missing impl method: `{needle}`; got:\n{ir}"
             );
         }
+    }
+
+    // ─── Slice 43: real ptr+size args at audit validate_* sites ─────────
+
+    #[test]
+    fn s43_register_block_store_passes_real_address_and_size() {
+        // A `Uart.tx_data = b;` write where Uart is `#audit
+        // #automaton ... { #address: 0x4000_4000; tx_data:
+        // u32 #offset: 0x00; }` lowers to a call passing the
+        // computed MMIO address as `i8* inttoptr (i64
+        // 1073758208 to i8*)` and the element size `i32 4`.
+        let src = "\
+            #interface PointerAuditor {\n  \
+              effect record_alloc(ptr: access<u8>, size: u32);\n  \
+              effect record_free(ptr: access<u8>);\n  \
+              effect validate_load(ptr: access<u8>, size: u32) -> bool;\n  \
+              effect validate_store(ptr: access<u8>, size: u32) -> bool;\n\
+            }\n\
+            #automaton ShadowSanitizer { }\n\
+            #impl PointerAuditor for ShadowSanitizer {\n  \
+              effect record_alloc(ptr: access<u8>, size: u32) { return; }\n  \
+              effect record_free(ptr: access<u8>) { return; }\n  \
+              effect validate_load(ptr: access<u8>, size: u32) -> bool { return true; }\n  \
+              effect validate_store(ptr: access<u8>, size: u32) -> bool { return true; }\n\
+            }\n\
+            #audit #automaton Uart {\n  \
+              #address: 0x4000_4000;\n  \
+              tx_data: u32 #offset: 0x00;\n\
+            }\n\
+            #effect send(b: u32) #mutates: [Uart] { Uart.tx_data = b; return; }\n\
+        ";
+        let ir = lower_str(src).expect("lower audit RB store");
+        // Real address (0x4000_4000 = 1073758208 decimal) and
+        // real size (i32 = 4 bytes).
+        assert!(
+            ir.contains("call i1 @ShadowSanitizer_validate_store(i8* inttoptr (i64 1073758208 to i8*), i32 4)"),
+            "expected real ptr+size args; got:\n{ir}"
+        );
+        // The slice-41 placeholder shape MUST NOT appear at
+        // this site any more.
+        assert!(
+            !ir.contains("validate_store(i8* null, i32 0)"),
+            "regression: placeholder args must not appear; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s43_register_block_load_passes_real_address_and_size() {
+        // Symmetric for the @snapshot RB read path.
+        let src = "\
+            #interface PointerAuditor {\n  \
+              effect record_alloc(ptr: access<u8>, size: u32);\n  \
+              effect record_free(ptr: access<u8>);\n  \
+              effect validate_load(ptr: access<u8>, size: u32) -> bool;\n  \
+              effect validate_store(ptr: access<u8>, size: u32) -> bool;\n\
+            }\n\
+            #automaton ShadowSanitizer { }\n\
+            #impl PointerAuditor for ShadowSanitizer {\n  \
+              effect record_alloc(ptr: access<u8>, size: u32) { return; }\n  \
+              effect record_free(ptr: access<u8>) { return; }\n  \
+              effect validate_load(ptr: access<u8>, size: u32) -> bool { return true; }\n  \
+              effect validate_store(ptr: access<u8>, size: u32) -> bool { return true; }\n\
+            }\n\
+            #audit #automaton Uart {\n  \
+              #address: 0x4000_4000;\n  \
+              status: u32 #offset: 0x08;\n\
+            }\n\
+            @fn read_status() -> u32 $ [Readable] { return @snapshot Uart.status; }\n\
+        ";
+        let ir = lower_str(src).expect("lower audit RB load");
+        // Address is 0x4000_4000 + 0x08 = 0x4000_4008 = 1073758216.
+        assert!(
+            ir.contains("call i1 @ShadowSanitizer_validate_load(i8* inttoptr (i64 1073758216 to i8*), i32 4)"),
+            "expected real ptr+size args for load; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s43_unchecked_store_passes_bitcast_pointer_and_real_size() {
+        // For non-RB unsafe stores, the pointer is an SSA
+        // value that needs a bitcast to i8*. The wrap call
+        // passes the bitcast result + the element byte size.
+        let src = "\
+            #interface PointerAuditor {\n  \
+              effect record_alloc(ptr: access<u8>, size: u32);\n  \
+              effect record_free(ptr: access<u8>);\n  \
+              effect validate_load(ptr: access<u8>, size: u32) -> bool;\n  \
+              effect validate_store(ptr: access<u8>, size: u32) -> bool;\n\
+            }\n\
+            #automaton ShadowSanitizer { }\n\
+            #impl PointerAuditor for ShadowSanitizer {\n  \
+              effect record_alloc(ptr: access<u8>, size: u32) { return; }\n  \
+              effect record_free(ptr: access<u8>) { return; }\n  \
+              effect validate_load(ptr: access<u8>, size: u32) -> bool { return true; }\n  \
+              effect validate_store(ptr: access<u8>, size: u32) -> bool { return true; }\n\
+            }\n\
+            #audit #automaton P { v: u32; }\n\
+            #effect store_via_unsafe(p: &u32) #mutates: [P] {\n  \
+              #unchecked_store<u32>(p, 7u32);\n  \
+              return;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower unchecked_store with audit");
+        // Bitcast appears before the validate call.
+        assert!(
+            ir.contains("bitcast i32* %p to i8*"),
+            "expected bitcast to i8*; got:\n{ir}"
+        );
+        // The validate call passes the bitcast result + size 4.
+        assert!(
+            ir.contains("call i1 @ShadowSanitizer_validate_store(i8* %tmp."),
+            "expected validate_store call referencing bitcast SSA; got:\n{ir}"
+        );
+        assert!(
+            ir.contains(", i32 4)"),
+            "expected size i32 4 (i32 element); got:\n{ir}"
+        );
     }
 
     // ─── Slice 36: sigma `(i, x)` index+value pattern ───────────────────

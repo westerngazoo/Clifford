@@ -7,6 +7,94 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 43: real ptr+size args at audit `validate_*` call sites (2026-05-13)
+
+Closes the slice-41 deferred work. Every audit `validate_*`
+call now passes the **actual** pointer (bitcast or
+inttoptr to `i8*`) and the **actual** element byte size
+— no more slice-41 placeholders (`i8* null, i32 0`).
+
+```llvm
+; before slice 43 (placeholder):
+%tmp.7 = call i1 @ShadowSanitizer_validate_store(i8* null, i32 0)
+
+; after slice 43 (real args):
+%tmp.7 = call i1 @ShadowSanitizer_validate_store(
+    i8* inttoptr (i64 1073758216 to i8*),
+    i32 4
+)
+```
+
+For the slice-42 counting Sanitizer, the real args don't
+change runtime behaviour — the counter increment doesn't
+depend on the args. But the IR shape is now correct for
+a future Sanitizer that does real shadow-table validation
+(KASAN-style): the call-site contract is fully wired.
+
+**Pipeline changes:**
+
+- **`crates/codegen/src/lib.rs`:**
+  - New helper `ir_type_byte_size(ir_ty: &str) ->
+    Option<u64>` — maps primitive IR types to byte
+    counts (`i32` → 4, `i64`/pointer → 8, etc.).
+  - `emit_audit_marker_if_needed` and
+    `emit_audit_marker_for_automaton` now emit the
+    marker comment ONLY (the slice-41 wiring of the
+    placeholder call is gone).
+  - New helpers `audit_context_active()` /
+    `audit_marker_active_for(automaton)` let call
+    sites independently gate their `validate_*` call
+    emission alongside the marker.
+  - The four call sites (
+    `emit_unchecked_load`, `emit_unchecked_store`,
+    `emit_field_store::RegisterBlock`,
+    `emit_field_load::RegisterBlock`,
+    `emit_indexed_field_store::RegisterBlock`,
+    `emit_field_access_by_name::RegisterBlock`)
+    each:
+    1. Materialize an `i8*` for the pointer (bitcast
+       for typed-ptr SSA, inline `inttoptr (i64 …
+       to i8*)` for register-block).
+    2. Compute the element byte size via
+       `ir_type_byte_size`.
+    3. Call
+       `emit_audit_validate_call_with_args(kind,
+       &i8_ptr, size)`.
+  - The slice-41 placeholder variant
+    `emit_audit_validate_call(kind)` is removed (no
+    callers left).
+
+**Tests added (3 codegen):**
+
+- `s43_register_block_store_passes_real_address_and_size`
+  — Uart.tx_data store: real address + size 4.
+  Asserts the placeholder shape no longer appears.
+- `s43_register_block_load_passes_real_address_and_size`
+  — symmetric for `@snapshot Uart.status` (load path
+  with field offset added to base).
+- `s43_unchecked_store_passes_bitcast_pointer_and_real_size`
+  — non-RB unsafe store: bitcast to i8* + size 4.
+
+The slice-41 test
+`s41_audit_store_emits_validate_store_call_before_store`
+still passes (substring matches the new shape too).
+The slice-42 counter tests still pass (the counter
+increments don't depend on the args).
+
+**The full `#audit` chain after slice 43:**
+
+User adds `#audit` to an automaton → compiler auto-
+includes interface + counting Sanitizer → emits
+counter-incrementing Sanitizer methods → inserts
+`validate_load` / `validate_store` calls **with real
+ptr+size arguments** at every audited unsafe site →
+user reads counters via `@snapshot` for runtime
+observability.
+
+End-to-end working with real instrumentation AND the
+correct call-site contract for future shadow-table
+Sanitizers.
+
 ### Added — Slice 42: counting `ShadowSanitizer` (real instrumentation, not no-ops) (2026-05-13)
 
 Promotes the `ShadowSanitizer` from "permissive default
