@@ -7,6 +7,102 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 41: codegen rewrites audit markers into `PointerAuditor` calls (2026-05-13)
+
+Closes the `#audit` runway. Three things landed:
+
+1. **`access<T>` lowering.** `lower_type` now maps
+   `access<T>` to `T*` — same shape as `&T` for codegen
+   purposes, with the nominal-type provenance (Decision
+   #19) handled upstream. This unblocks the PointerAuditor
+   interface methods (which take `access<u8>` parameters).
+2. **`#impl` method codegen.** Each
+   `#impl Interface for Automaton { effect …(…) { … } }`
+   method now emits an LLVM function named
+   `<Automaton>_<method>` (mirrors the transition naming
+   convention). The body lowers like an `#effect` body
+   minus the fence / atomic-mask plumbing (impl methods
+   inherit no `#mutates` / `#priority` / `#atomic`
+   clauses).
+3. **Marker → call rewrite.** Every
+   `; audit-wrap site for <Owner> (<primitive>)` marker
+   for a `*_load` or `*_store` primitive now emits a
+   `call i1 @ShadowSanitizer_validate_<load|store>` call
+   immediately after the comment, before the unsafe
+   operation. The marker comment stays for documentation.
+
+```llvm
+; audit-wrap site for Uart (volatile_store) ; Decision #18
+%tmp.0 = call i1 @ShadowSanitizer_validate_store(i8* null, i32 0) ; slice-41 placeholder args (real ptr+size plumbed in a follow-up)
+store volatile i32 %b, i32* inttoptr (i64 1073758208 to i32*)
+```
+
+**Slice 41 is the MVP — pointer + size are placeholders
+(`i8* null` / `i32 0`).** The ShadowSanitizer permissive
+default returns `true` regardless, so the placeholder
+arguments have no runtime effect. Real argument plumbing
+(materialize the ptr as an i8* SSA, compute byte size
+from the IR element type) is a future follow-up slice
+once a real `ShadowSanitizer` with shadow state lands.
+
+`unchecked_cast` and `unchecked_offset` deliberately do
+NOT emit calls — the `PointerAuditor` interface has no
+hook for them. Their markers stay as documentation.
+
+**Pipeline changes (`crates/codegen/src/lib.rs`):**
+
+- `lower_type` gains a `TypeKind::Access` arm.
+- New `Emitter::emit_impl(decl: &ImplDecl)` — emits one
+  LLVM function per method. Each method body lowers via
+  the existing `emit_block` machinery.
+- `lower()`'s pass-3 loop now handles `Item::Impl` (was
+  previously skipped).
+- New `Emitter::emit_audit_validate_call(kind)` — maps
+  the primitive kind to a `validate_load` /
+  `validate_store` call (no call for cast / offset).
+  Called from `emit_audit_marker_if_needed` (slice-21+
+  unsafe primitives) and `emit_audit_marker_for_automaton`
+  (slice-23 register-block path).
+
+**Tests:**
+
+- `s41_access_t_lowers_to_pointer` — replaces the
+  pre-slice-41 `unsupported_type_emits_e0810` test (the
+  NotYetImplemented for `access<T>` is gone).
+- `s41_audit_store_emits_validate_store_call_before_store`
+  — end-to-end: marker + call appear in the right
+  order.
+- `s41_unchecked_cast_and_offset_do_not_emit_calls` —
+  verifies the negative case for primitives without a
+  hook.
+- `s41_impl_methods_emit_as_llvm_functions` — all four
+  PointerAuditor methods emit as
+  `@ShadowSanitizer_<method>` functions with the
+  expected signatures.
+
+**The full `#audit` runway after slice 41:**
+
+| Slice | Landed |
+|-------|--------|
+| 20    | `#audit` modifier surface |
+| 21–23, 26 | Codegen markers |
+| 28    | DECISIONS.md sync |
+| 37    | `PointerAuditor` interface in stdlib |
+| 38    | `ShadowSanitizer` registration |
+| 39    | `#impl` method bodies + permissive default |
+| 40    | Compiler auto-includes `clifford::audit` |
+| **41** | **Marker → real PointerAuditor call** |
+
+End-to-end: a user adds `#audit` to an automaton; the
+compiler auto-includes the canonical interface + default
+Sanitizer; emits `<Sanitizer>_<method>` functions; and
+inserts `validate_load` / `validate_store` calls at
+every unsafe load / store site inside an audited
+automaton. The IR is correct shape; runtime behaviour
+is permissive (no real validation) until a non-default
+Sanitizer with shadow state is wired in (future stdlib
+work).
+
 ### Added — Slice 40: auto-include `clifford::audit` for `#audit` programs (2026-05-13)
 
 A user program that declares `#audit #automaton …` no

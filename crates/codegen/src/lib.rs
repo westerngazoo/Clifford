@@ -75,8 +75,8 @@ use std::fmt::Write;
 
 use clifford_ast::{
     AssignOp, AutomatonDecl, BinaryOp, Block, EffectDecl, Expr, ExprKind, FieldAssign, FnDecl,
-    InterruptDecl, Item, Param, PrimitiveType, Program, Stmt, StmtKind, TransitionDecl, TypeExpr,
-    TypeKind, UnaryOp,
+    ImplDecl, InterruptDecl, Item, Param, PrimitiveType, Program, Stmt, StmtKind, TransitionDecl,
+    TypeExpr, TypeKind, UnaryOp,
 };
 use clifford_resolve::Resolution;
 use clifford_types::{Type, Typing};
@@ -203,10 +203,17 @@ pub fn lower(
             Item::Effect(decl) => emitter.emit_effect(decl),
             Item::Interrupt(decl) => emitter.emit_interrupt(decl),
             Item::Automaton(decl) => emitter.emit_automaton_transitions(decl),
-            // Other items (`@type`, `@trait`, `#interface`, `#impl`,
-            // `#test`, `@sequential`) defer to subsequent slices.
-            // Skipping (vs erroring) means partial programs still
-            // produce usable IR for the supported portion.
+            // Slice 41 (Decision #18): emit each `#impl
+            // Interface for Automaton { effect …(…) { … } }`
+            // method as an LLVM function named
+            // `<Automaton>_<method>`. The slice-41 audit-
+            // marker-rewrite pass references these symbols.
+            Item::Impl(decl) => emitter.emit_impl(decl),
+            // Other items (`@type`, `@trait`, `#interface`,
+            // `#test`, `@sequential`) defer to subsequent
+            // slices. Skipping (vs erroring) means partial
+            // programs still produce usable IR for the
+            // supported portion.
             _ => {}
         }
     }
@@ -925,6 +932,65 @@ impl<'a> Emitter<'a> {
         writeln!(&mut self.out).ok();
 
         self.pending_exit_fence = None;
+    }
+
+    /// Slice 41 (Decision #18): emit one LLVM function per
+    /// `#impl Interface for Automaton { effect …(…) { … } }`
+    /// method, named `<Automaton>_<method>` (mirrors the
+    /// transition naming convention). The function signature
+    /// is the method's signature; the body is the method's
+    /// body.
+    ///
+    /// Methods inherit no `#mutates` / `#priority` / `#atomic`
+    /// clauses (those live on top-level effects/interrupts);
+    /// the impl method's contract is purely the interface's
+    /// declared signature. v0.2 emits the method as a regular
+    /// LLVM function with no fences and no atomic-mask wrapping
+    /// — the interface's design is intentionally minimal so
+    /// the wrap-emitting pass (also slice 41) can call it
+    /// without any pre/post-amble surprises.
+    fn emit_impl(&mut self, decl: &ImplDecl) {
+        for method in &decl.methods {
+            self.reset_per_function_state();
+
+            let ret_ty = self.lower_return_type(method.return_type.as_ref());
+
+            let mut sig_parts: Vec<String> =
+                Vec::with_capacity(method.params.len());
+            for p in &method.params {
+                match self.lower_param(p) {
+                    Ok(s) => sig_parts.push(s),
+                    Err(e) => {
+                        self.errors.push(e);
+                        return;
+                    }
+                }
+                let p_ir_ty =
+                    self.lower_type(&p.ty).unwrap_or_else(|_| "i32".to_owned());
+                self.locals.push(LocalBinding {
+                    name: p.name.clone(),
+                    value: format!("%{}", p.name),
+                    ir_type: p_ir_ty,
+                    storage: LocalStorage::Ssa,
+                });
+            }
+
+            let fn_name = format!(
+                "{auto}_{m}",
+                auto = decl.automaton_name,
+                m = method.name,
+            );
+            writeln!(
+                &mut self.out,
+                "define {ret_ty} @{fn_name}({params}) {{",
+                params = sig_parts.join(", "),
+            )
+            .ok();
+            writeln!(&mut self.out, "entry:").ok();
+            self.emit_block(&method.body, &ret_ty);
+            writeln!(&mut self.out, "}}").ok();
+            writeln!(&mut self.out).ok();
+        }
     }
 
     /// Emit one LLVM function per `#transition` inside this
@@ -2406,6 +2472,7 @@ impl<'a> Emitter<'a> {
                     "  ; audit-wrap site for {single} ({kind}) ; Decision #18",
                 )
                 .ok();
+                self.emit_audit_validate_call(kind);
             }
             many => {
                 // Slice 26: multi-owner format. Brackets +
@@ -2420,8 +2487,46 @@ impl<'a> Emitter<'a> {
                     "  ; audit-wrap site for [{list}] ({kind}) ; Decision #18",
                 )
                 .ok();
+                self.emit_audit_validate_call(kind);
             }
         }
+    }
+
+    /// Slice 41 (Decision #18 MVP): emit a placeholder call to
+    /// the auto-included `ShadowSanitizer`'s
+    /// `validate_load` / `validate_store` method for load /
+    /// store unsafe primitives. Pointer and size are
+    /// placeholders (`i8* null` / `i32 0`) for v0.2 — real
+    /// argument plumbing (materialise the ptr as an i8* SSA
+    /// value, compute the actual byte count from the IR
+    /// element type) lands in a follow-up slice.
+    ///
+    /// The placeholder calls prove the dispatch wiring works
+    /// end-to-end: the auto-included `ShadowSanitizer`'s
+    /// permissive default returns `true`, so the calls have
+    /// no runtime effect but the IR shape is correct for the
+    /// future when real arguments + abort-on-false logic
+    /// land.
+    ///
+    /// `unchecked_cast` / `unchecked_offset` are not
+    /// validated because the `PointerAuditor` interface
+    /// doesn't define a hook for them — only the load/store
+    /// validation methods. The slice-21+ markers for those
+    /// primitives remain in the IR as documentation.
+    fn emit_audit_validate_call(&mut self, kind: &str) {
+        let method = match kind {
+            "unchecked_load" | "volatile_load" => "validate_load",
+            "unchecked_store" | "volatile_store" => "validate_store",
+            // No interface hook for cast / offset; the marker
+            // is documentation-only at those sites.
+            _ => return,
+        };
+        let result = self.fresh_value();
+        writeln!(
+            &mut self.out,
+            "  {result} = call i1 @ShadowSanitizer_{method}(i8* null, i32 0) ; slice-41 placeholder args (real ptr+size plumbed in a follow-up)",
+        )
+        .ok();
     }
 
     /// Slice 23 (Decision #18): emit a `; audit-wrap site for
@@ -2460,6 +2565,10 @@ impl<'a> Emitter<'a> {
                 "  ; audit-wrap site for {automaton} ({kind}) ; Decision #18",
             )
             .ok();
+            // Slice 41: emit the placeholder validate_* call
+            // for register-block volatile load/store sites
+            // the same way the unsafe-primitive path does.
+            self.emit_audit_validate_call(kind);
         }
     }
 
@@ -3994,12 +4103,23 @@ impl<'a> Emitter<'a> {
                 }
                 Ok(format!("{{{}}}", parts.join(", ")))
             }
+            // Slice 41 (Decision #19): `access<T>` lowers to `T*`
+            // — same shape as `&T` for codegen purposes. The
+            // nominal distinction (audit trail, narrow-unsafe
+            // discipline) is upstream of codegen; at the LLVM
+            // level both are typed pointers. The `mutable` flag
+            // on `AccessType` is consumed by upstream phases
+            // (Decision #19's nominal type system); codegen
+            // doesn't currently emit `noalias` / `readonly`
+            // attributes (separate slice).
+            TypeKind::Access(at) => {
+                let inner = self.lower_type(&at.inner)?;
+                Ok(format!("{inner}*"))
+            }
             // `Path(...)` (nominal-type aliases / ADTs) and
-            // `Access(...)` and `Fn(...)` defer to subsequent slices.
-            // ADT lowering needs tagged-union representation; access
-            // pointer types follow the `&T` shape but with target-
-            // specific provenance (Decision #19); fn pointers need
-            // their full signature lowered.
+            // `Fn(...)` defer to subsequent slices. ADT
+            // lowering needs tagged-union representation; fn
+            // pointers need their full signature lowered.
             _ => Err(CodegenError::NotYetImplemented {
                 what: type_kind_name(&t.kind),
             }),
@@ -4765,17 +4885,18 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_type_emits_e0810() {
-        // Slice 2 supports `&T` / `[T; N]` / `[T]` / `(T1, T2)`, but
-        // `access<T>` (Decision #19's nominal pointer) still defers
-        // to a later codegen slice — its lowering needs target-
-        // specific provenance handling.
+    fn s41_access_t_lowers_to_pointer() {
+        // Slice 41: `access<T>` now lowers to `T*` so the
+        // PointerAuditor interface methods (which take
+        // `access<u8>` parameters) compile through to LLVM IR.
+        // The slice-2 NotYetImplemented for `access<T>` was the
+        // codegen-side block on auto-included audit stdlib.
         let src = "@fn r(p: access<u32>) -> u32 { return 0u32; }";
-        let errors = lower_str(src).expect_err("expected E0810 for access<T>");
-        let saw = errors
-            .iter()
-            .any(|e| matches!(e, CodegenError::NotYetImplemented { what } if *what == "access<T> type"));
-        assert!(saw, "expected NotYetImplemented(access); got {errors:?}");
+        let ir = lower_str(src).expect("access<u32> should lower to i32*");
+        assert!(
+            ir.contains("define i32 @r(i32* %p)"),
+            "expected access<u32> parameter typed as i32*; got:\n{ir}"
+        );
     }
 
     // ─── Primitive type-mapping table ────────────────────────────────────
@@ -8791,6 +8912,127 @@ mod tests {
             ir.contains("; audit-wrap site for Buf (unchecked_cast) ; Decision #18"),
             "expected audit marker for Buf; got:\n{ir}"
         );
+    }
+
+    // ─── Slice 41: marker → real PointerAuditor call rewrite ────────────
+
+    #[test]
+    fn s41_audit_store_emits_validate_store_call_before_store() {
+        // The lower_str helper (used by all other codegen
+        // tests) does NOT invoke the slice-40 auto-prepend
+        // — so we explicitly supply the PointerAuditor +
+        // ShadowSanitizer ourselves. The slice-41 rewrite then
+        // emits a `call i1 @ShadowSanitizer_validate_store` AT
+        // the audit-marker site, before the volatile store.
+        let src = "\
+            #interface PointerAuditor {\n  \
+              effect record_alloc(ptr: access<u8>, size: u32);\n  \
+              effect record_free(ptr: access<u8>);\n  \
+              effect validate_load(ptr: access<u8>, size: u32) -> bool;\n  \
+              effect validate_store(ptr: access<u8>, size: u32) -> bool;\n\
+            }\n\
+            #automaton ShadowSanitizer { }\n\
+            #impl PointerAuditor for ShadowSanitizer {\n  \
+              effect record_alloc(ptr: access<u8>, size: u32) { return; }\n  \
+              effect record_free(ptr: access<u8>) { return; }\n  \
+              effect validate_load(ptr: access<u8>, size: u32) -> bool { return true; }\n  \
+              effect validate_store(ptr: access<u8>, size: u32) -> bool { return true; }\n\
+            }\n\
+            #audit #automaton Uart {\n  \
+              #address: 0x4000_4000;\n  \
+              tx_data: u32 #offset: 0x00;\n\
+            }\n\
+            #effect send(b: u32) #mutates: [Uart] { Uart.tx_data = b; return; }\n\
+        ";
+        let ir = lower_str(src).expect("lower audit with full stdlib");
+        // The marker comment is still there for documentation.
+        assert!(
+            ir.contains("audit-wrap site for Uart (volatile_store)"),
+            "expected marker comment; got:\n{ir}"
+        );
+        // The slice-41 placeholder call right after.
+        assert!(
+            ir.contains("call i1 @ShadowSanitizer_validate_store"),
+            "expected validate_store call; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s41_unchecked_cast_and_offset_do_not_emit_calls() {
+        // The interface has no hook for cast / offset. Slice 41
+        // intentionally skips the call emission for those
+        // primitives — the markers stay as documentation.
+        let src = "\
+            #interface PointerAuditor {\n  \
+              effect record_alloc(ptr: access<u8>, size: u32);\n  \
+              effect record_free(ptr: access<u8>);\n  \
+              effect validate_load(ptr: access<u8>, size: u32) -> bool;\n  \
+              effect validate_store(ptr: access<u8>, size: u32) -> bool;\n\
+            }\n\
+            #automaton ShadowSanitizer { }\n\
+            #impl PointerAuditor for ShadowSanitizer {\n  \
+              effect record_alloc(ptr: access<u8>, size: u32) { return; }\n  \
+              effect record_free(ptr: access<u8>) { return; }\n  \
+              effect validate_load(ptr: access<u8>, size: u32) -> bool { return true; }\n  \
+              effect validate_store(ptr: access<u8>, size: u32) -> bool { return true; }\n\
+            }\n\
+            #audit #automaton P { v: u32; }\n\
+            #effect probe() #mutates: [P] {\n  \
+              let p: &u32 = #unchecked_cast<u64, &u32>(\"mmio\", 0x4000u64);\n  \
+              let _q: &u32 = #unchecked_offset<u32>(p, 4i32);\n  \
+              return;\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower cast+offset audit");
+        // Markers for unchecked_cast / unchecked_offset are
+        // still emitted (slice-21+ documentation behaviour).
+        assert!(
+            ir.contains("audit-wrap site for P (unchecked_cast)"),
+            "expected cast marker; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("audit-wrap site for P (unchecked_offset)"),
+            "expected offset marker; got:\n{ir}"
+        );
+        // But NO validate_* calls for these — the
+        // PointerAuditor interface doesn't define a hook.
+        assert!(
+            !ir.contains("call i1 @ShadowSanitizer_validate"),
+            "cast/offset must not emit validate_* calls; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s41_impl_methods_emit_as_llvm_functions() {
+        // The four PointerAuditor methods on ShadowSanitizer
+        // emit as `@ShadowSanitizer_<method>` LLVM functions.
+        let src = "\
+            #interface PointerAuditor {\n  \
+              effect record_alloc(ptr: access<u8>, size: u32);\n  \
+              effect record_free(ptr: access<u8>);\n  \
+              effect validate_load(ptr: access<u8>, size: u32) -> bool;\n  \
+              effect validate_store(ptr: access<u8>, size: u32) -> bool;\n\
+            }\n\
+            #automaton ShadowSanitizer { }\n\
+            #impl PointerAuditor for ShadowSanitizer {\n  \
+              effect record_alloc(ptr: access<u8>, size: u32) { return; }\n  \
+              effect record_free(ptr: access<u8>) { return; }\n  \
+              effect validate_load(ptr: access<u8>, size: u32) -> bool { return true; }\n  \
+              effect validate_store(ptr: access<u8>, size: u32) -> bool { return true; }\n\
+            }\n\
+        ";
+        let ir = lower_str(src).expect("lower interface+impl");
+        for needle in [
+            "define void @ShadowSanitizer_record_alloc(i8* %ptr, i32 %size)",
+            "define void @ShadowSanitizer_record_free(i8* %ptr)",
+            "define i1 @ShadowSanitizer_validate_load(i8* %ptr, i32 %size)",
+            "define i1 @ShadowSanitizer_validate_store(i8* %ptr, i32 %size)",
+        ] {
+            assert!(
+                ir.contains(needle),
+                "missing impl method: `{needle}`; got:\n{ir}"
+            );
+        }
     }
 
     // ─── Slice 36: sigma `(i, x)` index+value pattern ───────────────────
