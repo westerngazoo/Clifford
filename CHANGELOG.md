@@ -7,6 +7,101 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 42: counting `ShadowSanitizer` (real instrumentation, not no-ops) (2026-05-13)
+
+Promotes the `ShadowSanitizer` from "permissive default
+that returns `true` and does nothing" to a real
+**call-counting Sanitizer**. Each `validate_*` /
+`record_*` call now increments a per-kind `u32` counter
+on the Sanitizer's automaton state; user code reads the
+counters via `@snapshot ShadowSanitizer.<field>`.
+
+```clifford
+#audit #automaton Uart {
+  #address: 0x4000_4000;
+  tx_data: u32 #offset: 0x00;
+}
+
+#effect send(b: u32) #mutates: [Uart] { Uart.tx_data = b; return; }
+
+@fn observe_stores() -> u32 $ [Readable] {
+  return @snapshot ShadowSanitizer.stores;
+}
+```
+
+After two `send(_)` calls, `observe_stores()` returns
+`2`. Real, observable instrumentation that works with
+slice 41's placeholder `i8* null, i32 0` arguments —
+the counter increment doesn't depend on the actual ptr
+or size.
+
+**Why counting (not full shadow-memory tracking)?**
+
+KASAN-style validation needs (a) an allocator
+infrastructure and (b) real ptr+size arguments at every
+wrap call. Both are gated on later stdlib slices.
+Counting is the useful middle ground that works *today*
+and unblocks debugging / smoke-testing / profiling
+patterns:
+
+- "did my ISR's audit-wrapped store actually execute?"
+  → diff `@snapshot ShadowSanitizer.stores` before/after
+- "how many loads happened during this region?"
+  → reset to zero, run, read back
+
+**Concurrency caveat (v0.2):** the counter increments
+are load-modify-store with no synchronization.
+Multi-core or interrupt-preemption races produce
+under-counts. Wrap audited regions in
+`#atomic: interrupt_critical;` (v0.2-δ/ε) for accurate
+counts under concurrency.
+
+**Pipeline changes:**
+
+- **`crates/stdlib/cl/audit_shadow_sanitizer.cl`** —
+  the `#automaton ShadowSanitizer` gains four `u32`
+  counter fields (`allocs`, `frees`, `loads`,
+  `stores`); each `#impl` method increments its
+  matching counter via the v0.2 `+=` mutation sugar.
+- **`crates/cli/src/main.rs`** — `needs_audit_stdlib`
+  back-off heuristic also bails out on
+  `#automaton ShadowSanitizer` (so the stdlib's own
+  source compiles standalone, and any user-supplied
+  custom Sanitizer named ShadowSanitizer doesn't
+  trigger a duplicate-symbol conflict).
+
+**Tests added (1 stdlib + 2 cli):**
+
+- `audit_shadow_sanitizer_has_call_counters` — locks
+  in the four counter fields and the four counter
+  increments in the canonical source.
+- `s42_audit_program_increments_validate_store_counter`
+  — end-to-end IR shape: validate_store fn, GEP to
+  idx 3 (stores), counter increment, call from the
+  audited effect, observer fn reading via @snapshot.
+- `s42_user_can_reset_counters_via_mutate` — user
+  effects that list `ShadowSanitizer` in `#mutates:`
+  can reset the counters (they're ordinary `u32`
+  fields, not magic).
+
+The slice-40 `s40_user_supplied_pointer_auditor_suppresses_auto_include`
+test was extended with a parallel check for the
+`#automaton ShadowSanitizer` back-off path.
+
+**The full `#audit` chain after slice 42:**
+
+A user adds `#audit` to an automaton → compiler auto-
+includes interface + counting Sanitizer → emits
+Sanitizer methods that increment per-kind counters →
+inserts `validate_load` / `validate_store` calls at
+every audited unsafe site → user reads the counters
+via `@snapshot` for runtime observability.
+
+End-to-end working with real, useful runtime
+instrumentation. Real KASAN-style validation (with
+shadow allocation tables + ptr+size plumbing) remains
+future work but the chain it builds on is complete.
+
 ### Added — Slice 41: codegen rewrites audit markers into `PointerAuditor` calls (2026-05-13)
 
 Closes the `#audit` runway. Three things landed:

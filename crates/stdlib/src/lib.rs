@@ -177,4 +177,31 @@ mod tests {
         let program = parse(&tokens).expect("parse combined audit module");
         resolve(&program).expect("resolve combined audit module");
     }
+
+    /// Slice 42: the call-counting ShadowSanitizer declares
+    /// four `u32` counter fields and increments the matching
+    /// counter from each `validate_*` / `record_*` method.
+    /// The test locks in the counter-field set so a future
+    /// edit can't silently remove them.
+    #[test]
+    fn audit_shadow_sanitizer_has_call_counters() {
+        for required in &["allocs", "frees", "loads", "stores"] {
+            assert!(
+                AUDIT_SHADOW_SANITIZER_CL_SOURCE.contains(&format!("{required}: u32")),
+                "missing counter field `{required}: u32` in audit_shadow_sanitizer.cl",
+            );
+        }
+        // Each method increments its matching counter.
+        for required in &[
+            "ShadowSanitizer.allocs += 1u32",
+            "ShadowSanitizer.frees += 1u32",
+            "ShadowSanitizer.loads += 1u32",
+            "ShadowSanitizer.stores += 1u32",
+        ] {
+            assert!(
+                AUDIT_SHADOW_SANITIZER_CL_SOURCE.contains(required),
+                "missing counter increment `{required}` in audit_shadow_sanitizer.cl",
+            );
+        }
+    }
 }

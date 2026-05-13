@@ -347,27 +347,29 @@ fn run_compile(
 /// - `error[effect]:`  — categorical / mutation-profile / call-graph
 /// - `error[ortho]:`   — §7 GA orthogonality (write-write race detection)
 /// - `error[codegen]:` — IR-emission gap (NotYetImplemented surface)
-/// Slice 40: textual heuristic — does the source declare or
-/// reference any `#audit` automaton? If yes, the CLI prepends
-/// the canonical `clifford::audit` module (interface + default
-/// `ShadowSanitizer`) so the user doesn't have to copy-paste
-/// the contract.
+/// Slice 40 + 42: textual heuristic — does the source declare
+/// or reference any `#audit` automaton, and would auto-
+/// prepending the canonical `clifford::audit` module produce
+/// a duplicate-symbol conflict?
 ///
 /// The check is intentionally simple: a substring match for
-/// `#audit`. The only contexts in which `#audit` can appear in
-/// well-formed Clifford source are:
-///   - the `#audit` modifier on `#automaton`
-///   - inside a comment / string literal (false positive — but
-///     prepending the audit module in that case is harmless;
-///     the prepended source compiles cleanly on its own).
+/// `#audit`. The auto-include is opt-in by way of the `#audit`
+/// keyword.
 ///
-/// Returns `false` for the vast majority of programs — the
-/// auto-include is opt-in by way of the `#audit` keyword.
+/// Back-off conditions (the user is bringing their own audit
+/// surface, so auto-prepending would conflict):
+///   - source declares `#interface PointerAuditor`
+///   - source declares `#automaton ShadowSanitizer` (this
+///     catches the stdlib's own audit_shadow_sanitizer.cl
+///     when it's compiled standalone, and any user-side
+///     custom Sanitizer named ShadowSanitizer)
 fn needs_audit_stdlib(source: &str) -> bool {
-    // Bail out quickly if the user's source already declares
-    // its own `PointerAuditor` interface — they're providing
-    // their own; auto-prepending would conflict.
+    // Bail out if the user's source already declares its own
+    // PointerAuditor interface or ShadowSanitizer automaton.
     if source.contains("#interface PointerAuditor") {
+        return false;
+    }
+    if source.contains("#automaton ShadowSanitizer") {
         return false;
     }
     source.contains("#audit")
@@ -1087,5 +1089,83 @@ mod tests {
         assert!(!needs_audit_stdlib(
             "#interface PointerAuditor { } #audit #automaton X { }"
         ));
+        // Slice 42: user-supplied ShadowSanitizer also
+        // suppresses (otherwise the stdlib would conflict
+        // with the user's automaton declaration).
+        assert!(!needs_audit_stdlib(
+            "#automaton ShadowSanitizer { } #audit #automaton X { }"
+        ));
+    }
+
+    // ─── Slice 42: counting ShadowSanitizer end-to-end ──────────────────
+
+    #[test]
+    fn s42_audit_program_increments_validate_store_counter() {
+        // Auto-included counting Sanitizer's validate_store
+        // increments `ShadowSanitizer.stores`. End-to-end:
+        // the user effect → validate_store call → counter
+        // increment → user reads the counter via @snapshot.
+        let src = "\
+            #audit #automaton Uart {\n  \
+              #address: 0x4000_4000;\n  \
+              tx_data: u32 #offset: 0x00;\n\
+            }\n\
+            #effect send(b: u32) #mutates: [Uart] { Uart.tx_data = b; return; }\n\
+            @fn observe_stores() -> u32 $ [Readable] {\n  \
+              return @snapshot ShadowSanitizer.stores;\n\
+            }\n\
+        ";
+        let ir = compile_source(src, "fw").expect("audit program compiles");
+        // The validate_store function increments idx 3 (stores).
+        assert!(
+            ir.contains("define i1 @ShadowSanitizer_validate_store"),
+            "expected validate_store fn; got:\n{ir}"
+        );
+        // Within validate_store, a load+inc+store on idx 3.
+        // The increment idiom is `add i32 %tmp.X, 1`.
+        assert!(
+            ir.contains("@ShadowSanitizer.state, i32 0, i32 3"),
+            "expected GEP to stores counter (idx 3); got:\n{ir}"
+        );
+        assert!(
+            ir.contains("add i32"),
+            "expected counter increment; got:\n{ir}"
+        );
+        // The send effect's audit-wrap call site fires through
+        // validate_store.
+        assert!(
+            ir.contains("call i1 @ShadowSanitizer_validate_store"),
+            "expected validate_store call from send; got:\n{ir}"
+        );
+        // The observer reads stores via @snapshot — same GEP
+        // shape as the increment, but as a read.
+        assert!(
+            ir.contains("define i32 @observe_stores"),
+            "expected observer fn; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s42_user_can_reset_counters_via_mutate() {
+        // The Sanitizer's counters are ordinary u32 fields, so
+        // user code that lists ShadowSanitizer in `#mutates:`
+        // can reset them to zero (e.g. at the start of a
+        // measurement region).
+        let src = "\
+            #audit #automaton Buf { v: u32; }\n\
+            #effect reset_audit_counters() #mutates: [ShadowSanitizer] {\n  \
+              ShadowSanitizer.loads = 0u32;\n  \
+              ShadowSanitizer.stores = 0u32;\n  \
+              return;\n\
+            }\n\
+        ";
+        let ir = compile_source(src, "fw").expect("counter reset compiles");
+        // The reset effect emits direct stores to the counter
+        // fields (no validate_* calls — the effect itself
+        // isn't audited).
+        assert!(
+            ir.contains("define void @reset_audit_counters"),
+            "expected reset effect; got:\n{ir}"
+        );
     }
 }
