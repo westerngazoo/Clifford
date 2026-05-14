@@ -7,6 +7,93 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 44: abort-on-false (trap when `validate_*` returns false) (2026-05-13)
+
+Closes the soundness gap left by slice 41: the
+`validate_*` call result was emitted but never inspected.
+Slice 44 adds the conditional branch + trap shape so a
+future shadow-table Sanitizer that returns `false` on
+invalid pointer access actually halts execution rather
+than letting the unsafe op proceed.
+
+```llvm
+; before slice 44 — result discarded:
+%tmp.7 = call i1 @ShadowSanitizer_validate_store(...)
+store volatile i32 %b, i32* ...
+
+; after slice 44:
+%tmp.7 = call i1 @ShadowSanitizer_validate_store(...)
+br i1 %tmp.7, label %audit.ok.0, label %audit.viol.0
+audit.viol.0:
+  call void @llvm.trap()
+  unreachable
+audit.ok.0:
+  store volatile i32 %b, i32* ...
+```
+
+For the slice-42 counting Sanitizer, `validate_*` always
+returns `true` so the trap path is unreachable in
+practice — LLVM's optimizer will collapse the violation
+block. But the IR shape is correct for any future
+Sanitizer with real shadow-table validation.
+
+`@llvm.trap()` lowers to a target-specific halt
+instruction: `udf #0` on Cortex-M, `ud2` on x86,
+`ebreak` on RISC-V. Combined with `unreachable` it's
+the canonical "execution must not continue past this
+point" shape.
+
+**Pipeline changes:**
+
+- **`crates/codegen/src/lib.rs`:**
+  - New `Emitter::emit_audit_intrinsics_if_needed`
+    parallels `emit_staged_intrinsics_if_needed`. Emits
+    `declare void @llvm.trap()` once at module scope iff
+    any `#audit` automaton is present. Wired into
+    `lower()` alongside the staged-intrinsic emission.
+  - `emit_audit_validate_call_with_args` now emits the
+    full branch-and-trap shape after the validate call:
+    1. `br i1 %result, label %audit.ok.<id>, label %audit.viol.<id>`
+    2. `audit.viol.<id>:` block with `call void @llvm.trap()` + `unreachable`
+    3. `audit.ok.<id>:` block becomes the new
+       `current_block` so the unsafe op (and any
+       subsequent statements) emit there.
+
+The emit-block split adds two basic blocks per audited
+unsafe op. For programs with many audited operations,
+this expands the IR but LLVM's BB-merging optimisations
+collapse most of the overhead in `-O1` and above. The
+violation block in particular is a tail-call-shaped
+trap that LLVM coalesces aggressively.
+
+**Tests added (4 codegen):**
+
+- `s44_trap_intrinsic_declared_when_audit_present` —
+  the trap declaration appears at module scope when
+  `#audit` is present.
+- `s44_no_trap_intrinsic_for_non_audit_programs` —
+  bytewise stability: non-audit programs don't get the
+  declaration.
+- `s44_validate_call_branches_to_trap_or_continue` —
+  full IR shape: conditional branch on result, viol
+  block with trap+unreachable, ok block.
+- `s44_unsafe_op_emits_in_audit_ok_block` — the
+  volatile store (the protected unsafe op) emits AFTER
+  the audit.ok label.
+
+**The audit chain after slice 44:**
+
+User adds `#audit` → compiler auto-includes interface +
+counting Sanitizer → emits counter-incrementing
+Sanitizer methods → inserts `validate_*` calls with
+real ptr+size at every audited site → branches on the
+result and traps on false. The shape is now what a
+real KASAN-style ShadowSanitizer would consume; the
+slice-42 counting variant always returns true so the
+trap path is dead code (collapsed by LLVM). When a
+shadow-table Sanitizer lands later, the IR shape
+doesn't have to change — just the Sanitizer's body.
+
 ### Added — Slice 43: real ptr+size args at audit `validate_*` call sites (2026-05-13)
 
 Closes the slice-41 deferred work. Every audit `validate_*`

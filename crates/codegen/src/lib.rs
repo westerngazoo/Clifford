@@ -192,6 +192,11 @@ pub fn lower(
     // a plain `call` with no per-site declaration.
     emitter.emit_staged_intrinsics_if_needed(program);
 
+    // Slice 44 (Decision #18): if any automaton is `#audit`,
+    // the abort-on-false logic at audit wrap sites needs
+    // `@llvm.trap()` to be declared at module scope.
+    emitter.emit_audit_intrinsics_if_needed(program);
+
     // Pass 3: emit one LLVM function per @fn / #effect / #interrupt /
     // #transition. Order is preserved from source so callers see
     // callees declared first when source orders them naturally; LLVM
@@ -720,6 +725,33 @@ impl<'a> Emitter<'a> {
             "declare void @llvm.memcpy.p0.p0.i64(i8*, i8*, i64, i1)",
         )
         .ok();
+        writeln!(&mut self.out).ok();
+    }
+
+    /// Slice 44 (Decision #18): emit the `@llvm.trap`
+    /// declaration once at module scope iff the program
+    /// contains at least one `#audit` automaton. The slice-44
+    /// abort-on-false logic emits a trap call on the
+    /// `validate_*` failure path, and the trap intrinsic
+    /// needs to be declared at module scope before any caller
+    /// references it.
+    ///
+    /// Trap is `void @llvm.trap()` — terminates execution
+    /// with a target-specific instruction (`udf #0` on
+    /// Cortex-M, `ud2` on x86, `ebreak` on RISC-V).
+    /// Combined with `unreachable` after the call, LLVM
+    /// optimisation passes will collapse the violation block
+    /// to a single trap+unreachable shape regardless of
+    /// surrounding control flow.
+    fn emit_audit_intrinsics_if_needed(&mut self, program: &Program) {
+        let any_audit = program
+            .items
+            .iter()
+            .any(|item| matches!(item, Item::Automaton(decl) if decl.audited));
+        if !any_audit {
+            return;
+        }
+        writeln!(&mut self.out, "declare void @llvm.trap()").ok();
         writeln!(&mut self.out).ok();
     }
 
@@ -2561,6 +2593,31 @@ impl<'a> Emitter<'a> {
             "  {result} = call i1 @ShadowSanitizer_{method}(i8* {ptr_i8}, i32 {size_bytes})",
         )
         .ok();
+        // Slice 44: branch on the validation result. False
+        // path traps; true path continues to the unsafe op.
+        // The unsafe op now lives in the new `audit.ok.<id>`
+        // block — `current_block` is updated so subsequent
+        // emissions land there.
+        let id = self.next_label_id;
+        self.next_label_id += 1;
+        let ok_label = format!("audit.ok.{id}");
+        let viol_label = format!("audit.viol.{id}");
+        writeln!(
+            &mut self.out,
+            "  br i1 {result}, label %{ok_label}, label %{viol_label}",
+        )
+        .ok();
+        // Violation block: trap + unreachable terminator.
+        writeln!(&mut self.out, "{viol_label}:").ok();
+        writeln!(&mut self.out, "  call void @llvm.trap()").ok();
+        writeln!(&mut self.out, "  unreachable").ok();
+        // OK block: subsequent emissions (including the
+        // unsafe op the validate_* call protects) land here.
+        writeln!(&mut self.out, "{ok_label}:").ok();
+        self.current_block = ok_label;
+        // Reset the terminator flag — the new block is fresh
+        // and not yet terminated.
+        self.current_block_terminated = false;
     }
 
     // Slice 43: the slice-41 placeholder variant
@@ -9267,6 +9324,114 @@ mod tests {
         assert!(
             ir.contains(", i32 4)"),
             "expected size i32 4 (i32 element); got:\n{ir}"
+        );
+    }
+
+    // ─── Slice 44: abort-on-false (trap + unreachable on validate fail) ─
+
+    #[test]
+    fn s44_trap_intrinsic_declared_when_audit_present() {
+        // The `@llvm.trap()` declaration appears at module
+        // scope iff any `#audit` automaton is in the program.
+        let src = "\
+            #audit #automaton P { v: u32; }\n\
+        ";
+        let ir = lower_str(src).expect("lower audit-present program");
+        assert!(
+            ir.contains("declare void @llvm.trap()"),
+            "expected @llvm.trap declaration; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s44_no_trap_intrinsic_for_non_audit_programs() {
+        // Inverse: non-audit programs don't get the trap
+        // declaration (keeps slice-21 IR bytewise stable for
+        // non-audit code).
+        let src = "#automaton P { v: u32; }\n";
+        let ir = lower_str(src).expect("lower non-audit program");
+        assert!(
+            !ir.contains("declare void @llvm.trap()"),
+            "non-audit must not declare trap; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s44_validate_call_branches_to_trap_or_continue() {
+        // After every validate_* call: br i1 %result, label
+        // %audit.ok.<n>, label %audit.viol.<n>
+        // %audit.viol.<n>: call void @llvm.trap(); unreachable
+        // %audit.ok.<n>: <unsafe op continues>
+        let src = "\
+            #interface PointerAuditor {\n  \
+              effect record_alloc(ptr: access<u8>, size: u32);\n  \
+              effect record_free(ptr: access<u8>);\n  \
+              effect validate_load(ptr: access<u8>, size: u32) -> bool;\n  \
+              effect validate_store(ptr: access<u8>, size: u32) -> bool;\n\
+            }\n\
+            #automaton ShadowSanitizer { }\n\
+            #impl PointerAuditor for ShadowSanitizer {\n  \
+              effect record_alloc(ptr: access<u8>, size: u32) { return; }\n  \
+              effect record_free(ptr: access<u8>) { return; }\n  \
+              effect validate_load(ptr: access<u8>, size: u32) -> bool { return true; }\n  \
+              effect validate_store(ptr: access<u8>, size: u32) -> bool { return true; }\n\
+            }\n\
+            #audit #automaton Uart {\n  \
+              #address: 0x4000_4000;\n  \
+              tx_data: u32 #offset: 0x00;\n\
+            }\n\
+            #effect send(b: u32) #mutates: [Uart] { Uart.tx_data = b; return; }\n\
+        ";
+        let ir = lower_str(src).expect("lower audit branch+trap");
+        // The conditional branch on the validate result.
+        assert!(
+            ir.contains("br i1 %tmp.") && ir.contains("label %audit.ok.")
+                && ir.contains("label %audit.viol."),
+            "expected conditional branch on validate result; got:\n{ir}"
+        );
+        // The violation block: trap + unreachable.
+        assert!(
+            ir.contains("call void @llvm.trap()"),
+            "expected trap call; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("unreachable"),
+            "expected unreachable terminator; got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn s44_unsafe_op_emits_in_audit_ok_block() {
+        // The `store volatile` for the audited Uart.tx_data
+        // write is now in the `audit.ok.<n>` block, after
+        // the conditional branch.
+        let src = "\
+            #interface PointerAuditor {\n  \
+              effect record_alloc(ptr: access<u8>, size: u32);\n  \
+              effect record_free(ptr: access<u8>);\n  \
+              effect validate_load(ptr: access<u8>, size: u32) -> bool;\n  \
+              effect validate_store(ptr: access<u8>, size: u32) -> bool;\n\
+            }\n\
+            #automaton ShadowSanitizer { }\n\
+            #impl PointerAuditor for ShadowSanitizer {\n  \
+              effect record_alloc(ptr: access<u8>, size: u32) { return; }\n  \
+              effect record_free(ptr: access<u8>) { return; }\n  \
+              effect validate_load(ptr: access<u8>, size: u32) -> bool { return true; }\n  \
+              effect validate_store(ptr: access<u8>, size: u32) -> bool { return true; }\n\
+            }\n\
+            #audit #automaton Uart {\n  \
+              #address: 0x4000_4000;\n  \
+              tx_data: u32 #offset: 0x00;\n\
+            }\n\
+            #effect send(b: u32) #mutates: [Uart] { Uart.tx_data = b; return; }\n\
+        ";
+        let ir = lower_str(src).expect("lower audit ok block");
+        // The audit.ok.<n> label appears before the store.
+        let ok_at = ir.find("audit.ok.").expect("audit.ok label");
+        let store_at = ir.find("store volatile").expect("volatile store");
+        assert!(
+            ok_at < store_at,
+            "expected audit.ok label before the volatile store; got:\n{ir}"
         );
     }
 
