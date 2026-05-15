@@ -7,6 +7,52 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 46: theoretical re-grounding (`docs/foundations.md`) (2026-05-15)
+
+Working document drafted after a hostile critical review identified
+the "novel GA orthogonality engine" framing as decorative — the
+`outer_product` function in `crates/ortho` reduces to bitmask set
+disjointness, in the direct lineage of Lucassen & Gifford (1988) and
+Reynolds (2002). Project pivots to drop the GA-novelty narrative and
+ground both remaining layers (functional `@`, imperative `#` with
+automaton-as-state-owner) explicitly in the existing literature.
+
+`docs/foundations.md` is the first artifact of that pivot. Not
+normative — the spec remains the contract — but feeds future spec
+rewrites by mapping each Clifford construct to the tradition it
+actually descends from. For each tradition (effect systems,
+separation logic, Pony reference capabilities, Stack Resource
+Policy, Hindley-Milner / Koka effect rows / Idris totality, Ada/
+SPARK narrow unsafe), the document identifies (a) what Clifford
+already takes, (b) where Clifford is strictly weaker, and (c) what
+specific extensions could be added by reaching further into that
+tradition.
+
+Concrete recommendations the document feeds into:
+
+- **Spec §7 rewrite.** Open with the Lucassen-Gifford / Reynolds
+  citation. Frame the wedge-product computation as bitmask-encoded
+  effect-set disjointness. Move Cl(0,0,n) framing and Appendix B's
+  category-theoretic apparatus to `docs/research/`.
+- **Decision audit (planned next slice).** #21, #26, #27 → research-
+  future folder; cut their lexer reservations and AST scaffolding.
+  #22 vs #23 trait-list overlap → partition cleanly in §4.5 or
+  split the syntax. #23 → narrow to v0.2-realistic subset (totality
+  + fixed-set effect rows + sigma-bound refinements only).
+- **`access<T>` demotion.** From "third layer" to "typing discipline
+  within the imperative layer." README + CLAUDE.md + spec §1.
+- **`crates/ortho` rename** to `crates/disjoint` or `crates/effects`
+  in a separate semantically-empty slice.
+- **SRP-flavored handling of shared resources** (`#owned` /
+  `#sendable` qualifiers inspired by Pony `iso`) as a candidate
+  replacement for Decision #21's mixed-metric machinery.
+- **Reposition** as "designed for safety-critical systems
+  programming, with embedded firmware as the canonical first
+  target," dropping the dilutive "general-purpose" framing.
+
+No code touched in this slice. The follow-on slices (spec rewrite,
+decision audit, ortho rename, README pivot) each land independently.
+
 ### Added — Slice 44: abort-on-false (trap when `validate_*` returns false) (2026-05-13)
 
 Closes the soundness gap left by slice 41: the
