@@ -7,6 +7,74 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 45: firmware-level `#audit` smoke test (2026-05-15)
+
+End-to-end runtime proof that the slice 20 → 44 audit chain
+works on a real Cortex-M3 image. Until now the chain was
+covered by codegen unit tests (IR shape) and one CLI test
+(auto-include + marker presence) but never executed past the
+emitter. Slice 45 closes that gap: a single `#audit` automaton
++ effect + two `@snapshot` getters, dropped into the existing
+QEMU smoke harness, prove the whole pipeline survives clang,
+lld, the LM3S6965 boot path, and ARM semihosting.
+
+```clifford
+#audit #automaton SmokeAudited { }
+
+#effect smoke_audit_poke(p: &u32) #mutates: [SmokeAudited] {
+  let cur: u32 = #unchecked_load<u32>(p);
+  #unchecked_store<u32>(p, cur + 1u32);
+  return;
+}
+
+@fn smoke_loads()  -> u32 $ [Readable] { return @snapshot ShadowSanitizer.loads;  }
+@fn smoke_stores() -> u32 $ [Readable] { return @snapshot ShadowSanitizer.stores; }
+```
+
+The harness diffs `smoke_loads()` / `smoke_stores()` across
+one call to `smoke_audit_poke(&buf)` and asserts each counter
+incremented by exactly 1, then asserts the buffer was
+actually written (0 → 1) — proof that the slice-44 `audit.ok`
+block continued into the underlying `#unchecked_store` and
+didn't get short-circuited by the trap path.
+
+The counting Sanitizer always returns `true` so the trap
+path is unreachable in practice (LLVM collapses it at
+optimisation), but the IR is emitted, link-resolves, and
+ships in the image regardless. A future shadow-table
+Sanitizer that returns `false` will reach the same trap
+without any codegen change.
+
+**Pipeline changes (test-only — no compiler crate touched):**
+
+- **`tests/qemu/firmware_smoke.cl`:** adds the `SmokeAudited`
+  automaton, the `smoke_audit_poke` effect, and the two
+  `smoke_loads` / `smoke_stores` snapshot getters. The
+  presence of `#audit` flips the slice-40 CLI auto-include
+  on for this file, bringing in `clifford::audit` (interface
+  + counting `ShadowSanitizer`) without any other change to
+  the build script.
+- **`tests/qemu/harness.c`:** adds three checks (9, 10, 11)
+  exercising the audit chain, plus a static `volatile
+  uint32_t smoke_buffer` for the audited RMW to land on.
+- **`tests/qemu/run.sh`:** updated PASS-message check count
+  from 8 → 11.
+- **`tests/qemu/README.md`:** updated check table + count.
+
+**Tests added (3 runtime checks):**
+
+- Check 9: `loads_after - loads_before == 1` —
+  `validate_load` fired exactly once, counter visible from
+  the snapshot getter.
+- Check 10: `stores_after - stores_before == 1` — symmetric
+  for `validate_store`.
+- Check 11: `smoke_buffer == 1` — the underlying
+  `#unchecked_store` actually wrote, proving control flow
+  threaded through `audit.ok.<id>` to the real op.
+
+No new compiler-crate tests; the existing slice 21–44 unit
+tests already cover the IR shape this image exercises.
+
 ### Added — Slice 44: abort-on-false (trap when `validate_*` returns false) (2026-05-13)
 
 Closes the soundness gap left by slice 41: the
