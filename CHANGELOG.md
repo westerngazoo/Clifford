@@ -7,6 +7,57 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 47: decision audit (`docs/decision-audit-2026-05.md`) (2026-05-15)
+
+Second artifact of the post-GA-narrative pivot, after `docs/foundations.md`
+(slice 46). Grades every locked Decision #1–#27 (plus refinements and the
+six Emergent Rules) against the project's three first principles and the
+post-pivot grounding. Non-normative — per CLAUDE.md §5.5, changes to locked
+decisions need maintainer sign-off and each lands as its own PR. This
+document is the map that sequences that work.
+
+**Verdict tally:** 20 KEEP, 4 NARROW (#2, #5, #22, #23), 3 CUT (#4,
+Emergent Rules 1 and 6), 3 DEFER-TO-RESEARCH (#21, #26, #27).
+
+The headline finding: the language survives the audit almost intact.
+Everything that makes Clifford itself — sigils, automaton-as-state-owner,
+narrow unsafe primitives, body-scoped references, sigma loops, register-
+block automata, `#staged`, `#audit`, `#interface` — is KEEP. What gets
+cut or deferred is, with near-total consistency, the GA apparatus and the
+three decisions (#21/#26/#27) written to feed it. The decorative layer
+and the load-bearing layer separate at a clean seam — the strongest
+available confirmation that the pivot is correct.
+
+**What the audit recommends (each its own follow-on PR):**
+
+- **#4 + Emergent Rules 1 & 6 → CUT.** Decision #4 is end-to-end GA
+  surface (`#basis` overrides, "behavior multivector", `--verbose-basis`);
+  its one surviving sentence folds into the §7 rewrite. Emergent Rule 6
+  ("GA orthogonality = product-category existence") is the exact claim
+  the hostile review demolished.
+- **#21/#26/#27 → DEFER-TO-RESEARCH.** The mixed-metric-GA arc moves to
+  `docs/research/`; its Phase-1 scaffolding (lexer reservations of
+  `#shared`/`#lock`/`#rotor`/etc., the `FieldKind` `#[non_exhaustive]`
+  enum) is cut from the live tree. The real need — shared mutable
+  resources — is re-addressed via Stack Resource Policy (Baker 1991,
+  RTIC) + a Pony-`iso`-style `#owned`/`#sendable` qualifier, in a fresh
+  decision validated against the comparison artifact before locking.
+- **#5 → NARROW.** Keep automaton-as-state-owner, `#transition`-only
+  state changes, and all of Refinements #5a–#5e; move the category-
+  theory apparatus (Appendix B, product categories) to `docs/research/`.
+- **#2/#22/#23 → NARROW.** Resolve the three-way `$ [TraitList]`
+  overload (purity rows / documentary tags / type-checked effect rows)
+  by partitioning the semantics by layer in §4.5. Narrow #23 to the
+  v0.2-realistic subset (totality + fixed-set effect rows + sigma-bound
+  refinements); defer SMT-backed refinements to v0.4+.
+- **Cross-cutting:** a GA-vocabulary sweep across `DECISIONS.md` + spec +
+  docstrings; demote `access<T>` from "third layer" to "typing
+  discipline"; sync the stale Decision #18 status text (the runtime
+  `PointerAuditor` pass landed in slices 37–44).
+
+No code touched in this slice. The audit closes with an 8-item dependency-
+ordered sequence for the follow-on PRs.
+
 ### Added — Slice 44: abort-on-false (trap when `validate_*` returns false) (2026-05-13)
 
 Closes the soundness gap left by slice 41: the
