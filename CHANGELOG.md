@@ -7,6 +7,50 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Added — Slice 49: charter the synchronous-dataflow `#node` research bet (2026-05-16)
+
+Charters a research bet (`docs/research/synchronous-dataflow.md`) — not a
+v1.0 commitment — following the logic/mutation boundary design-space
+survey, which identified synchronous dataflow (Lustre / Esterel / SCADE)
+as the strongest *under-explored* answer to how Clifford separates pure
+logic from stateful mutation.
+
+The bet: for periodic, loop-shaped logic (control loops, sensor fusion,
+debouncers, filters), a `#node` construct built on the synchronous model
+— pure equations over streams, state expressed by delay operators
+(`pre`, `->`), statically scheduled into one allocation-free `step()` —
+*dissolves* the logic/mutation boundary instead of making code cross it.
+There is no `@snapshot` because there is no separate store to read from.
+SCADE, the DO-178C-qualified avionics tool, is in this lineage; Decision
+#5 already cites it but borrowed only the FSM surface, never the
+synchronous model.
+
+The charter defines a three-stage experiment with **explicit kill gates**
+— if a gate fails, the bet is abandoned and the document records it as a
+negative result:
+
+- **Stage 1 (worked paper design)** — executed in this slice, verdict
+  **PASS**. Three control programs written as `#node`s (thermostat,
+  debouncer, integrator); the thermostat hand-lowered to LLVM IR showing
+  a fixed-size state struct + straight-line allocation-free `step()`; an
+  interop stress test confirming `#node` composes — an `#automaton` owns
+  a node instance, `#effect`s form the imperative shell doing I/O and
+  MMIO around it, nodes call `@fn`s but not `#effect`s, and the §7
+  disjointness engine needs no change. Stage 1 surfaced one genuine
+  finding: a `#node` is a *third construct kind* — pure yet stateful,
+  where the state is functional (delays) rather than mutated — not a
+  variant of `@fn` or `#automaton`.
+- **Stage 2** — a standalone, isolated `experiments/node-proto/` crate
+  (mini lexer/parser + causality analysis + LLVM-IR emit), not wired into
+  the compiler so the bet stays abandonable. Gated on Stage 1's PASS;
+  now open.
+- **Stage 3** — compile and run the thermostat `#node`, compare against
+  the `#automaton` form.
+
+No compiler code touched. Nothing enters the main crates unless all three
+stages pass, at which point `#node` would go through the normal decision
++ spec + slice process.
+
 ### Changed — Slice 48: defer GA-arc decisions #21/#26/#27 to research (2026-05-16)
 
 First follow-on from the decision audit (slice 47). Acts on the audit's
