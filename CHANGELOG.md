@@ -7,51 +7,56 @@ may include breaking changes.
 
 ## [Unreleased]
 
-### Added — Slice 46: theoretical re-grounding (`docs/foundations.md`) (2026-05-15)
+### Added — Slice 47: decision audit (`docs/decision-audit-2026-05.md`) (2026-05-15)
 
-Working document drafted after a hostile critical review identified
-the "novel GA orthogonality engine" framing as decorative — the
-`outer_product` function in `crates/ortho` reduces to bitmask set
-disjointness, in the direct lineage of Lucassen & Gifford (1988) and
-Reynolds (2002). Project pivots to drop the GA-novelty narrative and
-ground both remaining layers (functional `@`, imperative `#` with
-automaton-as-state-owner) explicitly in the existing literature.
+Second artifact of the post-GA-narrative pivot, after `docs/foundations.md`
+(slice 46). Grades every locked Decision #1–#27 (plus refinements and the
+six Emergent Rules) against the project's three first principles and the
+post-pivot grounding. Non-normative — per CLAUDE.md §5.5, changes to locked
+decisions need maintainer sign-off and each lands as its own PR. This
+document is the map that sequences that work.
 
-`docs/foundations.md` is the first artifact of that pivot. Not
-normative — the spec remains the contract — but feeds future spec
-rewrites by mapping each Clifford construct to the tradition it
-actually descends from. For each tradition (effect systems,
-separation logic, Pony reference capabilities, Stack Resource
-Policy, Hindley-Milner / Koka effect rows / Idris totality, Ada/
-SPARK narrow unsafe), the document identifies (a) what Clifford
-already takes, (b) where Clifford is strictly weaker, and (c) what
-specific extensions could be added by reaching further into that
-tradition.
+**Verdict tally:** 20 KEEP, 4 NARROW (#2, #5, #22, #23), 3 CUT (#4,
+Emergent Rules 1 and 6), 3 DEFER-TO-RESEARCH (#21, #26, #27).
 
-Concrete recommendations the document feeds into:
+The headline finding: the language survives the audit almost intact.
+Everything that makes Clifford itself — sigils, automaton-as-state-owner,
+narrow unsafe primitives, body-scoped references, sigma loops, register-
+block automata, `#staged`, `#audit`, `#interface` — is KEEP. What gets
+cut or deferred is, with near-total consistency, the GA apparatus and the
+three decisions (#21/#26/#27) written to feed it. The decorative layer
+and the load-bearing layer separate at a clean seam — the strongest
+available confirmation that the pivot is correct.
 
-- **Spec §7 rewrite.** Open with the Lucassen-Gifford / Reynolds
-  citation. Frame the wedge-product computation as bitmask-encoded
-  effect-set disjointness. Move Cl(0,0,n) framing and Appendix B's
-  category-theoretic apparatus to `docs/research/`.
-- **Decision audit (planned next slice).** #21, #26, #27 → research-
-  future folder; cut their lexer reservations and AST scaffolding.
-  #22 vs #23 trait-list overlap → partition cleanly in §4.5 or
-  split the syntax. #23 → narrow to v0.2-realistic subset (totality
-  + fixed-set effect rows + sigma-bound refinements only).
-- **`access<T>` demotion.** From "third layer" to "typing discipline
-  within the imperative layer." README + CLAUDE.md + spec §1.
-- **`crates/ortho` rename** to `crates/disjoint` or `crates/effects`
-  in a separate semantically-empty slice.
-- **SRP-flavored handling of shared resources** (`#owned` /
-  `#sendable` qualifiers inspired by Pony `iso`) as a candidate
-  replacement for Decision #21's mixed-metric machinery.
-- **Reposition** as "designed for safety-critical systems
-  programming, with embedded firmware as the canonical first
-  target," dropping the dilutive "general-purpose" framing.
+**What the audit recommends (each its own follow-on PR):**
 
-No code touched in this slice. The follow-on slices (spec rewrite,
-decision audit, ortho rename, README pivot) each land independently.
+- **#4 + Emergent Rules 1 & 6 → CUT.** Decision #4 is end-to-end GA
+  surface (`#basis` overrides, "behavior multivector", `--verbose-basis`);
+  its one surviving sentence folds into the §7 rewrite. Emergent Rule 6
+  ("GA orthogonality = product-category existence") is the exact claim
+  the hostile review demolished.
+- **#21/#26/#27 → DEFER-TO-RESEARCH.** The mixed-metric-GA arc moves to
+  `docs/research/`; its Phase-1 scaffolding (lexer reservations of
+  `#shared`/`#lock`/`#rotor`/etc., the `FieldKind` `#[non_exhaustive]`
+  enum) is cut from the live tree. The real need — shared mutable
+  resources — is re-addressed via Stack Resource Policy (Baker 1991,
+  RTIC) + a Pony-`iso`-style `#owned`/`#sendable` qualifier, in a fresh
+  decision validated against the comparison artifact before locking.
+- **#5 → NARROW.** Keep automaton-as-state-owner, `#transition`-only
+  state changes, and all of Refinements #5a–#5e; move the category-
+  theory apparatus (Appendix B, product categories) to `docs/research/`.
+- **#2/#22/#23 → NARROW.** Resolve the three-way `$ [TraitList]`
+  overload (purity rows / documentary tags / type-checked effect rows)
+  by partitioning the semantics by layer in §4.5. Narrow #23 to the
+  v0.2-realistic subset (totality + fixed-set effect rows + sigma-bound
+  refinements); defer SMT-backed refinements to v0.4+.
+- **Cross-cutting:** a GA-vocabulary sweep across `DECISIONS.md` + spec +
+  docstrings; demote `access<T>` from "third layer" to "typing
+  discipline"; sync the stale Decision #18 status text (the runtime
+  `PointerAuditor` pass landed in slices 37–44).
+
+No code touched in this slice. The audit closes with an 8-item dependency-
+ordered sequence for the follow-on PRs.
 
 ### Added — Slice 44: abort-on-false (trap when `validate_*` returns false) (2026-05-13)
 
