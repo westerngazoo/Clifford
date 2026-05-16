@@ -344,13 +344,6 @@ pub struct StateName {
 /// `#access:` mode. The parser preserves whatever the user wrote;
 /// `clifford-check` (§5.5) enforces "register-block automata require
 /// `#offset` on every field".
-///
-/// **Decision #21 reservation:** `kind` discriminates private vs shared
-/// fields per `docs/DECISIONS.md` Decision #21 and `docs/CLIFFORD_SPEC.md`
-/// §7.0 / §7.9. v0.1–v0.6 implementations always set `kind = FieldKind::Private`;
-/// v0.7+ will introduce `FieldKind::Shared { lock: … }` and the mixed-metric
-/// algebra extension. The enum is `#[non_exhaustive]` so adding the v0.7
-/// variant is a non-breaking AST change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutomatonField {
     /// Field name.
@@ -361,9 +354,6 @@ pub struct AutomatonField {
     pub offset: Option<String>,
     /// `#access: read|write|read_write` if present.
     pub access: Option<AccessMode>,
-    /// Whether this field is private (default, v0.1) or shared (v0.7+).
-    /// See [`FieldKind`].
-    pub kind: FieldKind,
     /// `#hidden` modifier per Decision #25 (algebraic-trivial encapsulation).
     /// `true` if the field is marked `#hidden`, `false` otherwise. A hidden
     /// field's basis vector cannot appear in the `actual_writes` set of any
@@ -377,34 +367,6 @@ pub struct AutomatonField {
     pub hidden: bool,
     /// Source span covering the whole field declaration end-to-end.
     pub span: Span,
-}
-
-/// Whether an [`AutomatonField`] participates in the GA orthogonality
-/// engine's null subspace (private; current behavior) or non-null subspace
-/// (shared; reserved for v0.7+).
-///
-/// Per `docs/DECISIONS.md` Decision #21 and ADR 0002: v0.1–v0.6 implementations
-/// always emit [`FieldKind::Private`]; the parser does not yet recognise the
-/// `#shared` field qualifier (the lexer reserves the token but the parser
-/// rejects it with a "reserved for v0.7" diagnostic). The v0.7 work that
-/// enables Shared fields lands as a non-breaking AST change because this
-/// enum is `#[non_exhaustive]`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum FieldKind {
-    /// Private field — contributes a null basis vector to the GA orthogonality
-    /// engine's behavior multivector. The §7.4 `wedge == 0` collapse on
-    /// shared writes is the current race-detection behavior.
-    Private,
-    // FUTURE (Decision #21, v0.7+):
-    //
-    // /// `#shared` field — contributes a non-null basis vector. Overlap on
-    // /// this basis vector is permitted but generates a separate proof
-    // /// obligation that the named lock is held by both concurrent contexts.
-    // Shared {
-    //     /// Identifier of the `#lock` declaration guarding this field.
-    //     lock: String,
-    // },
 }
 
 /// Access mode on a register-block field (Decision #6 `#access:` clause).
