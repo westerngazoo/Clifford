@@ -105,7 +105,7 @@ QEMU_RC=$?
 set -e
 
 if [[ ${QEMU_RC} -eq 0 ]]; then
-    echo "==> PASS (all 8 functional checks succeeded)"
+    echo "==> PASS (all 11 functional checks succeeded)"
     exit 0
 else
     echo "==> FAIL (harness reported check #${QEMU_RC} failed; see harness.c)"

@@ -17,6 +17,18 @@ extern uint32_t clamp(uint32_t x);
 extern uint32_t sum_to(uint32_t n);
 extern uint32_t bit_count(uint32_t x);
 
+/* Slice 45 — Decision #18 audit chain end-to-end. */
+extern void smoke_audit_poke(uint32_t *p);
+extern uint32_t smoke_loads(void);
+extern uint32_t smoke_stores(void);
+
+/* Static RAM buffer for the audited read-modify-write. Lives in
+ * .bss (zero-initialized by Reset_Handler), so its initial value
+ * is 0 and smoke_audit_poke leaves it at 1. `volatile` prevents
+ * any optimizer from eliding the round-trip — we want clang to
+ * emit the actual load+store that the audit chain wraps. */
+static volatile uint32_t smoke_buffer;
+
 void semihost_exit(int code);
 
 int main(void) {
@@ -43,6 +55,30 @@ int main(void) {
 
     /* 8. bit_count(0xFFFFFFFF) is 32 (all bits set). */
     if (bit_count(0xFFFFFFFFu) != 32u) { semihost_exit(8); }
+
+    /* Slice 45: snapshot the ShadowSanitizer counters, run one
+     * audited read-modify-write, then verify the counters bumped
+     * by exactly one each and the buffer was actually written.
+     * This proves the slice 41+43+44 chain (validate_* call,
+     * branch-on-result, audit.ok block continuation) reaches the
+     * underlying unsafe op at runtime and that the counting
+     * Sanitizer (slice 42) observes both sides. */
+    uint32_t loads_before  = smoke_loads();
+    uint32_t stores_before = smoke_stores();
+    smoke_audit_poke((uint32_t *)&smoke_buffer);
+    uint32_t loads_after   = smoke_loads();
+    uint32_t stores_after  = smoke_stores();
+
+    /* 9. The audited #unchecked_load incremented the loads counter. */
+    if (loads_after - loads_before != 1u) { semihost_exit(9); }
+
+    /* 10. The audited #unchecked_store incremented the stores counter. */
+    if (stores_after - stores_before != 1u) { semihost_exit(10); }
+
+    /* 11. The store actually landed: buffer went 0 → 1. Proves
+     *     the audit.ok block continued into the real unsafe op
+     *     and didn't get short-circuited by the trap path. */
+    if (smoke_buffer != 1u) { semihost_exit(11); }
 
     /* All checks passed. */
     semihost_exit(0);

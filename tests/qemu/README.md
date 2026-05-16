@@ -15,9 +15,10 @@ fails this test.
 | `clamp(x)` | slice 13 — `if` + comparison | clamp(50)=50, clamp(200)=100 |
 | `sum_to(n)` | slice 11 + 12 — sigma loop + `let mut` accumulator | sum_to(10)=45 |
 | `bit_count(x)` | slice 13 — `if` + sigma + bitwise + shift | bit_count(0xFF)=8 |
+| `smoke_audit_poke(p)` + `smoke_loads()` / `smoke_stores()` | slices 20+ (Decision #18) — `#audit` chain end-to-end through the auto-included counting `ShadowSanitizer` | one audited RMW bumps `loads` and `stores` by 1 each; the buffer goes 0 → 1 |
 
-Eight functional checks total. The harness exits with code 0 on
-success or with `1..=8` indicating which check failed; QEMU's
+Eleven functional checks total. The harness exits with code 0 on
+success or with `1..=11` indicating which check failed; QEMU's
 `-semihosting-config arg=app` propagates that back as the process
 exit code.
 
