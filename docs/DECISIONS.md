@@ -1,6 +1,6 @@
 # Clifford Language: Critical Design Decisions
 
-**Status:** Decisions #1–#27 LOCKED. Implementation gating: **#12 implemented in v0.2** (slices 18–19, 24–25 — `#staged`, `#flush`, `@shadow`, register-block-staged rejection); **#18 surface + codegen markers landed in v0.2** (slices 20–23, 26 — `#audit`, marker placement, multi-owner format), with the runtime `PointerAuditor` pass deferred to a later milestone pending stdlib scaffolding; #21 design locked, implementation gated to v0.7; #22, #23, #24, #25 design locked, implementation slated for v0.2; #26 (rotor-plane locks, refines #21) implementation gated to v0.7; #27 (GA across scales / distributed runtime check) implementation gated to v0.4+ (Phase 5+ plugin work). Refinement #1a LOCKED. Phase 1 implementation underway.
+**Status:** Decisions #1–#27 locked, **except #21, #26, #27 — deferred to research by the 2026-05 audit** (`docs/decision-audit-2026-05.md`; full text relocated to `docs/research/`). Implementation gating: **#12 implemented in v0.2** (slices 18–19, 24–25 — `#staged`, `#flush`, `@shadow`, register-block-staged rejection); **#18 implemented in v0.2** (slices 20–23, 26 — `#audit` surface + markers; slices 37–44 — runtime `PointerAuditor` pass, counting `ShadowSanitizer`, trap-on-false); #22, #23, #24, #25 design locked, implementation slated for v0.2 (subject to the audit's NARROW recommendations on #22/#23). Refinement #1a LOCKED. Phase 1 implementation underway. The project is in a post-GA-narrative pivot — see `docs/foundations.md` and `docs/decision-audit-2026-05.md`.
 **Dates:** see footer below for the full chronological log.
 **Owner:** Goose (Gustavo Delgadillo)
 **Positioning:** General-purpose systems language; embedded firmware is the canonical first target but not the only target. Decisions are language-level and apply across domains.
@@ -1153,62 +1153,13 @@ morphisms commute.
 
 ---
 
-## Decision #21: Shared Automata via Mutator Multivectors (Mixed-Metric GA) ✓ LOCKED
+## Decision #21: Shared Automata via Mutator Multivectors — DEFERRED TO RESEARCH
 
-**Date locked:** 2026-05-01
-**ADR:** [`docs/adr/0002-shared-automata-mutator-multivectors.md`](adr/0002-shared-automata-mutator-multivectors.md)
-**Spec impact:** §7 (Orthogonality Engine — adds §7.0 prologue and §7.9 mixed-metric extension), §2 (reserves new sigil-prefixed forms), §4 (Type System — `#shared` field qualifier landing v0.7).
+**Status:** Deferred to research by the 2026-05 audit (`docs/decision-audit-2026-05.md` §5). Originally locked 2026-05-01.
 
-### Summary
+The original mixed-metric Cl(p,0,n) design — shared fields contributing non-null basis vectors, locks as multivectors `lock(L) = pri(L) + e_L`, deadlock-freedom from a sketched algebraic theorem — was unimplemented, gated to v0.7, and rested on a categorical correctness proof that did not exist in writing. The real problem it named (shared mutable resources: run-queues, allocators, capability tables) is better served by Stack Resource Policy (Baker 1991, mechanized by RTIC) plus a Pony-`iso`-style `#owned`/`#sendable` field qualifier — see `docs/foundations.md` §3–§4.
 
-The current GA orthogonality engine works in a Clifford algebra Cl(0,0,n) — every basis vector squares to zero, which is why `a & b != 0 ⇒ wedge == 0` detects write-write races. This is mathematically clean for *disjoint-mutation* programs but cannot model *shared mutable state* that real kernels (Wari, seL4, Hubris, Linux) deliberately require — run-queues, capability tables, page allocators, IRQ binding tables.
-
-Decision #21 extends the engine to a mixed-metric Cl(p,0,n) algebra where:
-
-- **Private fields** (the v0.1 default) contribute *null* basis vectors. Their wedge collapses on overlap — current race-detection behavior, unchanged.
-- **Shared fields** (declared `#shared` per ADR §5) contribute *non-null* basis vectors. Their wedge does *not* collapse on overlap; instead, overlap discharges a separate proof obligation: the lock guarding the shared resource must be held by both concurrent contexts.
-
-The locking discipline is itself algebraic, not procedural (per ADR §5.5):
-
-- Each lock is a mixed-grade multivector `lock(L) = pri(L) + e_L` (scalar priority + identity basis vector).
-- The lock-context multivector held by an executing automaton is the wedge of every held lock.
-- Acquisition validity falls out of the wedge product:
-  - Ascending priority → canonical wedge
-  - Descending priority → Koszul-flippable
-  - Equal priority → resolved by a GA *rotor* parameterised by a canonical structural attribute (MMIO `#address` for register-block locks; link-section position / source-location hash / explicit `#rotor:` clause for software locks).
-- **Theorem (sketched):** the lock context never collapses to zero ⟺ execution is deadlock-free. Lock-ordering safety falls out of the algebra; no separate procedural checker.
-- **Interrupts and locks unify:** an `#interrupt #priority: N { … }` is a priority-ordered acquisition under the §5.5 algebra; the engine handles both with the same machinery.
-
-### What this Decision unifies
-
-Four safety properties become one statement under the mixed-metric algebra:
-
-1. **Disjoint-mutation safety** — null-subspace wedge non-zero (current §7.4 check).
-2. **Shared-state safety** — non-null subspace overlap discharges the lock-coverage proof obligation.
-3. **Deadlock-freedom** — lock-context multivector never collapses (§5.5.4 theorem).
-4. **Interrupt/lock unification** — interrupts are priority-ordered acquisitions; algebra handles both.
-
-### Phase-1 scaffolding (lands now, alongside this decision)
-
-Per the ADR's Recommendation, Phase-1 work locks the design direction without committing to engine implementation:
-
-- `docs/CLIFFORD_SPEC.md` §7.0 (new prologue) declares the v0.1–v0.6 algebra as the *restricted form* Cl(0,0,n) and reserves the mixed-metric extension for v0.7.0-draft.
-- `docs/CLIFFORD_SPEC.md` §7.9 (new) sketches the v0.7 extension and points at this Decision and ADR 0002 §5.5 for the rotor formulation.
-- `crates/ast` adds `FieldKind` enum on `AutomatonField` with one variant today (`Private`), marked `#[non_exhaustive]` so adding `Shared { lock: Ident }` later is a non-breaking AST change.
-- `crates/lexer` reserves `#shared`, `#lock`, `#with_lock`, `#reads`, `#rotor` as keyword-prefixed forms (no parser support yet — just the tokens).
-- `@lock_order` is *not* reserved; the §5.5 rotor formulation supersedes Option B's procedural lock-ordering attribute.
-
-### Phase-2 implementation (v0.7.0-draft)
-
-Surface syntax in lexer + parser, AST extensions, mixed-metric algebra in `crates/ortho`, lock-coverage analysis in `crates/check`. Lock-ordering safety is *automatic* under the §5.5 rotor formulation — no separate pass.
-
-### Reentrant locks
-
-Deferred to a future minor decision (likely v0.8). Default non-reentrant; opt-in reentrant via `#lock #reentrant L` would set `e_L² = pri(L)` (non-null self-square) instead of zero.
-
-### Why this is locked, not deferred
-
-The ADR's "Doors we keep open" section enumerates the things that would foreclose Decision #21 if we *didn't* land Phase-1 scaffolding now: hard-coded all-null algebra in `crates/ortho`, exhaustive matches on `FieldKind`, accidental token collisions on `#shared` etc. The Phase-1 cost is small (~200 LoC + spec edits + this DECISIONS entry); the cost of *not* doing it is weeks-to-months of refactoring once v0.7 work begins.
+Full original text: [`docs/research/ga-shared-automata.md`](research/ga-shared-automata.md). Tracking ADR (immutable): `docs/adr/0002-shared-automata-mutator-multivectors.md`. The Phase-1 scaffolding this decision landed (the `crates/ast` `FieldKind` enum, the `crates/lexer` `#shared`/`#lock`/`#with_lock`/`#reads`/`#rotor` reservations) was removed when the decision was deferred. A fresh decision will cover SRP-based shared resources once a comparison artifact validates the need.
 
 ---
 
@@ -1426,95 +1377,23 @@ Spec amendment + parser/resolve extension lands in a follow-up Phase-1 work item
 
 ---
 
-## Decision #26: Rotor-Based Plane-Confined Locks (refines #21) ✓ LOCKED
+## Decision #26: Rotor-Based Plane-Confined Locks — DEFERRED TO RESEARCH
 
-**Date locked:** 2026-05-05 (architect sign-off "yes to all" on ADR 0005's five open questions)
-**Tracking ADR:** `docs/adr/0005-rotor-plane-confined-locks.md` (Accepted 2026-05-05).
-**Spec impact:** §7 (Orthogonality Engine — extends Decision #21's mixed-metric machinery), §2 (Grammar — `#rotor_lock`, `#thread_plane`, `#guarded_by`, `#with_lock`), §10 (Error codes — E0535 family).
-**Refines:** Decision #21 (shared automata via mutator multivectors).
+**Status:** Deferred to research by the 2026-05 audit (`docs/decision-audit-2026-05.md` §5). Originally locked 2026-05-05. Refined the also-deferred Decision #21.
 
-### Summary
+Rotor-as-acquisition-primitive (`M ← R_t · M`, `R_t = exp(-θ_t · B_t / 2)`) reframed lock acquisition as a Clifford-algebra rotation. The decision's own text conceded that "`exp` does not appear in generated code; runtime cost is a normal CAS-based spinlock with an integer owner-ID" — i.e. the rotor algebra was decoration over an ordinary owner-ID spinlock. Mutual exclusion, wrong-thread-release detection, and re-entrancy are standard properties of ordinary lock implementations.
 
-Decision #21 / ADR 0002 already established that locks are multivectors `lock(L) = pri(L) + e_L` in a mixed-metric Clifford algebra, with rotors playing a *tiebreak* role for same-priority locks. Decision #26 reframes rotors from tiebreak machinery to the **acquisition primitive itself**.
-
-A `#rotor_lock L` is conceptually a multivector cell `M`. Initially `M = 1` (scalar identity, "unlocked"). To acquire `L`, a thread `t` whose signature bivector is `B_t` rotates the cell: `M ← R_t · M` where `R_t = exp(-θ_t · B_t / 2)`.
-
-Three properties fall out of the algebra for free:
-
-1. **Mutual exclusion.** Cross-plane acquire produces a non-rotor multivector (odd-grade components) → reject.
-2. **Wrong-thread release detection.** `R̃_t' · R_t ≠ 1` for `t' ≠ t` → reject.
-3. **Re-entrancy by the same thread.** `R_t · R_t = exp(-2θ_t · B_t / 2)` is still a rotor in plane `B_t`.
-
-The static-analysis check is the same wedge-product the orthogonality engine already runs (`caller.thread_plane ∧ lock.plane`). Runtime cost is a normal CAS-based spinlock with an integer owner-ID — `exp` does not appear in generated code.
-
-### Locked resolutions (per ADR 0005, accepted 2026-05-05)
-
-- **Q1 Thread-plane assignment:** Pool-based at link time for v0.7 (default `p = 16` shared basis vectors → 8 distinct planes). RTOS dynamic case deferred to v0.8+.
-- **Q2 Re-entrancy:** Counted (matches POSIX expectations); lock owns owner-ID + depth counter at runtime.
-- **Q3 Same-plane uniqueness:** Hard error `E0539 DuplicateThreadPlane`.
-- **Q4 Who carries θ for release:** Lock owns its full state; thread checks "am I owner?".
-- **Q5 Relation to #21's priority-ordering proof:** Rotor-as-acquisition supersedes; ADR 0002 §5.5's deadlock-freedom proof re-derived in terms of plane-acquisition order. Priority becomes the canonical strict total order on planes; the two formulations are equivalent.
-
-### Diagnostic family
-
-`E0535 PlaneeMismatch`, `E0536 NoThreadPlane`, `E0537 SharedFieldOutsideLock`, `E0538 ReEntryViolation`, `E0539 DuplicateThreadPlane`.
-
-### Implementation status
-
-Implementation gated to **v0.7+** alongside the rest of Decision #21's mixed-metric machinery. v0.1–v0.6: tokens reserved at the lexer (`#shared`, `#lock`, `#with_lock`, `#reads`, `#rotor` already reserved per Decision #21; `#rotor_lock`, `#thread_plane`, `#guarded_by` join them); parser/AST/check work begins when v0.7 milestone opens.
+Full original text: [`docs/research/ga-rotor-locks.md`](research/ga-rotor-locks.md). Tracking ADR (immutable): `docs/adr/0005-rotor-plane-confined-locks.md`.
 
 ---
 
-## Decision #27: GA Across Scales — Distributed Runtime Race Detection ✓ LOCKED
+## Decision #27: GA Across Scales — Distributed Runtime Race Detection — DEFERRED TO RESEARCH
 
-**Date locked:** 2026-05-05 (architect sign-off "lock it in" on ADR 0006's cost-model + utility analysis)
-**Tracking ADR:** `docs/adr/0006-runtime-distributed-multivector-engine.md` (Accepted 2026-05-05).
-**Spec impact:** None on core language semantics. New `#dist_shared` field qualifier (lexer/parser/AST). Spec §10 reserves `E07xx` error-code range for runtime diagnostics.
-**Refines / extends:** §7 orthogonality engine (algebra reused, not modified); Decisions #21 and #26 (cross-node visibility layered on top, opt-in via `#dist_shared`).
+**Status:** Deferred to research by the 2026-05 audit (`docs/decision-audit-2026-05.md` §5). Originally locked 2026-05-05.
 
-### Summary — the unifying claim
+The decision committed to lifting the wedge primitive to distributed runtime race detection, described in its own text as "RPC publish + central coordinator + RPC retract; `&` op on coordinator" — i.e. optimistic concurrency control (publish a read/write set, intersect at a coordinator, retract). Sinfonia (2007), Calvin (2012), and every modern OCC system already do this; the "GA is the unifying algebra" framing added nothing operational and was the marketing thesis the post-pivot project retired.
 
-Decisions #21 and #26 already established that the GA wedge product proves race-freedom for in-process state — first compile-time, then in-process locking. Decision #27 commits to extending the *same wedge primitive* to **runtime distributed race detection**, scoped to plugin / debug mode.
-
-This is the unifying architectural pattern across #21, #26, and now #27:
-
-> **GA is the unifying algebra; standard primitives (CAS spinlocks, flags, RPCs, atomics) are the implementation.**
-
-Same `outer_product` operation runs at three scales:
-
-| Scale | When | What carries the algebra | What carries the runtime |
-|---|---|---|---|
-| Compile-time, single-process | `cliffordc` invocation | Static `actual_writes` per callable | (none — pure proof) |
-| In-process runtime (Decisions #21/#26) | Lock acquire/release | `lock(L) = pri(L) + e_L` multivector cell | Normal CAS spinlock with owner-ID + depth counter |
-| Distributed runtime (this Decision) | Mutation phase publish/retract | `Behaviour { (resource, slice) bits }` | RPC publish + central coordinator + RPC retract; `&` op on coordinator |
-
-The user explicitly named this pattern in the conversation that locked the Decision: *"rotors that could be designed via single locks and flags."* The algebra is the *framework*; the runtime is whatever's already cheap.
-
-### Why this is a Decision (and not just an ADR-only thing)
-
-ADR 0006 alone documents the operational plan. Decision #27 elevates it to a language-level commitment: Clifford promises that the GA framework reaches across scales, not just the static check. This positioning matters for the language's pitch (the GA isn't an incidental compile-time trick; it's fundamental and uniformly applicable) and for downstream users planning distributed Clifford services (the framework is a stable feature roadmap, not a maybe).
-
-### Locked resolutions (per ADR 0006 §"Decision")
-
-- **Q1** Coordinator topology: central for v0.4-α; gossip pluggable for v0.5+.
-- **Q2** Publication scope: per-transaction (`#effect` body or `@dist_phase("name") { … }` block).
-- **Q3** Race response: configurable per `#rotor_lock` via `#on_dist_race: Log | Abort | Quarantine`; default `Log`.
-- **Q4** Resource basis assignment: pre-agreed schema at link time; `E0702 SchemaIncompatible` for mismatches; runtime registration deferred to v0.6+.
-- **Q5** Interaction with #21/#26: opt-in per resource via `#dist_shared` field qualifier; in-process `#shared` resources unchanged.
-
-### Why locked now
-
-1. **Cost model is genuinely zero-impact when off.** Per-resource opt-in (`#dist_shared`), per-build opt-in (`cliffordc test --dist-check`), per-program opt-in (Cargo feature flag). Programs that never use it pay nothing — compile-time, binary-size, runtime.
-2. **Strategic continuity.** Locking commits to "GA scales from single-IRQ to multi-machine" as a language-level claim, not just a research direction. Users designing systems can plan for this without uncertainty.
-3. **Architectural pattern is proven.** Decisions #21 and #26 already validated the GA-as-framework / standard-primitives-as-runtime split. ADR 0006 applies the same pattern at one more scale; no new architectural risk.
-
-### Implementation status
-
-**Phase 5+ work** — v0.4 / v0.5 alongside `clifford::core::sync` and any networking stdlib. v0.1, v0.2, v0.3 milestones unaffected.
-
-Lexer reservations (`#dist_shared`, `#dist_phase`, `#on_dist_race`) may land alongside the Decision #21 / #26 reservations or independently in v0.4-α. Plugin crate `crates/dist-check`, codegen instrumentation hook, central-coordinator reference implementation: v0.4. Gossip backend, dynamic schema registration: v0.5+ / v0.6+.
-
-The compile-time engine (§7) ships unaware of Decision #27; programs that don't opt in are entirely unaffected.
+Full original text: [`docs/research/ga-across-scales.md`](research/ga-across-scales.md). Tracking ADR (immutable): `docs/adr/0006-runtime-distributed-multivector-engine.md`. If distributed race checking is ever built, it should be grounded in the OCC literature under its own decision.
 
 ---
 
@@ -1542,13 +1421,13 @@ The compile-time engine (§7) ships unaware of Decision #27; programs that don't
 | #18 | Runtime auditing | None vs Built-in vs `#audit` + `PointerAuditor` interface | **`#audit` + interface (designed; deferred to v0.2)** | KASAN-style runtime checking layered on Decision #17's static visibility |
 | #19 | Pointer types | Raw `*const T`/`*mut T` vs Nominal `access<T>` | **Nominal `access<T>` / `access const<T>`** | Type-distinct pointers; peripheral confusion caught at compile time; cross-type casts grep-able via `#unchecked_cast` |
 | #20 | Bitfield access | `#mutate Reg { f = (self.f & ~M) \| (v << S) }` vs First-class `Reg.f.bit = v` | **First-class `#bits` annotation with target-atomic RMW** | Eliminates bit-twiddling boilerplate; atomic RMW where a concurrent writer exists, plain RMW otherwise; subfield-level GA basis vectors |
-| #21 | Shared state | Audit-block escape vs Mixed-metric Cl(p,0,n) algebra with priority-as-scalar lock multivectors and rotor tiebreaks | **Mixed-metric Cl(p,0,n) + §5.5 rotor formulation** | Kernels (Wari, seL4-shape) become typecheckable; lock-ordering safety, deadlock-freedom, and interrupt/lock unification all fall out of the algebra; design locked v0.7, scaffolding lands now |
+| #21 | Shared state | Mixed-metric Cl(p,0,n) algebra vs established concurrency literature | **DEFERRED TO RESEARCH** (2026-05 audit) | Mixed-metric-GA design unimplemented and proof-incomplete; shared mutable resources to be re-addressed via Stack Resource Policy + Pony-`iso`-style `#owned`/`#sendable`. See `docs/research/ga-shared-automata.md` |
 | #22 | Imperative kinds | Flat `#effect` everywhere vs effect-traits classifying mutation kind | **`$ [TraitList]` on effects** (Hardware, Realtime, Acquire, Release, SeqCst, LockingDiscipline, PureState, Encapsulated) | Imperative side becomes legible without engine impact; codegen / audit / certification consume the traits |
 | #23 | Functional discipline | Status quo `@fn` (excludes `#`-constructs) vs Haskell-clean (total + effect rows + refinement types) | **Haskell-clean (totality + Readable/Observable rows + sigma-bound refinements)** | Pure side commits fully to its math; brings Idris-style totality + Koka-style rows to the systems-language tier; SMT-backed refinements deferred to v1.0+ |
 | #24 | Boundary crossing | Convention-based snapshot pattern vs `@snapshot Auto.field` operator | **Explicit `@snapshot` expression**; copy-by-value for Copy types in v0.2; lock-holding proof for `#shared` snapshots | Reading mutable state into pure analysis becomes a visible, named act gated by the `Readable` row; supports future read-tracking |
 | #25 | Encapsulation | Re-add `#hidden` per-field modifier with algebraic-trivial-orthogonality interpretation | **`#hidden` on automaton fields** | Implementation hiding by construction; field never appears in outside callables' basis sets, so wedge never collapses against it from outside |
-| #26 | Lock acquisition (refines #21) | Rotor-as-tiebreak vs rotor-as-acquisition primitive | **Rotor-as-acquisition** with counted re-entry, lock-owns-θ, plane-uniqueness enforced as `E0539` | Mutual exclusion + wrong-thread-release detection + re-entrancy all fall out of GA wedge product; runtime is normal CAS spinlock; static check is the engine's existing wedge primitive |
-| #27 | GA across scales (distributed runtime) | Compile-time only vs same wedge primitive lifted to runtime via plugin/debug mode | **Plugin-layer dist-check** with `#dist_shared` opt-in field qualifier | Same `outer_product` runs at three scales (compile-time, in-process runtime, distributed runtime); zero cost when off; strategic claim that GA is fundamental, not incidental |
+| #26 | Lock acquisition (refines #21) | Rotor-as-acquisition primitive vs ordinary owner-ID locks | **DEFERRED TO RESEARCH** (2026-05 audit) | Rotor algebra was decoration over a CAS spinlock with an owner-ID (the decision's own text conceded `exp` never reaches generated code). See `docs/research/ga-rotor-locks.md` |
+| #27 | GA across scales (distributed runtime) | "GA across scales" vs established OCC literature | **DEFERRED TO RESEARCH** (2026-05 audit) | Mechanism is optimistic concurrency control (publish/intersect/retract read-write sets); GA framing added nothing operational. See `docs/research/ga-across-scales.md` |
 
 ---
 
@@ -1661,4 +1540,6 @@ Decisions #1–#27 are all locked alongside six emergent rules and Refinement #1
 - Refinement #1a approved May 2, 2026.
 - Decisions #22 and #25 approved May 3, 2026 (locked design; v0.2 implementation).
 - Decisions #23 and #24 approved May 3, 2026 (DESIGN-IN-PROGRESS — ADRs `docs/adr/0003-haskell-clean-fn-discipline.md` and `docs/adr/0004-snapshot-boundary-operator.md` pending).
+- Decisions #26 and #27 approved May 5, 2026.
+- **Decisions #21, #26, #27 deferred to research May 16, 2026** by the post-GA-narrative pivot (`docs/decision-audit-2026-05.md`). Full text relocated to `docs/research/`; their compiler scaffolding removed from the live tree. The original ADRs (0002, 0005, 0006) remain immutable per CLAUDE.md §5.4.
 **Next Step:** Propagate Decisions #6–#16 through `CLIFFORD_SPEC.md` (§1, §2, §4, §5, §6, §7, §8, §10, §12, §13, new §5.7/§5.8 sub-sections, new error code blocks). After that, Cargo workspace and Phase 1 implementation.

@@ -226,19 +226,6 @@ pub enum TokenKind {
     /// trivial-orthogonality: the field's basis vector simply doesn't
     /// appear in non-owning callables' `actual_writes`.
     KwHashHidden,
-    /// `#shared` field qualifier (Decision #21, reserved for v0.7+).
-    /// Lexes as a token so source compatibility holds across the v0.7
-    /// transition; the parser rejects with a "reserved for v0.7" diagnostic.
-    KwHashShared,
-    /// `#lock NAME #priority: N;` declaration (Decision #21, reserved for v0.7+).
-    KwHashLock,
-    /// `#with_lock(NAME) { … }` block (Decision #21, reserved for v0.7+).
-    KwHashWithLock,
-    /// `#reads: [...]` clause on `#effect` / `#interrupt`
-    /// (Decision #21, reserved for v0.7+).
-    KwHashReads,
-    /// `#rotor: SECTION_OFFSET` lock-rotor parameter (Decision #21, reserved for v0.7+).
-    KwHashRotor,
 
     // ─ Functional sigil-prefixed forms (`@`) — §1.3 ───────────────────────
     /// `@fn` (Decision #1)
@@ -1138,15 +1125,11 @@ impl<'src> Lexer<'src> {
             "audit" => TokenKind::KwHashAudit,
             // Decision #25 — `#hidden` field encapsulation modifier.
             "hidden" => TokenKind::KwHashHidden,
-            // Reserved for v0.7+ — Decision #21 (shared automata via mutator
-            // multivectors). Lexed so source compatibility holds across the
-            // v0.7 transition; the parser will reject these with a
-            // "reserved for v0.7" diagnostic in v0.1–v0.6.
-            "shared" => TokenKind::KwHashShared,
-            "lock" => TokenKind::KwHashLock,
-            "with_lock" => TokenKind::KwHashWithLock,
-            "reads" => TokenKind::KwHashReads,
-            "rotor" => TokenKind::KwHashRotor,
+            // NOTE: `#shared`, `#lock`, `#with_lock`, `#reads`, `#rotor` were
+            // reserved here for Decision #21 (shared automata via mutator
+            // multivectors). Decision #21 was deferred to research by the
+            // 2026-05 audit; the reservations were removed. These forms now
+            // lex as `UnknownHashForm` like any other unrecognised `#name`.
             other => {
                 return Err(LexError::UnknownHashForm {
                     name: other.to_owned(),
@@ -1483,8 +1466,7 @@ mod tests {
                    #unchecked_load #unchecked_store #volatile_load #volatile_store \
                    #unchecked_cast #unchecked_offset #asm #free \
                    #staged #flush #audit \
-                   #hidden \
-                   #shared #lock #with_lock #reads #rotor";
+                   #hidden";
         let expected = vec![
             TokenKind::KwHashAutomaton,
             TokenKind::KwHashEffect,
@@ -1519,12 +1501,6 @@ mod tests {
             TokenKind::KwHashAudit,
             // Decision #25 — `#hidden` field encapsulation modifier.
             TokenKind::KwHashHidden,
-            // Decision #21 — reserved for v0.7+ but lexed today.
-            TokenKind::KwHashShared,
-            TokenKind::KwHashLock,
-            TokenKind::KwHashWithLock,
-            TokenKind::KwHashReads,
-            TokenKind::KwHashRotor,
             TokenKind::Eof,
         ];
         assert_eq!(kinds(src), expected);
@@ -1607,6 +1583,20 @@ mod tests {
             tokenize("@badform"),
             Err(LexError::UnknownAtForm { .. }),
         ));
+    }
+
+    #[test]
+    fn deferred_decision21_hash_forms_no_longer_reserved() {
+        // Decision #21 (shared automata via mutator multivectors) was
+        // deferred to research by the 2026-05 audit. Its reserved
+        // `#`-forms are no longer recognised — they lex as
+        // `UnknownHashForm` like any other unknown `#name`.
+        for form in ["#shared", "#lock", "#with_lock", "#reads", "#rotor"] {
+            assert!(
+                matches!(tokenize(form), Err(LexError::UnknownHashForm { .. })),
+                "expected `{form}` to lex as UnknownHashForm after Decision #21 deferral",
+            );
+        }
     }
 
     // ─── Slice 2: comments ────────────────────────────────────────────────

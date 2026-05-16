@@ -7,6 +7,57 @@ may include breaking changes.
 
 ## [Unreleased]
 
+### Changed — Slice 48: defer GA-arc decisions #21/#26/#27 to research (2026-05-16)
+
+First follow-on from the decision audit (slice 47). Acts on the audit's
+DEFER-TO-RESEARCH verdict for the three decisions that extended the
+Geometric Algebra framing rather than serving a v0.1/v0.2 use case.
+
+**Decisions relocated.** The full original text of Decision #21 (shared
+automata via mutator multivectors), #26 (rotor-based plane-confined
+locks), and #27 (GA across scales — distributed runtime race detection)
+moves verbatim to a new `docs/research/` directory:
+
+- `docs/research/README.md` — explains the directory: research bets, not
+  v1.0 commitments; not normative; scaffolding removed from the live tree.
+- `docs/research/ga-shared-automata.md` — Decision #21.
+- `docs/research/ga-rotor-locks.md` — Decision #26.
+- `docs/research/ga-across-scales.md` — Decision #27.
+
+In `docs/DECISIONS.md`, each of the three decisions is replaced by a short
+deferral stub pointing at its research file; the header status line, the
+Decision Matrix rows, and the chronological footer are updated. The
+original ADRs (`docs/adr/0002`, `0005`, `0006`) are left untouched —
+immutable per CLAUDE.md §5.4.
+
+**Scaffolding removed from the compiler.** Decision #21's Phase-1
+scaffolding had no purpose once the decision was deferred:
+
+- `crates/lexer`: the reserved `#`-forms `#shared`, `#lock`, `#with_lock`,
+  `#reads`, `#rotor` — five `TokenKind` variants and their lex-map
+  entries. These forms now lex as `UnknownHashForm` like any other
+  unrecognised `#name`. A new test, `deferred_decision21_hash_forms_no_longer_reserved`,
+  locks that behavior in; `all_imperative_sigil_forms` drops the five tokens.
+- `crates/ast`: the `FieldKind` enum (`#[non_exhaustive]`, single variant
+  `Private`) and the `AutomatonField.kind` field it populated. The enum
+  existed only to make a future `FieldKind::Shared { lock }` variant a
+  non-breaking change; with #21 deferred, a single-variant enum carried
+  on every field was dead weight.
+- `crates/parser`: the `FieldKind` import and the `kind: FieldKind::Private`
+  initializer in `parse_automaton_field`.
+
+Decisions #26 and #27 never had lexer/AST scaffolding land, so nothing
+was removed for them.
+
+The real problem #21 named — shared mutable resources — is not abandoned:
+it will be re-addressed via Stack Resource Policy (Baker 1991, mechanized
+by RTIC) plus a Pony-`iso`-style `#owned`/`#sendable` field qualifier, in
+a fresh decision validated against a comparison artifact before locking.
+See `docs/foundations.md` §3–§4 and `docs/research/README.md`.
+
+No behavior change for any valid program: the removed `#`-forms were
+never accepted by the parser. Workspace builds; full test suite passes.
+
 ### Added — Slice 47: decision audit (`docs/decision-audit-2026-05.md`) (2026-05-15)
 
 Second artifact of the post-GA-narrative pivot, after `docs/foundations.md`
