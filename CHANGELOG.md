@@ -7,73 +7,56 @@ may include breaking changes.
 
 ## [Unreleased]
 
-### Added — Slice 45: firmware-level `#audit` smoke test (2026-05-15)
+### Added — Slice 47: decision audit (`docs/decision-audit-2026-05.md`) (2026-05-15)
 
-End-to-end runtime proof that the slice 20 → 44 audit chain
-works on a real Cortex-M3 image. Until now the chain was
-covered by codegen unit tests (IR shape) and one CLI test
-(auto-include + marker presence) but never executed past the
-emitter. Slice 45 closes that gap: a single `#audit` automaton
-+ effect + two `@snapshot` getters, dropped into the existing
-QEMU smoke harness, prove the whole pipeline survives clang,
-lld, the LM3S6965 boot path, and ARM semihosting.
+Second artifact of the post-GA-narrative pivot, after `docs/foundations.md`
+(slice 46). Grades every locked Decision #1–#27 (plus refinements and the
+six Emergent Rules) against the project's three first principles and the
+post-pivot grounding. Non-normative — per CLAUDE.md §5.5, changes to locked
+decisions need maintainer sign-off and each lands as its own PR. This
+document is the map that sequences that work.
 
-```clifford
-#audit #automaton SmokeAudited { }
+**Verdict tally:** 20 KEEP, 4 NARROW (#2, #5, #22, #23), 3 CUT (#4,
+Emergent Rules 1 and 6), 3 DEFER-TO-RESEARCH (#21, #26, #27).
 
-#effect smoke_audit_poke(p: &u32) #mutates: [SmokeAudited] {
-  let cur: u32 = #unchecked_load<u32>(p);
-  #unchecked_store<u32>(p, cur + 1u32);
-  return;
-}
+The headline finding: the language survives the audit almost intact.
+Everything that makes Clifford itself — sigils, automaton-as-state-owner,
+narrow unsafe primitives, body-scoped references, sigma loops, register-
+block automata, `#staged`, `#audit`, `#interface` — is KEEP. What gets
+cut or deferred is, with near-total consistency, the GA apparatus and the
+three decisions (#21/#26/#27) written to feed it. The decorative layer
+and the load-bearing layer separate at a clean seam — the strongest
+available confirmation that the pivot is correct.
 
-@fn smoke_loads()  -> u32 $ [Readable] { return @snapshot ShadowSanitizer.loads;  }
-@fn smoke_stores() -> u32 $ [Readable] { return @snapshot ShadowSanitizer.stores; }
-```
+**What the audit recommends (each its own follow-on PR):**
 
-The harness diffs `smoke_loads()` / `smoke_stores()` across
-one call to `smoke_audit_poke(&buf)` and asserts each counter
-incremented by exactly 1, then asserts the buffer was
-actually written (0 → 1) — proof that the slice-44 `audit.ok`
-block continued into the underlying `#unchecked_store` and
-didn't get short-circuited by the trap path.
+- **#4 + Emergent Rules 1 & 6 → CUT.** Decision #4 is end-to-end GA
+  surface (`#basis` overrides, "behavior multivector", `--verbose-basis`);
+  its one surviving sentence folds into the §7 rewrite. Emergent Rule 6
+  ("GA orthogonality = product-category existence") is the exact claim
+  the hostile review demolished.
+- **#21/#26/#27 → DEFER-TO-RESEARCH.** The mixed-metric-GA arc moves to
+  `docs/research/`; its Phase-1 scaffolding (lexer reservations of
+  `#shared`/`#lock`/`#rotor`/etc., the `FieldKind` `#[non_exhaustive]`
+  enum) is cut from the live tree. The real need — shared mutable
+  resources — is re-addressed via Stack Resource Policy (Baker 1991,
+  RTIC) + a Pony-`iso`-style `#owned`/`#sendable` qualifier, in a fresh
+  decision validated against the comparison artifact before locking.
+- **#5 → NARROW.** Keep automaton-as-state-owner, `#transition`-only
+  state changes, and all of Refinements #5a–#5e; move the category-
+  theory apparatus (Appendix B, product categories) to `docs/research/`.
+- **#2/#22/#23 → NARROW.** Resolve the three-way `$ [TraitList]`
+  overload (purity rows / documentary tags / type-checked effect rows)
+  by partitioning the semantics by layer in §4.5. Narrow #23 to the
+  v0.2-realistic subset (totality + fixed-set effect rows + sigma-bound
+  refinements); defer SMT-backed refinements to v0.4+.
+- **Cross-cutting:** a GA-vocabulary sweep across `DECISIONS.md` + spec +
+  docstrings; demote `access<T>` from "third layer" to "typing
+  discipline"; sync the stale Decision #18 status text (the runtime
+  `PointerAuditor` pass landed in slices 37–44).
 
-The counting Sanitizer always returns `true` so the trap
-path is unreachable in practice (LLVM collapses it at
-optimisation), but the IR is emitted, link-resolves, and
-ships in the image regardless. A future shadow-table
-Sanitizer that returns `false` will reach the same trap
-without any codegen change.
-
-**Pipeline changes (test-only — no compiler crate touched):**
-
-- **`tests/qemu/firmware_smoke.cl`:** adds the `SmokeAudited`
-  automaton, the `smoke_audit_poke` effect, and the two
-  `smoke_loads` / `smoke_stores` snapshot getters. The
-  presence of `#audit` flips the slice-40 CLI auto-include
-  on for this file, bringing in `clifford::audit` (interface
-  + counting `ShadowSanitizer`) without any other change to
-  the build script.
-- **`tests/qemu/harness.c`:** adds three checks (9, 10, 11)
-  exercising the audit chain, plus a static `volatile
-  uint32_t smoke_buffer` for the audited RMW to land on.
-- **`tests/qemu/run.sh`:** updated PASS-message check count
-  from 8 → 11.
-- **`tests/qemu/README.md`:** updated check table + count.
-
-**Tests added (3 runtime checks):**
-
-- Check 9: `loads_after - loads_before == 1` —
-  `validate_load` fired exactly once, counter visible from
-  the snapshot getter.
-- Check 10: `stores_after - stores_before == 1` — symmetric
-  for `validate_store`.
-- Check 11: `smoke_buffer == 1` — the underlying
-  `#unchecked_store` actually wrote, proving control flow
-  threaded through `audit.ok.<id>` to the real op.
-
-No new compiler-crate tests; the existing slice 21–44 unit
-tests already cover the IR shape this image exercises.
+No code touched in this slice. The audit closes with an 8-item dependency-
+ordered sequence for the follow-on PRs.
 
 ### Added — Slice 44: abort-on-false (trap when `validate_*` returns false) (2026-05-13)
 
