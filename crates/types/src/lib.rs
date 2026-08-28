@@ -934,11 +934,8 @@ impl TypeRegistry {
         }
         // Build the substitution mapping (param-name → arg) and apply
         // it to the alias body.
-        let mapping: HashMap<&str, &Type> = params
-            .iter()
-            .map(String::as_str)
-            .zip(args.iter())
-            .collect();
+        let mapping: HashMap<&str, &Type> =
+            params.iter().map(String::as_str).zip(args.iter()).collect();
         Some(target.substitute(&mapping))
     }
 
@@ -1102,11 +1099,7 @@ impl TraitRegistry {
 /// body-walking one — it should fire even on callables whose bodies
 /// the inferer never enters (e.g. `@fn` declarations whose call sites
 /// are all in a different module).
-fn validate_trait_lists(
-    program: &Program,
-    registry: &TraitRegistry,
-    errors: &mut Vec<TypeError>,
-) {
+fn validate_trait_lists(program: &Program, registry: &TraitRegistry, errors: &mut Vec<TypeError>) {
     for item in &program.items {
         match item {
             Item::Fn(d) => check_traits(
@@ -1245,11 +1238,7 @@ fn validate_snapshot_row_gates(program: &Program, errors: &mut Vec<TypeError>) {
 /// - Trait-bound satisfaction on generic params (`T: Copy`) — full
 ///   HM-unification work, deferred to a later slice.
 /// - Paths inside `@trait` method signatures — Slice 6 work.
-fn validate_nominal_paths(
-    program: &Program,
-    registry: &TypeRegistry,
-    errors: &mut Vec<TypeError>,
-) {
+fn validate_nominal_paths(program: &Program, registry: &TypeRegistry, errors: &mut Vec<TypeError>) {
     let no_params: &[String] = &[];
     for item in &program.items {
         match item {
@@ -1509,7 +1498,9 @@ fn walk_expr_for_type_exprs(
         ExprKind::Unary { operand, .. } | ExprKind::Ref { operand, .. } => {
             walk_expr_for_type_exprs(operand, registry, params_in_scope, errors);
         }
-        ExprKind::Paren(inner) => walk_expr_for_type_exprs(inner, registry, params_in_scope, errors),
+        ExprKind::Paren(inner) => {
+            walk_expr_for_type_exprs(inner, registry, params_in_scope, errors)
+        }
         ExprKind::Tuple(es) | ExprKind::Array(es) => {
             for e in es {
                 walk_expr_for_type_exprs(e, registry, params_in_scope, errors);
@@ -1903,7 +1894,13 @@ impl<'a> Inferer<'a> {
             // v0.1 scope: range sources only. Array sources (which
             // would type the var as the array's element type) land
             // when slice-indexing infrastructure is built out.
-            StmtKind::Sigma { index_var, var, source, body, .. } => {
+            StmtKind::Sigma {
+                index_var,
+                var,
+                source,
+                body,
+                ..
+            } => {
                 let source_ty = self.infer_expr(source);
                 let var_ty = match &source_ty {
                     Type::Range { element, .. } => (**element).clone(),
@@ -2274,13 +2271,8 @@ impl<'a> Inferer<'a> {
         let limit = variant.args.len().min(arg_types.len());
         for (i, actual) in arg_types.iter().take(limit).enumerate() {
             let declared = &variant.args[i];
-            if let Err(()) = unify_pin(
-                declared,
-                actual,
-                params,
-                &mut bindings,
-                self.type_registry,
-            ) {
+            if let Err(()) = unify_pin(declared, actual, params, &mut bindings, self.type_registry)
+            {
                 // Render the declared form with whatever bindings we
                 // do have so the diagnostic shows the user the
                 // *expected* type after partial inference, not just
@@ -2323,16 +2315,8 @@ impl<'a> Inferer<'a> {
         // ADT, with generic-param substitution from the arg types when
         // the ADT is generic and the arg count matches.
         if let ExprKind::Path(segs) = &callee.kind {
-            if let Some((adt_name, params, variant)) =
-                self.type_registry.lookup_variant(segs)
-            {
-                return self.variant_call_type(
-                    adt_name,
-                    params,
-                    variant,
-                    &arg_types,
-                    at,
-                );
+            if let Some((adt_name, params, variant)) = self.type_registry.lookup_variant(segs) {
+                return self.variant_call_type(adt_name, params, variant, &arg_types, at);
             }
         }
 
@@ -2731,25 +2715,41 @@ fn unify_pin(
             Ok(())
         }
         (
-            Type::Ref { mutable: dm, inner: di },
-            Type::Ref { mutable: am, inner: ai },
+            Type::Ref {
+                mutable: dm,
+                inner: di,
+            },
+            Type::Ref {
+                mutable: am,
+                inner: ai,
+            },
         ) if dm == am => unify_pin(di, ai, params, bindings, registry),
         (
-            Type::Array { element: de, size: ds },
-            Type::Array { element: ae, size: as_size },
+            Type::Array {
+                element: de,
+                size: ds,
+            },
+            Type::Array {
+                element: ae,
+                size: as_size,
+            },
         ) if ds == as_size => unify_pin(de, ae, params, bindings, registry),
+        (Type::Slice { element: de }, Type::Slice { element: ae }) => {
+            unify_pin(de, ae, params, bindings, registry)
+        }
         (
-            Type::Slice { element: de },
-            Type::Slice { element: ae },
-        ) => unify_pin(de, ae, params, bindings, registry),
-        (
-            Type::Range { element: de, inclusive: di },
-            Type::Range { element: ae, inclusive: ai },
+            Type::Range {
+                element: de,
+                inclusive: di,
+            },
+            Type::Range {
+                element: ae,
+                inclusive: ai,
+            },
         ) if di == ai => unify_pin(de, ae, params, bindings, registry),
-        (
-            Type::Nominal { path: dp, args: da },
-            Type::Nominal { path: ap, args: aa },
-        ) if dp == ap && da.len() == aa.len() => {
+        (Type::Nominal { path: dp, args: da }, Type::Nominal { path: ap, args: aa })
+            if dp == ap && da.len() == aa.len() =>
+        {
             for (di, ai) in da.iter().zip(aa) {
                 unify_pin(di, ai, params, bindings, registry)?;
             }
@@ -4233,7 +4233,10 @@ mod tests {
             matches!(e, TypeError::UnknownTrait { trait_name, kind, callable, .. }
                 if trait_name == "TotallyMadeUp" && *kind == "@fn" && callable == "f")
         });
-        assert!(saw, "expected E0541 with kind=@fn callable=f; got {errors:?}");
+        assert!(
+            saw,
+            "expected E0541 with kind=@fn callable=f; got {errors:?}"
+        );
     }
 
     #[test]
@@ -4290,9 +4293,9 @@ mod tests {
             #effect e() #mutates: [C] $ [Realtim] { }\n\
         ";
         let errors = infer_str(src).expect_err("expected E0541 on typo");
-        let saw = errors.iter().any(|e| {
-            matches!(e, TypeError::UnknownTrait { trait_name, .. } if trait_name == "Realtim")
-        });
+        let saw = errors.iter().any(
+            |e| matches!(e, TypeError::UnknownTrait { trait_name, .. } if trait_name == "Realtim"),
+        );
         assert!(saw, "expected E0541 for `Realtim` typo; got {errors:?}");
     }
 
@@ -4317,10 +4320,13 @@ mod tests {
         // user to switch to `@partial`.
         let src = "@fn f(x: u32) -> u32 $ [Diverges] { return x; }";
         let errors = infer_str(src).expect_err("Diverges should be unknown post-ADR-0003");
-        let saw = errors.iter().any(|e| {
-            matches!(e, TypeError::UnknownTrait { trait_name, .. } if trait_name == "Diverges")
-        });
-        assert!(saw, "expected E0541 for dropped `Diverges` trait; got {errors:?}");
+        let saw = errors.iter().any(
+            |e| matches!(e, TypeError::UnknownTrait { trait_name, .. } if trait_name == "Diverges"),
+        );
+        assert!(
+            saw,
+            "expected E0541 for dropped `Diverges` trait; got {errors:?}"
+        );
     }
 
     #[test]
@@ -4447,9 +4453,9 @@ mod tests {
             @fn p() -> u32 { let v := @snapshot C.v; return v; }\n\
         ";
         let errors = infer_str(src).expect_err("expected E0550");
-        let saw = errors.iter().any(|e| {
-            matches!(e, TypeError::SnapshotInUnreadableFn { fn_name, .. } if fn_name == "p")
-        });
+        let saw = errors.iter().any(
+            |e| matches!(e, TypeError::SnapshotInUnreadableFn { fn_name, .. } if fn_name == "p"),
+        );
         assert!(
             saw,
             "expected E0550 SnapshotInUnreadableFn for `p`; got {errors:?}"
@@ -4544,7 +4550,10 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, TypeError::SnapshotInUnreadableFn { fn_name, .. } if fn_name == "p"))
             .count();
-        assert_eq!(count, 1, "expected exactly one E0550; got {count}: {errors:?}");
+        assert_eq!(
+            count, 1,
+            "expected exactly one E0550; got {count}: {errors:?}"
+        );
     }
 
     #[test]
@@ -4562,11 +4571,13 @@ mod tests {
         // The body-walker may still report something else, but no E0550.
         let res = infer_str(src);
         if let Err(errors) = &res {
-            let saw_e0550 = errors.iter().any(|e| matches!(
-                e,
-                TypeError::SnapshotInUnreadableFn { .. }
-            ));
-            assert!(!saw_e0550, "imperative-layer should not trigger E0550; got {errors:?}");
+            let saw_e0550 = errors
+                .iter()
+                .any(|e| matches!(e, TypeError::SnapshotInUnreadableFn { .. }));
+            assert!(
+                !saw_e0550,
+                "imperative-layer should not trigger E0550; got {errors:?}"
+            );
         }
     }
 
@@ -4578,7 +4589,12 @@ mod tests {
         ";
         let errors = infer_str(src).expect_err("expected E0550");
         for e in &errors {
-            if let TypeError::SnapshotInUnreadableFn { fn_name, at, decl_at } = e {
+            if let TypeError::SnapshotInUnreadableFn {
+                fn_name,
+                at,
+                decl_at,
+            } = e
+            {
                 assert_eq!(fn_name, "p");
                 assert!(*decl_at < *at, "decl_at must precede snapshot at");
                 assert!(*at < src.len());
@@ -4623,11 +4639,13 @@ mod tests {
             @fn f() { let _p: Pair<u32, bool> = (1u32, true); return; }\n\
         ";
         let errors = infer_str(src).expect_err("expected E0519");
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            TypeError::GenericArityMismatch { name, expected, actual, .. }
-                if name == "Pair" && *expected == 1 && *actual == 2
-        ));
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                TypeError::GenericArityMismatch { name, expected, actual, .. }
+                    if name == "Pair" && *expected == 1 && *actual == 2
+            )
+        });
         assert!(saw, "expected E0519 expected=1 actual=2; got {errors:?}");
     }
 
@@ -4638,11 +4656,13 @@ mod tests {
             @fn f() { let _p: Pair = (1u32, 2u32); return; }\n\
         ";
         let errors = infer_str(src).expect_err("expected E0519");
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            TypeError::GenericArityMismatch { name, expected, actual, .. }
-                if name == "Pair" && *expected == 1 && *actual == 0
-        ));
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                TypeError::GenericArityMismatch { name, expected, actual, .. }
+                    if name == "Pair" && *expected == 1 && *actual == 0
+            )
+        });
         assert!(saw, "expected E0519 expected=1 actual=0; got {errors:?}");
     }
 
@@ -4653,10 +4673,12 @@ mod tests {
         // diagnostic at signature time.
         let src = "@fn f(x: NotARealType) -> u32 { return 0u32; }";
         let errors = infer_str(src).expect_err("expected E0518");
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            TypeError::UnknownNominalType { name, .. } if name == "NotARealType"
-        ));
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                TypeError::UnknownNominalType { name, .. } if name == "NotARealType"
+            )
+        });
         assert!(saw, "expected E0518 for `NotARealType`; got {errors:?}");
     }
 
@@ -4664,10 +4686,12 @@ mod tests {
     fn t4c_unknown_nominal_in_return_type() {
         let src = "@fn f() -> Phantom { return 0u32; }";
         let errors = infer_str(src).expect_err("expected E0518");
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            TypeError::UnknownNominalType { name, .. } if name == "Phantom"
-        ));
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                TypeError::UnknownNominalType { name, .. } if name == "Phantom"
+            )
+        });
         assert!(saw, "expected E0518 in return type; got {errors:?}");
     }
 
@@ -4675,10 +4699,12 @@ mod tests {
     fn t4c_unknown_nominal_in_let_annotation() {
         let src = "@fn f() { let _x: Mystery = 0u32; return; }";
         let errors = infer_str(src).expect_err("expected E0518 in let annotation");
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            TypeError::UnknownNominalType { name, .. } if name == "Mystery"
-        ));
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                TypeError::UnknownNominalType { name, .. } if name == "Mystery"
+            )
+        });
         assert!(saw, "expected E0518 in let annotation; got {errors:?}");
     }
 
@@ -4759,28 +4785,36 @@ mod tests {
             @fn f(r: Result<u32>) -> bool { return true; }\n\
         ";
         let errors = infer_str(src).expect_err("expected E0519 on ADT");
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            TypeError::GenericArityMismatch { name, expected, actual, .. }
-                if name == "Result" && *expected == 2 && *actual == 1
-        ));
-        assert!(saw, "expected E0519 for `Result<u32>` (need 2); got {errors:?}");
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                TypeError::GenericArityMismatch { name, expected, actual, .. }
+                    if name == "Result" && *expected == 2 && *actual == 1
+            )
+        });
+        assert!(
+            saw,
+            "expected E0519 for `Result<u32>` (need 2); got {errors:?}"
+        );
     }
 
     #[test]
     fn t4c_substitute_replaces_leaf_nominals() {
         // Direct unit test for `Type::substitute`: leaf `Nominal["T"]`
         // substitutes; `Nominal["Other"]` (not in mapping) doesn't.
-        let mapping_owner: HashMap<&str, Type> =
-            [("T", Type::Primitive(PrimitiveType::U32))].into_iter().collect();
-        let mapping: HashMap<&str, &Type> =
-            mapping_owner.iter().map(|(k, v)| (*k, v)).collect();
+        let mapping_owner: HashMap<&str, Type> = [("T", Type::Primitive(PrimitiveType::U32))]
+            .into_iter()
+            .collect();
+        let mapping: HashMap<&str, &Type> = mapping_owner.iter().map(|(k, v)| (*k, v)).collect();
 
         let t_leaf = Type::Nominal {
             path: vec!["T".to_owned()],
             args: vec![],
         };
-        assert_eq!(t_leaf.substitute(&mapping), Type::Primitive(PrimitiveType::U32));
+        assert_eq!(
+            t_leaf.substitute(&mapping),
+            Type::Primitive(PrimitiveType::U32)
+        );
 
         let other_leaf = Type::Nominal {
             path: vec!["Other".to_owned()],
@@ -4792,10 +4826,10 @@ mod tests {
 
     #[test]
     fn t4c_substitute_recurses_into_compound_types() {
-        let mapping_owner: HashMap<&str, Type> =
-            [("T", Type::Primitive(PrimitiveType::U32))].into_iter().collect();
-        let mapping: HashMap<&str, &Type> =
-            mapping_owner.iter().map(|(k, v)| (*k, v)).collect();
+        let mapping_owner: HashMap<&str, Type> = [("T", Type::Primitive(PrimitiveType::U32))]
+            .into_iter()
+            .collect();
+        let mapping: HashMap<&str, &Type> = mapping_owner.iter().map(|(k, v)| (*k, v)).collect();
 
         // Tuple([T, T]) → Tuple([u32, u32])
         let tuple = Type::Tuple(vec![
@@ -4876,11 +4910,13 @@ mod tests {
             #interrupt SysTick() #mutates: [C] #priority: HIGH $ [Readable] { }\n\
         ";
         let errors = infer_str(src).expect_err("expected E0544");
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            TypeError::TraitLayerMismatch { trait_name, actual_kind, .. }
-                if trait_name == "Readable" && *actual_kind == "#interrupt"
-        ));
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                TypeError::TraitLayerMismatch { trait_name, actual_kind, .. }
+                    if trait_name == "Readable" && *actual_kind == "#interrupt"
+            )
+        });
         assert!(saw, "expected E0544 Readable on #interrupt; got {errors:?}");
     }
 
@@ -4893,12 +4929,17 @@ mod tests {
             }\n\
         ";
         let errors = infer_str(src).expect_err("expected E0544");
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            TypeError::TraitLayerMismatch { trait_name, actual_kind, .. }
-                if trait_name == "Observable" && *actual_kind == "#transition"
-        ));
-        assert!(saw, "expected E0544 Observable on #transition; got {errors:?}");
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                TypeError::TraitLayerMismatch { trait_name, actual_kind, .. }
+                    if trait_name == "Observable" && *actual_kind == "#transition"
+            )
+        });
+        assert!(
+            saw,
+            "expected E0544 Observable on #transition; got {errors:?}"
+        );
     }
 
     #[test]
@@ -4921,10 +4962,12 @@ mod tests {
         for name in ["Acquire", "Release", "SeqCst"] {
             let src = format!("@fn p(x: u32) -> u32 $ [{name}] {{ return x; }}");
             let errors = infer_str(&src).unwrap_err();
-            let saw = errors.iter().any(|e| matches!(
-                e,
-                TypeError::TraitLayerMismatch { trait_name, .. } if trait_name == name
-            ));
+            let saw = errors.iter().any(|e| {
+                matches!(
+                    e,
+                    TypeError::TraitLayerMismatch { trait_name, .. } if trait_name == name
+                )
+            });
             assert!(saw, "expected E0544 for `{name}` on @fn");
         }
     }
@@ -5060,7 +5103,10 @@ mod tests {
             @fn pick() -> Color { return Color::Red; }\n\
         ";
         let res = infer_str(src);
-        assert!(res.is_ok(), "expected Color::Red to type as Color; got {res:?}");
+        assert!(
+            res.is_ok(),
+            "expected Color::Red to type as Color; got {res:?}"
+        );
     }
 
     #[test]
@@ -5070,7 +5116,10 @@ mod tests {
             @fn f() { let _c: Color = Color::Green; return; }\n\
         ";
         let res = infer_str(src);
-        assert!(res.is_ok(), "expected Color::Green to typecheck in let; got {res:?}");
+        assert!(
+            res.is_ok(),
+            "expected Color::Green to typecheck in let; got {res:?}"
+        );
     }
 
     #[test]
@@ -5096,12 +5145,14 @@ mod tests {
             @fn bad() -> Maybe { return Maybe::Some(true); }\n\
         ";
         let errors = infer_str(src).expect_err("expected E0522");
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            TypeError::VariantArgMismatch { adt_name, variant_name, expected, actual, .. }
-                if adt_name == "Maybe" && variant_name == "Some"
-                    && expected == "u32" && actual == "bool"
-        ));
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                TypeError::VariantArgMismatch { adt_name, variant_name, expected, actual, .. }
+                    if adt_name == "Maybe" && variant_name == "Some"
+                        && expected == "u32" && actual == "bool"
+            )
+        });
         assert!(saw, "expected E0522 for Some(true); got {errors:?}");
     }
 
@@ -5112,12 +5163,14 @@ mod tests {
             @fn bad() -> Maybe { return Maybe::Some(5u32, 6u32); }\n\
         ";
         let errors = infer_str(src).expect_err("expected E0521");
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            TypeError::VariantArityMismatch { adt_name, variant_name, expected, actual, .. }
-                if adt_name == "Maybe" && variant_name == "Some"
-                    && *expected == 1 && *actual == 2
-        ));
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                TypeError::VariantArityMismatch { adt_name, variant_name, expected, actual, .. }
+                    if adt_name == "Maybe" && variant_name == "Some"
+                        && *expected == 1 && *actual == 2
+            )
+        });
         assert!(saw, "expected E0521 for Some(5,6); got {errors:?}");
     }
 
@@ -5128,11 +5181,13 @@ mod tests {
             @fn bad() -> Pair { return Pair::Both(5u32); }\n\
         ";
         let errors = infer_str(src).expect_err("expected E0521");
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            TypeError::VariantArityMismatch { variant_name, expected, actual, .. }
-                if variant_name == "Both" && *expected == 2 && *actual == 1
-        ));
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                TypeError::VariantArityMismatch { variant_name, expected, actual, .. }
+                    if variant_name == "Both" && *expected == 2 && *actual == 1
+            )
+        });
         assert!(saw, "expected E0521 for Both(5); got {errors:?}");
     }
 
@@ -5226,7 +5281,10 @@ mod tests {
             @fn make() -> Pair<u32> { return Pair::Both(5u32, 6u32); }\n\
         ";
         let res = infer_str(src);
-        assert!(res.is_ok(), "Pair::Both(5u32, 6u32) should typecheck; got {res:?}");
+        assert!(
+            res.is_ok(),
+            "Pair::Both(5u32, 6u32) should typecheck; got {res:?}"
+        );
     }
 
     #[test]
@@ -5253,11 +5311,16 @@ mod tests {
             @fn bad() -> Pair<u32> { return Pair::Both((5u32, true)); }\n\
         ";
         let errors = infer_str(src).expect_err("expected E0522");
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            TypeError::VariantArgMismatch { variant_name, .. } if variant_name == "Both"
-        ));
-        assert!(saw, "expected E0522 for tuple position conflict; got {errors:?}");
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                TypeError::VariantArgMismatch { variant_name, .. } if variant_name == "Both"
+            )
+        });
+        assert!(
+            saw,
+            "expected E0522 for tuple position conflict; got {errors:?}"
+        );
     }
 
     #[test]
@@ -5310,7 +5373,10 @@ mod tests {
             }\n\
         ";
         let res = infer_str(src);
-        assert!(res.is_ok(), "&(T,T) compound should walk through Ref+Tuple; got {res:?}");
+        assert!(
+            res.is_ok(),
+            "&(T,T) compound should walk through Ref+Tuple; got {res:?}"
+        );
     }
 
     #[test]
@@ -5322,10 +5388,12 @@ mod tests {
             @fn bad() -> Pair<u32> { return Pair::Both(5u32); }\n\
         ";
         let errors = infer_str(src).expect_err("expected E0522");
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            TypeError::VariantArgMismatch { variant_name, .. } if variant_name == "Both"
-        ));
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                TypeError::VariantArgMismatch { variant_name, .. } if variant_name == "Both"
+            )
+        });
         assert!(saw, "expected E0522 for shape mismatch; got {errors:?}");
     }
 
@@ -5342,11 +5410,13 @@ mod tests {
         let errors = infer_str(src).expect_err("expected E0522");
         // The third arg should report `expected: u32, actual: bool`
         // (A pinned to u32 from arg 0; arg 2 is bool which conflicts).
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            TypeError::VariantArgMismatch { arg, expected, actual, .. }
-                if *arg == 3 && expected == "u32" && actual == "bool"
-        ));
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                TypeError::VariantArgMismatch { arg, expected, actual, .. }
+                    if *arg == 3 && expected == "u32" && actual == "bool"
+            )
+        });
         assert!(
             saw,
             "expected E0522 with displayed_expected=u32 (substituted from A); got {errors:?}"

@@ -276,9 +276,8 @@ fn run_compile(
     module_name: Option<&str>,
 ) -> Result<(), CompileError> {
     // Read the source file.
-    let source = std::fs::read_to_string(input).map_err(|e| {
-        CompileError::Io(format!("could not read `{}`: {e}", input.display()))
-    })?;
+    let source = std::fs::read_to_string(input)
+        .map_err(|e| CompileError::Io(format!("could not read `{}`: {e}", input.display())))?;
 
     // Resolve defaults: output path = input with `.ll` extension; module
     // name = input file's stem (no extension, no parent dirs).
@@ -303,10 +302,7 @@ fn run_compile(
     };
 
     std::fs::write(&output_path, ir).map_err(|e| {
-        CompileError::Io(format!(
-            "could not write `{}`: {e}",
-            output_path.display()
-        ))
+        CompileError::Io(format!("could not write `{}`: {e}", output_path.display()))
     })?;
 
     eprintln!(
@@ -487,16 +483,13 @@ fn render_phase_error(file_name: &str, source: &str, name: &str, diags: &[PhaseD
             let end = (off + 1).min(source.len());
             let start = off.min(source.len());
             if start <= end {
-                diagnostic = diagnostic.with_labels(vec![
-                    Label::primary((), start..end).with_message("here"),
-                ]);
+                diagnostic = diagnostic
+                    .with_labels(vec![Label::primary((), start..end).with_message("here")]);
             }
         }
         // Render via codespan-reporting. Failure to write to
         // stderr is non-fatal; we fall back to a plain eprintln.
-        if let Err(_render_err) =
-            term::emit(&mut writer_lock, &config, &file, &diagnostic)
-        {
+        if let Err(_render_err) = term::emit(&mut writer_lock, &config, &file, &diagnostic) {
             eprintln!("error[{name}]: {}", diag.message);
         }
     }
@@ -552,10 +545,7 @@ mod tests {
 
     #[test]
     fn unknown_top_level_arg_is_unknown() {
-        assert!(matches!(
-            parse_argv(&argv(&["doctor"])),
-            Cli::Unknown(_)
-        ));
+        assert!(matches!(parse_argv(&argv(&["doctor"])), Cli::Unknown(_)));
     }
 
     #[test]
@@ -586,12 +576,7 @@ mod tests {
 
     #[test]
     fn compile_with_module_name() {
-        let cli = parse_argv(&argv(&[
-            "compile",
-            "hello.cl",
-            "--module-name",
-            "myMod",
-        ]));
+        let cli = parse_argv(&argv(&["compile", "hello.cl", "--module-name", "myMod"]));
         assert_eq!(
             cli,
             Cli::Compile {
@@ -620,10 +605,7 @@ mod tests {
 
     #[test]
     fn compile_missing_input_is_unknown() {
-        assert!(matches!(
-            parse_argv(&argv(&["compile"])),
-            Cli::Unknown(_)
-        ));
+        assert!(matches!(parse_argv(&argv(&["compile"])), Cli::Unknown(_)));
     }
 
     #[test]
@@ -663,10 +645,7 @@ mod tests {
     #[test]
     fn default_module_name_uses_stem() {
         assert_eq!(default_module_name(Path::new("hello.cl")), "hello");
-        assert_eq!(
-            default_module_name(Path::new("path/to/uart.cl")),
-            "uart"
-        );
+        assert_eq!(default_module_name(Path::new("path/to/uart.cl")), "uart");
         assert_eq!(default_module_name(Path::new("noext")), "noext");
     }
 
@@ -841,7 +820,10 @@ mod tests {
 
     #[test]
     fn byte_offset_from_msg_returns_none_for_no_offset() {
-        assert_eq!(byte_offset_from_msg("E0500: GA engine not yet implemented"), None);
+        assert_eq!(
+            byte_offset_from_msg("E0500: GA engine not yet implemented"),
+            None
+        );
         assert_eq!(byte_offset_from_msg("just a plain message"), None);
         assert_eq!(byte_offset_from_msg(""), None);
     }
@@ -891,8 +873,8 @@ mod tests {
         // zero `#`-layer constructs, links with any host C harness.
         // This test just asserts cliffordc accepts the file and
         // produces the expected entry points.
-        let src = std::fs::read_to_string("../../examples/crc32.cl")
-            .expect("read examples/crc32.cl");
+        let src =
+            std::fs::read_to_string("../../examples/crc32.cl").expect("read examples/crc32.cl");
         let ir = compile_source(&src, "crc32").expect("crc32 compiles");
         for needle in [
             "define i32 @crc32_init()",
@@ -992,10 +974,7 @@ mod tests {
                 .unwrap_or("example");
             let res = compile_source(&src, module);
             if let Err(e) = res {
-                panic!(
-                    "example {} failed to compile: {e:?}",
-                    path.display()
-                );
+                panic!("example {} failed to compile: {e:?}", path.display());
             }
         }
     }
@@ -1082,7 +1061,9 @@ mod tests {
     fn s40_needs_audit_stdlib_textual_heuristic() {
         // Direct unit test on the heuristic.
         assert!(needs_audit_stdlib("#audit #automaton X { }"));
-        assert!(needs_audit_stdlib("// some comment\n#audit #automaton X { }"));
+        assert!(needs_audit_stdlib(
+            "// some comment\n#audit #automaton X { }"
+        ));
         assert!(!needs_audit_stdlib("#automaton X { }"));
         assert!(!needs_audit_stdlib(""));
         // User-supplied PointerAuditor suppresses auto-include.

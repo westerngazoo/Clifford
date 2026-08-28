@@ -56,10 +56,10 @@
 
 use clifford_ast::{
     AccessMode, AccessType, AddressClause, ArraySize, ArrayType, AssignOp, AtomicKind,
-    AutomatonDecl, AutomatonField, BasisClause, BinaryOp, Block, EffectDecl, Expr, ExprKind,
-    Field, FieldAssign, FnDecl, FnType, GenericParam, ImplDecl, ImplMethod,
-    InterfaceDecl, InterfaceMethod, InterruptDecl, Item, Param, PathType, PriorityLevel, PrimitiveType,
-    Program, RefType, SequentialAttr, SliceType, StateName, Stmt, StmtKind, TestDecl, TraitDecl,
+    AutomatonDecl, AutomatonField, BasisClause, BinaryOp, Block, EffectDecl, Expr, ExprKind, Field,
+    FieldAssign, FnDecl, FnType, GenericParam, ImplDecl, ImplMethod, InterfaceDecl,
+    InterfaceMethod, InterruptDecl, Item, Param, PathType, PrimitiveType, PriorityLevel, Program,
+    RefType, SequentialAttr, SliceType, StateName, Stmt, StmtKind, TestDecl, TraitDecl,
     TraitMethod, TraitRef, TransitionDecl, TupleType, TypeBody, TypeDecl, TypeExpr, TypeKind,
     UnaryOp, Variant, VariantData,
 };
@@ -290,7 +290,11 @@ impl<'t> Parser<'t> {
             TokenKind::KwAtType => self.parse_type_decl(lead.span.start).map(Item::Type),
             TokenKind::KwAtTrait => self.parse_trait_decl(lead.span.start).map(Item::Trait),
             TokenKind::KwHashAutomaton => self
-                .parse_automaton_decl(lead.span.start, /*staged=*/ false, /*audited=*/ false)
+                .parse_automaton_decl(
+                    lead.span.start,
+                    /*staged=*/ false,
+                    /*audited=*/ false,
+                )
                 .map(Item::Automaton),
             // Decisions #12 + #18 (v0.2): `#staged` and `#audit` are
             // item-level prefixes on `#automaton`. They compose in any
@@ -299,24 +303,21 @@ impl<'t> Parser<'t> {
             // each prefix may appear at most once (duplicate token
             // is a parse error). Both keywords are reserved for
             // `#automaton` only; any other follower is rejected.
-            TokenKind::KwHashStaged | TokenKind::KwHashAudit => {
-                self.parse_prefixed_automaton(lead.span.start)
-                    .map(Item::Automaton)
-            }
-            TokenKind::KwHashEffect => {
-                self.parse_effect_decl(lead.span.start).map(Item::Effect)
-            }
-            TokenKind::KwHashInterrupt => {
-                self.parse_interrupt_decl(lead.span.start).map(Item::Interrupt)
-            }
-            TokenKind::KwHashInterface => {
-                self.parse_interface_decl(lead.span.start).map(Item::Interface)
-            }
+            TokenKind::KwHashStaged | TokenKind::KwHashAudit => self
+                .parse_prefixed_automaton(lead.span.start)
+                .map(Item::Automaton),
+            TokenKind::KwHashEffect => self.parse_effect_decl(lead.span.start).map(Item::Effect),
+            TokenKind::KwHashInterrupt => self
+                .parse_interrupt_decl(lead.span.start)
+                .map(Item::Interrupt),
+            TokenKind::KwHashInterface => self
+                .parse_interface_decl(lead.span.start)
+                .map(Item::Interface),
             TokenKind::KwHashImpl => self.parse_impl_decl(lead.span.start).map(Item::Impl),
             TokenKind::KwHashTest => self.parse_test_decl(lead.span.start).map(Item::Test),
-            TokenKind::KwAtSequential => {
-                self.parse_sequential_attr(lead.span.start).map(Item::Sequential)
-            }
+            TokenKind::KwAtSequential => self
+                .parse_sequential_attr(lead.span.start)
+                .map(Item::Sequential),
             other => Err(ParseError::ExpectedItem {
                 found: other,
                 at: lead.span.start,
@@ -394,10 +395,7 @@ impl<'t> Parser<'t> {
     /// `#audit #staged #automaton …` produce identical ASTs.
     /// Anything other than `#automaton` after the prefixes is
     /// rejected with a diagnostic citing both decisions.
-    fn parse_prefixed_automaton(
-        &mut self,
-        start: usize,
-    ) -> Result<AutomatonDecl, ParseError> {
+    fn parse_prefixed_automaton(&mut self, start: usize) -> Result<AutomatonDecl, ParseError> {
         let mut staged = false;
         let mut audited = false;
         loop {
@@ -430,8 +428,7 @@ impl<'t> Parser<'t> {
                 }
                 other => {
                     return Err(ParseError::Expected {
-                        expected:
-                            "`#automaton` after `#staged` / `#audit` modifier(s) \
+                        expected: "`#automaton` after `#staged` / `#audit` modifier(s) \
                              (Decisions #12 + #18)",
                         found: other,
                         at: tok.span.start,
@@ -592,9 +589,7 @@ impl<'t> Parser<'t> {
         self.expect(TokenKind::LBracket, "`[` to open `#states` list")?;
         let mut names: Vec<StateName> = Vec::new();
         if matches!(self.peek().kind, TokenKind::RBracket) {
-            return Err(ParseError::EmptyStatesList {
-                at: clause_start,
-            });
+            return Err(ParseError::EmptyStatesList { at: clause_start });
         }
         loop {
             let (n, span) = self.expect_ident("state name in `#states` list")?;
@@ -1046,7 +1041,10 @@ impl<'t> Parser<'t> {
         } else {
             None
         };
-        let close = self.expect(TokenKind::Semi, "`;` to terminate interface method signature")?;
+        let close = self.expect(
+            TokenKind::Semi,
+            "`;` to terminate interface method signature",
+        )?;
         Ok(InterfaceMethod {
             name,
             params,
@@ -1081,10 +1079,7 @@ impl<'t> Parser<'t> {
     /// Parse one `@fn name(params) -> ret $ [TraitList];` entry inside `@trait`.
     fn parse_trait_method(&mut self) -> Result<TraitMethod, ParseError> {
         let start = self.peek().span.start;
-        self.expect(
-            TokenKind::KwAtFn,
-            "`@fn` to start a trait method signature",
-        )?;
+        self.expect(TokenKind::KwAtFn, "`@fn` to start a trait method signature")?;
         let (name, _) = self.expect_ident("method name after `@fn`")?;
         let params = self.parse_param_list()?;
         let return_type = if matches!(self.peek().kind, TokenKind::Arrow) {
@@ -1117,11 +1112,9 @@ impl<'t> Parser<'t> {
     /// for its second use position.
     fn parse_impl_decl(&mut self, start: usize) -> Result<ImplDecl, ParseError> {
         self.advance(); // `#impl`
-        let (interface_name, _) =
-            self.expect_ident("interface name after `#impl`")?;
+        let (interface_name, _) = self.expect_ident("interface name after `#impl`")?;
         self.expect(TokenKind::KwFor, "`for` between interface and automaton")?;
-        let (automaton_name, _) =
-            self.expect_ident("automaton name after `for`")?;
+        let (automaton_name, _) = self.expect_ident("automaton name after `for`")?;
         self.expect(TokenKind::LBrace, "`{` to open impl body")?;
 
         // Slice 39: parse zero or more `effect name(...) -> T
@@ -1143,8 +1136,7 @@ impl<'t> Parser<'t> {
                 other => {
                     let t = self.peek().clone();
                     return Err(ParseError::Expected {
-                        expected:
-                            "`effect` to start an impl method body, or `}` to close the impl",
+                        expected: "`effect` to start an impl method body, or `}` to close the impl",
                         found: other.clone(),
                         at: t.span.start,
                     });
@@ -1244,10 +1236,11 @@ impl<'t> Parser<'t> {
     /// `#cannot_mutate: [...]` (optional). Order: `#mutates` must come first
     /// for now; richer reordering and `#invariant` / `#atomic` come in
     /// subsequent slices.
-    fn parse_effect_meta_for_effect(
-        &mut self,
-    ) -> Result<(Vec<String>, Vec<String>), ParseError> {
-        self.expect(TokenKind::KwHashMutates, "`#mutates: [...]` clause is required for `#effect`")?;
+    fn parse_effect_meta_for_effect(&mut self) -> Result<(Vec<String>, Vec<String>), ParseError> {
+        self.expect(
+            TokenKind::KwHashMutates,
+            "`#mutates: [...]` clause is required for `#effect`",
+        )?;
         self.expect(TokenKind::Colon, "`:` after `#mutates`")?;
         let mutates = self.parse_ident_list_in_brackets()?;
 
@@ -1362,7 +1355,8 @@ impl<'t> Parser<'t> {
                     "HIGH" => PriorityLevel::High,
                     _ => {
                         return Err(ParseError::Expected {
-                            expected: "`LOW`, `MEDIUM`, `HIGH`, or integer literal as `#priority` value",
+                            expected:
+                                "`LOW`, `MEDIUM`, `HIGH`, or integer literal as `#priority` value",
                             found: t.kind,
                             at: t.span.start,
                         });
@@ -1526,7 +1520,7 @@ impl<'t> Parser<'t> {
     /// with ≥ 2 elements per §2.7).
     fn parse_tuple_or_unit_type(&mut self, start: usize) -> Result<TypeExpr, ParseError> {
         self.advance(); // `(`
-        // Empty `()` → unit.
+                        // Empty `()` → unit.
         if matches!(self.peek().kind, TokenKind::RParen) {
             let close = self.expect(TokenKind::RParen, "internal: just peeked RParen")?;
             return Ok(TypeExpr {
@@ -1622,8 +1616,7 @@ impl<'t> Parser<'t> {
                 }
             }
         }
-        let close_paren =
-            self.expect(TokenKind::RParen, "`)` to close @fn parameter types")?;
+        let close_paren = self.expect(TokenKind::RParen, "`)` to close @fn parameter types")?;
         let mut end = close_paren.end;
 
         let return_type = if matches!(self.peek().kind, TokenKind::Arrow) {
@@ -2151,7 +2144,7 @@ impl<'t> Parser<'t> {
 
     fn parse_let_stmt(&mut self, start: usize) -> Result<Stmt, ParseError> {
         self.advance(); // `let`
-        // `let mut?` - if mut, must be plain `let mut x: T = expr;` (no `:=`).
+                        // `let mut?` - if mut, must be plain `let mut x: T = expr;` (no `:=`).
         let mutable = if matches!(self.peek().kind, TokenKind::KwMut) {
             self.advance();
             true
@@ -2368,11 +2361,11 @@ impl<'t> Parser<'t> {
         let mut end = then_block.span.end;
         let else_block = if matches!(self.peek().kind, TokenKind::KwElse) {
             self.advance(); // `else`
-            // `else if` chain: parse the next `if` as a statement
-            // and wrap it in a synthetic single-stmt Block. This
-            // keeps the AST shape uniform — every `else_block` is
-            // a `Block`, regardless of whether the source wrote
-            // `else if` or `else { if … }`.
+                            // `else if` chain: parse the next `if` as a statement
+                            // and wrap it in a synthetic single-stmt Block. This
+                            // keeps the AST shape uniform — every `else_block` is
+                            // a `Block`, regardless of whether the source wrote
+                            // `else if` or `else { if … }`.
             if matches!(self.peek().kind, TokenKind::KwIf) {
                 let inner_start = self.peek().span.start;
                 let inner = self.parse_if_stmt(inner_start)?;
@@ -2471,8 +2464,7 @@ impl<'t> Parser<'t> {
     /// only checks the grammar.
     fn parse_flush_stmt(&mut self, start: usize) -> Result<Stmt, ParseError> {
         self.advance(); // `#flush`
-        let (automaton, _) =
-            self.expect_ident("automaton name after `#flush` (Decision #12)")?;
+        let (automaton, _) = self.expect_ident("automaton name after `#flush` (Decision #12)")?;
         let close = self.expect(TokenKind::Semi, "`;` to terminate `#flush` statement")?;
         Ok(Stmt {
             kind: StmtKind::Flush { automaton },
@@ -2482,8 +2474,8 @@ impl<'t> Parser<'t> {
 
     fn parse_sigma_stmt(&mut self, start: usize) -> Result<Stmt, ParseError> {
         self.advance(); // `sigma`
-        // Slice 27: optional `'label` between `sigma` and the
-        // loop variable.
+                        // Slice 27: optional `'label` between `sigma` and the
+                        // loop variable.
         let label = self.parse_optional_label_target();
         // Slice 36: pattern is either a single ident `x` (slice
         // 11/35) or `(i, x)` for index+element binding. The
@@ -2492,8 +2484,12 @@ impl<'t> Parser<'t> {
         let (index_var, var) = if matches!(self.peek().kind, TokenKind::LParen) {
             self.advance(); // `(`
             let (idx_name, _) = self.expect_ident("index variable name in `sigma (i, x) in …`")?;
-            self.expect(TokenKind::Comma, "`,` between index and element bindings in `sigma (i, x) …`")?;
-            let (val_name, _) = self.expect_ident("element variable name after `,` in `sigma (i, x) in …`")?;
+            self.expect(
+                TokenKind::Comma,
+                "`,` between index and element bindings in `sigma (i, x) …`",
+            )?;
+            let (val_name, _) =
+                self.expect_ident("element variable name after `,` in `sigma (i, x) in …`")?;
             self.expect(TokenKind::RParen, "`)` to close `(i, x)` sigma pattern")?;
             (Some(idx_name), val_name)
         } else {
@@ -2505,7 +2501,13 @@ impl<'t> Parser<'t> {
         let body = self.parse_block()?;
         let end = body.span.end;
         Ok(Stmt {
-            kind: StmtKind::Sigma { label, index_var, var, source, body },
+            kind: StmtKind::Sigma {
+                label,
+                index_var,
+                var,
+                source,
+                body,
+            },
             span: Span::new(start, end),
         })
     }
@@ -2894,8 +2896,8 @@ impl<'t> Parser<'t> {
 
     fn parse_paren_or_tuple_expr(&mut self, start: usize) -> Result<Expr, ParseError> {
         self.advance(); // `(`
-        // Empty parens `()` is unit — emitted as an empty Tuple. Real unit
-        // expression handling can come later; for now reject explicitly.
+                        // Empty parens `()` is unit — emitted as an empty Tuple. Real unit
+                        // expression handling can come later; for now reject explicitly.
         if matches!(self.peek().kind, TokenKind::RParen) {
             let close = self.expect(TokenKind::RParen, "internal RParen")?;
             return Ok(Expr {
@@ -2971,7 +2973,8 @@ impl<'t> Parser<'t> {
             TokenKind::Semi => {
                 self.advance();
                 let count = self.parse_expr()?;
-                let close = self.expect(TokenKind::RBracket, "`]` to close array-repeat literal")?;
+                let close =
+                    self.expect(TokenKind::RBracket, "`]` to close array-repeat literal")?;
                 Ok(Expr {
                     kind: ExprKind::ArrayRepeat {
                         value: Box::new(first),
@@ -3032,11 +3035,7 @@ impl<'t> Parser<'t> {
         }
     }
 
-    fn parse_unsafe_load_expr(
-        &mut self,
-        start: usize,
-        volatile: bool,
-    ) -> Result<Expr, ParseError> {
+    fn parse_unsafe_load_expr(&mut self, start: usize, volatile: bool) -> Result<Expr, ParseError> {
         self.advance(); // primitive keyword
         self.expect(TokenKind::Lt, "`<` after load primitive")?;
         let ty = self.parse_type()?;
@@ -3164,7 +3163,10 @@ impl<'t> Parser<'t> {
                 });
             }
         };
-        self.expect(TokenKind::Dot, "`.` between automaton name and field in `@snapshot`")?;
+        self.expect(
+            TokenKind::Dot,
+            "`.` between automaton name and field in `@snapshot`",
+        )?;
         let (field, field_span) = self.expect_ident("field name after `.` in `@snapshot`")?;
         Ok(Expr {
             kind: ExprKind::Snapshot { automaton, field },
@@ -3191,14 +3193,16 @@ impl<'t> Parser<'t> {
             }
             other => {
                 return Err(ParseError::Expected {
-                    expected:
-                        "automaton name or `Self` after `@shadow` (e.g. `@shadow Pose.x`)",
+                    expected: "automaton name or `Self` after `@shadow` (e.g. `@shadow Pose.x`)",
                     found: other,
                     at: tok.span.start,
                 });
             }
         };
-        self.expect(TokenKind::Dot, "`.` between automaton name and field in `@shadow`")?;
+        self.expect(
+            TokenKind::Dot,
+            "`.` between automaton name and field in `@shadow`",
+        )?;
         let (field, field_span) = self.expect_ident("field name after `.` in `@shadow`")?;
         Ok(Expr {
             kind: ExprKind::Shadow { automaton, field },
@@ -3432,8 +3436,7 @@ mod tests {
     // ─── Slice 2: extended top-level items ────────────────────────────────
 
     use clifford_ast::{
-        EffectDecl, ImplDecl, InterfaceDecl, InterruptDecl, PriorityLevel, SequentialAttr,
-        TestDecl,
+        EffectDecl, ImplDecl, InterfaceDecl, InterruptDecl, PriorityLevel, SequentialAttr, TestDecl,
     };
 
     #[test]
@@ -3537,8 +3540,8 @@ mod tests {
 
     #[test]
     fn interrupt_requires_priority() {
-        let err =
-            parse_str("#interrupt UART_RX() #mutates: [UartRx] { }").expect_err("missing #priority");
+        let err = parse_str("#interrupt UART_RX() #mutates: [UartRx] { }")
+            .expect_err("missing #priority");
         assert!(matches!(
             err,
             ParseError::Expected {
@@ -3550,10 +3553,8 @@ mod tests {
 
     #[test]
     fn interrupt_priority_rejects_random_ident() {
-        let err = parse_str(
-            "#interrupt X() #mutates: [A] #priority: SUPER_DUPER_HIGH { }",
-        )
-        .expect_err("random ident is not a valid priority level");
+        let err = parse_str("#interrupt X() #mutates: [A] #priority: SUPER_DUPER_HIGH { }")
+            .expect_err("random ident is not a valid priority level");
         assert!(matches!(
             err,
             ParseError::Expected {
@@ -3635,8 +3636,7 @@ mod tests {
         .expect("parse multi-method impl");
         match &p.items[0] {
             Item::Impl(decl) => {
-                let names: Vec<&str> =
-                    decl.methods.iter().map(|m| m.name.as_str()).collect();
+                let names: Vec<&str> = decl.methods.iter().map(|m| m.name.as_str()).collect();
                 assert_eq!(
                     names,
                     vec![
@@ -3656,10 +3656,8 @@ mod tests {
         // Anything other than `effect <method>` inside the
         // braces is a parse error citing the expected
         // shape.
-        let err = parse_str(
-            "#impl Foo for Bar { @fn random() { return; } }",
-        )
-        .expect_err("@fn inside impl body");
+        let err = parse_str("#impl Foo for Bar { @fn random() { return; } }")
+            .expect_err("@fn inside impl body");
         let msg = format!("{err}");
         assert!(
             msg.contains("effect") || msg.contains("`}`"),
@@ -3692,8 +3690,7 @@ mod tests {
 
     #[test]
     fn test_decl_with_description() {
-        let p = parse_str(r#"#test "scheduler picks lowest vruntime" { }"#)
-            .expect("parse #test");
+        let p = parse_str(r#"#test "scheduler picks lowest vruntime" { }"#).expect("parse #test");
         match &p.items[0] {
             Item::Test(TestDecl { description, .. }) => {
                 assert_eq!(description, "scheduler picks lowest vruntime");
@@ -3761,15 +3758,15 @@ mod tests {
         assert_eq!(
             layers,
             vec![
-                Layer::Imperative,  // #automaton Counter
-                Layer::Imperative,  // #automaton Boot
-                Layer::Imperative,  // #effect
-                Layer::Imperative,  // #interrupt
-                Layer::Imperative,  // #interface
-                Layer::Imperative,  // #impl
-                Layer::Imperative,  // #test
-                Layer::Functional,  // @sequential
-                Layer::Functional,  // @fn main
+                Layer::Imperative, // #automaton Counter
+                Layer::Imperative, // #automaton Boot
+                Layer::Imperative, // #effect
+                Layer::Imperative, // #interrupt
+                Layer::Imperative, // #interface
+                Layer::Imperative, // #impl
+                Layer::Imperative, // #test
+                Layer::Functional, // @sequential
+                Layer::Functional, // @fn main
             ]
         );
     }
@@ -3980,9 +3977,19 @@ mod tests {
                 segments,
                 generic_args,
             }) => {
-                assert_eq!(segments, vec!["clifford".to_string(), "core".to_string(), "Option".to_string()]);
+                assert_eq!(
+                    segments,
+                    vec![
+                        "clifford".to_string(),
+                        "core".to_string(),
+                        "Option".to_string()
+                    ]
+                );
                 assert_eq!(generic_args.len(), 1);
-                assert_eq!(generic_args[0].kind, TypeKind::Primitive(PrimitiveType::U32));
+                assert_eq!(
+                    generic_args[0].kind,
+                    TypeKind::Primitive(PrimitiveType::U32)
+                );
             }
             other => panic!("expected Path, got {:?}", other),
         }
@@ -4066,11 +4073,14 @@ mod tests {
 
     #[test]
     fn fn_type_with_generic_trait_in_list() {
-        let ty = parse_type_str("@fn(u32) $ [Iterator<u32>]").expect("parse @fn with generic trait");
+        let ty =
+            parse_type_str("@fn(u32) $ [Iterator<u32>]").expect("parse @fn with generic trait");
         match ty.kind {
             TypeKind::Fn(FnType { trait_list, .. }) => {
                 assert_eq!(trait_list.len(), 1);
-                let TraitRef { name, generic_args, .. } = &trait_list[0];
+                let TraitRef {
+                    name, generic_args, ..
+                } = &trait_list[0];
                 assert_eq!(name, "Iterator");
                 assert_eq!(generic_args.len(), 1);
                 assert_eq!(
@@ -4105,8 +4115,7 @@ mod tests {
     fn deeply_nested_types() {
         // `access<[Result<u32, bool>; 8]>` — a register pointer to an array
         // of Results. Stress-tests recursion depth.
-        let ty = parse_type_str("access<[Result<u32, bool>; 8]>")
-            .expect("parse deep nested");
+        let ty = parse_type_str("access<[Result<u32, bool>; 8]>").expect("parse deep nested");
         match ty.kind {
             TypeKind::Access(AccessType { is_const, inner }) => {
                 assert!(!is_const);
@@ -4124,7 +4133,10 @@ mod tests {
             TypeKind::Tuple(TupleType { elements }) => {
                 assert_eq!(elements.len(), 2);
                 assert!(matches!(elements[0].kind, TypeKind::Ref(_)));
-                assert!(matches!(elements[1].kind, TypeKind::Ref(RefType { mutable: true, .. })));
+                assert!(matches!(
+                    elements[1].kind,
+                    TypeKind::Ref(RefType { mutable: true, .. })
+                ));
             }
             other => panic!("expected Tuple, got {:?}", other),
         }
@@ -4176,9 +4188,7 @@ mod tests {
         let p = parse_str("@fn next() -> u32 { }").expect("parse @fn -> u32");
         match &p.items[0] {
             Item::Fn(FnDecl {
-                name,
-                return_type,
-                ..
+                name, return_type, ..
             }) => {
                 assert_eq!(name, "next");
                 assert!(return_type.is_some());
@@ -4281,10 +4291,8 @@ mod tests {
     fn fn_with_complex_param_types() {
         // `(snap: &SchedulerSnapshot, deadline: u64)` — the kernel
         // scheduler signature shape from the worked example.
-        let p = parse_str(
-            "@fn pick_next(snap: &SchedulerSnapshot, deadline: u64) -> Decision { }",
-        )
-        .expect("parse scheduler-shape signature");
+        let p = parse_str("@fn pick_next(snap: &SchedulerSnapshot, deadline: u64) -> Decision { }")
+            .expect("parse scheduler-shape signature");
         match &p.items[0] {
             Item::Fn(FnDecl {
                 params,
@@ -4319,8 +4327,8 @@ mod tests {
 
     #[test]
     fn fn_with_trait_list() {
-        let p = parse_str("@fn pure_helper(x: u32) -> u32 $ [Pure] { }")
-            .expect("parse @fn $ [Pure]");
+        let p =
+            parse_str("@fn pure_helper(x: u32) -> u32 $ [Pure] { }").expect("parse @fn $ [Pure]");
         match &p.items[0] {
             Item::Fn(FnDecl { trait_list, .. }) => {
                 assert_eq!(trait_list.len(), 1);
@@ -4369,8 +4377,7 @@ mod tests {
     #[test]
     fn fn_full_signature() {
         // Everything together: params, return type, trait list.
-        let src =
-            "@fn cmd_is_help(buf: &[u8], min_len: usize) -> bool $ [Pure] { }";
+        let src = "@fn cmd_is_help(buf: &[u8], min_len: usize) -> bool $ [Pure] { }";
         let p = parse_str(src).expect("parse full @fn signature");
         match &p.items[0] {
             Item::Fn(FnDecl {
@@ -4432,10 +4439,8 @@ mod tests {
 
     #[test]
     fn effect_with_params_and_return() {
-        let p = parse_str(
-            "#effect read_byte() -> u8 #mutates: [Usart1] { }",
-        )
-        .expect("parse #effect -> u8");
+        let p = parse_str("#effect read_byte() -> u8 #mutates: [Usart1] { }")
+            .expect("parse #effect -> u8");
         match &p.items[0] {
             Item::Effect(EffectDecl {
                 params,
@@ -4594,10 +4599,8 @@ mod tests {
 
     #[test]
     fn type_adt_mixed_variant_kinds() {
-        let p = parse_str(
-            "@type Event = Tick | Tx(u8) | Reading { ch: u8, value: u16 } | Halt;",
-        )
-        .expect("parse mixed-kinds ADT");
+        let p = parse_str("@type Event = Tick | Tx(u8) | Reading { ch: u8, value: u16 } | Halt;")
+            .expect("parse mixed-kinds ADT");
         match &p.items[0] {
             Item::Type(TypeDecl {
                 body: TypeBody::Adt(variants),
@@ -4683,8 +4686,8 @@ mod tests {
     fn nested_adt_in_alias() {
         // A type alias whose RHS is itself a path that would look like an
         // ADT variant if not for the generic args (`Result<u32, bool>`).
-        let p = parse_str("@type IntOrBool = Result<u32, bool>;")
-            .expect("parse alias to generic path");
+        let p =
+            parse_str("@type IntOrBool = Result<u32, bool>;").expect("parse alias to generic path");
         match &p.items[0] {
             Item::Type(TypeDecl {
                 body: TypeBody::Alias(ty),
@@ -4754,8 +4757,7 @@ mod tests {
 
     #[test]
     fn interface_with_multiple_methods() {
-        let src =
-            "#interface Serial {\n  \
+        let src = "#interface Serial {\n  \
              effect send_byte(b: u8);\n  \
              effect recv_byte() -> u8;\n  \
              effect flush() -> bool;\n\
@@ -4797,8 +4799,8 @@ mod tests {
 
     #[test]
     fn interface_method_must_start_with_effect_keyword() {
-        let err = parse_str("#interface X { send_byte(b: u8); }")
-            .expect_err("missing `effect` keyword");
+        let err =
+            parse_str("#interface X { send_byte(b: u8); }").expect_err("missing `effect` keyword");
         assert!(matches!(
             err,
             ParseError::Expected {
@@ -5037,8 +5039,14 @@ mod tests {
 
     #[test]
     fn expr_bool_literals() {
-        assert_eq!(parse_expr_str("true").unwrap().kind, ExprKind::BoolLit(true));
-        assert_eq!(parse_expr_str("false").unwrap().kind, ExprKind::BoolLit(false));
+        assert_eq!(
+            parse_expr_str("true").unwrap().kind,
+            ExprKind::BoolLit(true)
+        );
+        assert_eq!(
+            parse_expr_str("false").unwrap().kind,
+            ExprKind::BoolLit(false)
+        );
     }
 
     #[test]
@@ -5198,7 +5206,10 @@ mod tests {
         let e = parse_expr_str("!flag").unwrap();
         assert!(matches!(
             e.kind,
-            ExprKind::Unary { op: UnaryOp::Not, .. }
+            ExprKind::Unary {
+                op: UnaryOp::Not,
+                ..
+            }
         ));
     }
 
@@ -5207,7 +5218,10 @@ mod tests {
         let e = parse_expr_str("~mask").unwrap();
         assert!(matches!(
             e.kind,
-            ExprKind::Unary { op: UnaryOp::BitNot, .. }
+            ExprKind::Unary {
+                op: UnaryOp::BitNot,
+                ..
+            }
         ));
     }
 
@@ -5216,7 +5230,10 @@ mod tests {
         let e = parse_expr_str("*p").unwrap();
         assert!(matches!(
             e.kind,
-            ExprKind::Unary { op: UnaryOp::Deref, .. }
+            ExprKind::Unary {
+                op: UnaryOp::Deref,
+                ..
+            }
         ));
     }
 
@@ -5254,10 +5271,16 @@ mod tests {
         // `1 + 2 * 3` should parse as `1 + (2 * 3)`.
         let e = parse_expr_str("1 + 2 * 3").unwrap();
         match e.kind {
-            ExprKind::Binary { op: BinaryOp::Add, lhs, rhs } => {
+            ExprKind::Binary {
+                op: BinaryOp::Add,
+                lhs,
+                rhs,
+            } => {
                 assert_eq!(lhs.kind, ExprKind::IntLit("1".into()));
                 match rhs.kind {
-                    ExprKind::Binary { op: BinaryOp::Mul, .. } => {}
+                    ExprKind::Binary {
+                        op: BinaryOp::Mul, ..
+                    } => {}
                     other => panic!("expected Mul on rhs, got {:?}", other),
                 }
             }
@@ -5270,8 +5293,18 @@ mod tests {
         // `1 + 2 + 3` → `(1 + 2) + 3`.
         let e = parse_expr_str("1 + 2 + 3").unwrap();
         match e.kind {
-            ExprKind::Binary { op: BinaryOp::Add, lhs, rhs } => {
-                assert!(matches!(lhs.kind, ExprKind::Binary { op: BinaryOp::Add, .. }));
+            ExprKind::Binary {
+                op: BinaryOp::Add,
+                lhs,
+                rhs,
+            } => {
+                assert!(matches!(
+                    lhs.kind,
+                    ExprKind::Binary {
+                        op: BinaryOp::Add,
+                        ..
+                    }
+                ));
                 assert_eq!(rhs.kind, ExprKind::IntLit("3".into()));
             }
             other => panic!("expected Add, got {:?}", other),
@@ -5283,8 +5316,18 @@ mod tests {
         // `a || b && c` → `a || (b && c)`.
         let e = parse_expr_str("a || b && c").unwrap();
         match e.kind {
-            ExprKind::Binary { op: BinaryOp::Or, rhs, .. } => {
-                assert!(matches!(rhs.kind, ExprKind::Binary { op: BinaryOp::And, .. }));
+            ExprKind::Binary {
+                op: BinaryOp::Or,
+                rhs,
+                ..
+            } => {
+                assert!(matches!(
+                    rhs.kind,
+                    ExprKind::Binary {
+                        op: BinaryOp::And,
+                        ..
+                    }
+                ));
             }
             other => panic!("expected Or, got {:?}", other),
         }
@@ -5295,9 +5338,25 @@ mod tests {
         // `a + 1 < b * 2` → `(a + 1) < (b * 2)`.
         let e = parse_expr_str("a + 1 < b * 2").unwrap();
         match e.kind {
-            ExprKind::Binary { op: BinaryOp::Lt, lhs, rhs } => {
-                assert!(matches!(lhs.kind, ExprKind::Binary { op: BinaryOp::Add, .. }));
-                assert!(matches!(rhs.kind, ExprKind::Binary { op: BinaryOp::Mul, .. }));
+            ExprKind::Binary {
+                op: BinaryOp::Lt,
+                lhs,
+                rhs,
+            } => {
+                assert!(matches!(
+                    lhs.kind,
+                    ExprKind::Binary {
+                        op: BinaryOp::Add,
+                        ..
+                    }
+                ));
+                assert!(matches!(
+                    rhs.kind,
+                    ExprKind::Binary {
+                        op: BinaryOp::Mul,
+                        ..
+                    }
+                ));
             }
             other => panic!("expected Lt, got {:?}", other),
         }
@@ -5309,11 +5368,22 @@ mod tests {
         // `a | b ^ c & d` → `a | (b ^ (c & d))`.
         let e = parse_expr_str("a | b ^ c & d").unwrap();
         match e.kind {
-            ExprKind::Binary { op: BinaryOp::BitOr, rhs, .. } => match rhs.kind {
-                ExprKind::Binary { op: BinaryOp::BitXor, rhs: rhs2, .. } => {
+            ExprKind::Binary {
+                op: BinaryOp::BitOr,
+                rhs,
+                ..
+            } => match rhs.kind {
+                ExprKind::Binary {
+                    op: BinaryOp::BitXor,
+                    rhs: rhs2,
+                    ..
+                } => {
                     assert!(matches!(
                         rhs2.kind,
-                        ExprKind::Binary { op: BinaryOp::BitAnd, .. }
+                        ExprKind::Binary {
+                            op: BinaryOp::BitAnd,
+                            ..
+                        }
                     ));
                 }
                 other => panic!("expected BitXor under BitOr, got {:?}", other),
@@ -5328,8 +5398,18 @@ mod tests {
         // so `+` binds tighter: `(a + b) << 2`.
         let e = parse_expr_str("a + b << 2").unwrap();
         match e.kind {
-            ExprKind::Binary { op: BinaryOp::Shl, lhs, .. } => {
-                assert!(matches!(lhs.kind, ExprKind::Binary { op: BinaryOp::Add, .. }));
+            ExprKind::Binary {
+                op: BinaryOp::Shl,
+                lhs,
+                ..
+            } => {
+                assert!(matches!(
+                    lhs.kind,
+                    ExprKind::Binary {
+                        op: BinaryOp::Add,
+                        ..
+                    }
+                ));
             }
             other => panic!("expected Shl, got {:?}", other),
         }
@@ -5340,7 +5420,11 @@ mod tests {
         // `(1 + 2) * 3` — explicit grouping.
         let e = parse_expr_str("(1 + 2) * 3").unwrap();
         match e.kind {
-            ExprKind::Binary { op: BinaryOp::Mul, lhs, .. } => {
+            ExprKind::Binary {
+                op: BinaryOp::Mul,
+                lhs,
+                ..
+            } => {
                 assert!(matches!(lhs.kind, ExprKind::Paren(_)));
             }
             other => panic!("expected Mul, got {:?}", other),
@@ -5352,8 +5436,18 @@ mod tests {
         // `-a + b` → `(-a) + b`. Unary binds tighter than binary.
         let e = parse_expr_str("-a + b").unwrap();
         match e.kind {
-            ExprKind::Binary { op: BinaryOp::Add, lhs, .. } => {
-                assert!(matches!(lhs.kind, ExprKind::Unary { op: UnaryOp::Neg, .. }));
+            ExprKind::Binary {
+                op: BinaryOp::Add,
+                lhs,
+                ..
+            } => {
+                assert!(matches!(
+                    lhs.kind,
+                    ExprKind::Unary {
+                        op: UnaryOp::Neg,
+                        ..
+                    }
+                ));
             }
             other => panic!("expected Add, got {:?}", other),
         }
@@ -5413,8 +5507,7 @@ mod tests {
 
     #[test]
     fn expr_unchecked_cast_with_reason() {
-        let e =
-            parse_expr_str(r#"#unchecked_cast<u32, i32>("safe per ABI", x)"#).unwrap();
+        let e = parse_expr_str(r#"#unchecked_cast<u32, i32>("safe per ABI", x)"#).unwrap();
         match e.kind {
             ExprKind::UncheckedCast { reason, .. } => {
                 assert_eq!(reason, "safe per ABI");
@@ -5461,7 +5554,12 @@ mod tests {
     fn stmt_let_explicit() {
         let s = parse_stmt_str("let x: u32 = 1;");
         match s.kind {
-            StmtKind::Let { mutable, name, ty, value } => {
+            StmtKind::Let {
+                mutable,
+                name,
+                ty,
+                value,
+            } => {
                 assert!(!mutable);
                 assert_eq!(name, "x");
                 assert!(ty.is_some());
@@ -5544,7 +5642,12 @@ mod tests {
             StmtKind::Mutate { automaton, assigns } => {
                 assert_eq!(automaton, "Counter");
                 assert_eq!(assigns.len(), 2);
-                let FieldAssign { field, index, value, .. } = &assigns[0];
+                let FieldAssign {
+                    field,
+                    index,
+                    value,
+                    ..
+                } = &assigns[0];
                 assert_eq!(field, "value");
                 assert!(index.is_none());
                 assert_eq!(value.kind, ExprKind::IntLit("1".into()));
@@ -5569,7 +5672,12 @@ mod tests {
         // Decision #15: `Auto.field = expr;`
         let s = parse_stmt_str("Counter.value = 5;");
         match s.kind {
-            StmtKind::MutateShort { automaton, field, op, value } => {
+            StmtKind::MutateShort {
+                automaton,
+                field,
+                op,
+                value,
+            } => {
                 assert_eq!(automaton, "Counter");
                 assert_eq!(field, "value");
                 assert_eq!(op, AssignOp::Eq);
@@ -5689,14 +5797,14 @@ mod tests {
 
     #[test]
     fn effect_body_round_trips_through_decl() {
-        let p = parse_str(
-            "#effect tick() #mutates: [Counter] { Counter.value += 1; }",
-        )
-        .unwrap();
+        let p = parse_str("#effect tick() #mutates: [Counter] { Counter.value += 1; }").unwrap();
         match &p.items[0] {
             Item::Effect(decl) => {
                 assert_eq!(decl.body.stmts.len(), 1);
-                assert!(matches!(decl.body.stmts[0].kind, StmtKind::MutateShort { .. }));
+                assert!(matches!(
+                    decl.body.stmts[0].kind,
+                    StmtKind::MutateShort { .. }
+                ));
             }
             other => panic!("expected Effect, got {:?}", other),
         }
@@ -5704,10 +5812,8 @@ mod tests {
 
     #[test]
     fn interrupt_body_round_trips_through_decl() {
-        let p = parse_str(
-            "#interrupt UART_RX() #mutates: [Logger] #priority: HIGH { #> log(1); }",
-        )
-        .unwrap();
+        let p = parse_str("#interrupt UART_RX() #mutates: [Logger] #priority: HIGH { #> log(1); }")
+            .unwrap();
         match &p.items[0] {
             Item::Interrupt(decl) => {
                 assert_eq!(decl.body.stmts.len(), 1);
@@ -5768,9 +5874,7 @@ mod tests {
 
     // ─── Slice 8: automaton members (Decisions #4, #5, #6 + Refinement #5b) ─
 
-    use clifford_ast::{
-        AccessMode, AddressClause, AutomatonField, BasisClause, StateName,
-    };
+    use clifford_ast::{AccessMode, AddressClause, AutomatonField, BasisClause, StateName};
 
     fn auto(p: &Program, idx: usize) -> &clifford_ast::AutomatonDecl {
         match &p.items[idx] {
@@ -5796,7 +5900,13 @@ mod tests {
         let p = parse_str("#automaton Counter { value: u32; }").unwrap();
         let a = auto(&p, 0);
         assert_eq!(a.fields.len(), 1);
-        let AutomatonField { name, ty, offset, access, .. } = &a.fields[0];
+        let AutomatonField {
+            name,
+            ty,
+            offset,
+            access,
+            ..
+        } = &a.fields[0];
         assert_eq!(name, "value");
         assert_eq!(ty.kind, TypeKind::Primitive(PrimitiveType::U32));
         assert!(offset.is_none());
@@ -5805,10 +5915,7 @@ mod tests {
 
     #[test]
     fn automaton_with_multiple_fields() {
-        let p = parse_str(
-            "#automaton Counter { value: u32; last: u32; flags: u8; }",
-        )
-        .unwrap();
+        let p = parse_str("#automaton Counter { value: u32; last: u32; flags: u8; }").unwrap();
         let a = auto(&p, 0);
         let names: Vec<_> = a.fields.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, vec!["value", "last", "flags"]);
@@ -5827,8 +5934,8 @@ mod tests {
 
     #[test]
     fn address_requires_hex_literal() {
-        let err = parse_str("#automaton X { #address: 1024; }")
-            .expect_err("decimal literal should fail");
+        let err =
+            parse_str("#automaton X { #address: 1024; }").expect_err("decimal literal should fail");
         assert!(matches!(
             err,
             ParseError::Expected {
@@ -5840,13 +5947,14 @@ mod tests {
 
     #[test]
     fn duplicate_address_rejected() {
-        let err = parse_str(
-            "#automaton X { #address: 0x4000_0000; #address: 0x5000_0000; }",
-        )
-        .expect_err("duplicate #address");
+        let err = parse_str("#automaton X { #address: 0x4000_0000; #address: 0x5000_0000; }")
+            .expect_err("duplicate #address");
         assert!(matches!(
             err,
-            ParseError::DuplicateClause { clause: "#address", .. }
+            ParseError::DuplicateClause {
+                clause: "#address",
+                ..
+            }
         ));
     }
 
@@ -5862,11 +5970,14 @@ mod tests {
 
     #[test]
     fn duplicate_basis_rejected() {
-        let err = parse_str("#automaton X { #basis: a; #basis: b; }")
-            .expect_err("duplicate #basis");
+        let err =
+            parse_str("#automaton X { #basis: a; #basis: b; }").expect_err("duplicate #basis");
         assert!(matches!(
             err,
-            ParseError::DuplicateClause { clause: "#basis", .. }
+            ParseError::DuplicateClause {
+                clause: "#basis",
+                ..
+            }
         ));
     }
 
@@ -5874,10 +5985,7 @@ mod tests {
 
     #[test]
     fn automaton_with_states() {
-        let p = parse_str(
-            "#automaton Counter { #states: [Idle, Counting, Halted]; }",
-        )
-        .unwrap();
+        let p = parse_str("#automaton Counter { #states: [Idle, Counting, Halted]; }").unwrap();
         let a = auto(&p, 0);
         let states = a.states.as_ref().unwrap();
         let names: Vec<_> = states.iter().map(|s| s.name.as_str()).collect();
@@ -5893,20 +6001,20 @@ mod tests {
 
     #[test]
     fn empty_states_list_rejected() {
-        let err =
-            parse_str("#automaton X { #states: []; }").expect_err("empty #states list");
+        let err = parse_str("#automaton X { #states: []; }").expect_err("empty #states list");
         assert!(matches!(err, ParseError::EmptyStatesList { .. }));
     }
 
     #[test]
     fn duplicate_states_rejected() {
-        let err = parse_str(
-            "#automaton X { #states: [A]; #states: [B]; }",
-        )
-        .expect_err("duplicate #states");
+        let err = parse_str("#automaton X { #states: [A]; #states: [B]; }")
+            .expect_err("duplicate #states");
         assert!(matches!(
             err,
-            ParseError::DuplicateClause { clause: "#states", .. }
+            ParseError::DuplicateClause {
+                clause: "#states",
+                ..
+            }
         ));
     }
 
@@ -5915,8 +6023,14 @@ mod tests {
         let src = "#automaton X { #states: [A, B]; }";
         let p = parse_str(src).unwrap();
         let states = auto(&p, 0).states.as_ref().unwrap();
-        let StateName { name: a_name, span: a_span } = &states[0];
-        let StateName { name: b_name, span: b_span } = &states[1];
+        let StateName {
+            name: a_name,
+            span: a_span,
+        } = &states[0];
+        let StateName {
+            name: b_name,
+            span: b_span,
+        } = &states[1];
         assert_eq!(a_name, "A");
         assert_eq!(b_name, "B");
         // Each span must point at distinct, non-overlapping ranges.
@@ -5937,8 +6051,7 @@ mod tests {
 
     #[test]
     fn field_with_offset_and_access_read() {
-        let p = parse_str("#automaton X { status: u32 #offset: 0x04 #access: read; }")
-            .unwrap();
+        let p = parse_str("#automaton X { status: u32 #offset: 0x04 #access: read; }").unwrap();
         let f = &auto(&p, 0).fields[0];
         assert_eq!(f.offset.as_deref(), Some("0x04"));
         assert_eq!(f.access, Some(AccessMode::Read));
@@ -5951,9 +6064,7 @@ mod tests {
             ("write", AccessMode::Write),
             ("read_write", AccessMode::ReadWrite),
         ] {
-            let src = format!(
-                "#automaton X {{ f: u32 #offset: 0x00 #access: {src_mode}; }}"
-            );
+            let src = format!("#automaton X {{ f: u32 #offset: 0x00 #access: {src_mode}; }}");
             let p = parse_str(&src).unwrap_or_else(|e| panic!("{src}: {e}"));
             let f = &auto(&p, 0).fields[0];
             assert_eq!(f.access, Some(expected), "src: {src}");
@@ -5975,8 +6086,7 @@ mod tests {
 
     #[test]
     fn field_offset_requires_hex_literal() {
-        let err = parse_str("#automaton X { f: u32 #offset: 4; }")
-            .expect_err("decimal offset");
+        let err = parse_str("#automaton X { f: u32 #offset: 4; }").expect_err("decimal offset");
         assert!(matches!(
             err,
             ParseError::Expected {
@@ -5989,10 +6099,7 @@ mod tests {
     #[test]
     fn field_meta_in_either_order() {
         // `#access` before `#offset` should also work.
-        let p = parse_str(
-            "#automaton X { f: u32 #access: read_write #offset: 0x10; }",
-        )
-        .unwrap();
+        let p = parse_str("#automaton X { f: u32 #access: read_write #offset: 0x10; }").unwrap();
         let f = &auto(&p, 0).fields[0];
         assert_eq!(f.offset.as_deref(), Some("0x10"));
         assert_eq!(f.access, Some(AccessMode::ReadWrite));
@@ -6000,25 +6107,27 @@ mod tests {
 
     #[test]
     fn duplicate_field_offset_rejected() {
-        let err = parse_str(
-            "#automaton X { f: u32 #offset: 0x00 #offset: 0x04; }",
-        )
-        .expect_err("duplicate #offset");
+        let err = parse_str("#automaton X { f: u32 #offset: 0x00 #offset: 0x04; }")
+            .expect_err("duplicate #offset");
         assert!(matches!(
             err,
-            ParseError::DuplicateClause { clause: "#offset", .. }
+            ParseError::DuplicateClause {
+                clause: "#offset",
+                ..
+            }
         ));
     }
 
     #[test]
     fn duplicate_field_access_rejected() {
-        let err = parse_str(
-            "#automaton X { f: u32 #access: read #access: write; }",
-        )
-        .expect_err("duplicate #access");
+        let err = parse_str("#automaton X { f: u32 #access: read #access: write; }")
+            .expect_err("duplicate #access");
         assert!(matches!(
             err,
-            ParseError::DuplicateClause { clause: "#access", .. }
+            ParseError::DuplicateClause {
+                clause: "#access",
+                ..
+            }
         ));
     }
 
@@ -6065,11 +6174,14 @@ mod tests {
     fn duplicate_field_hidden_rejected() {
         // `#hidden` is a flag — repeating it is a duplicate clause error,
         // matching the policy for `#offset` / `#access`.
-        let err = parse_str("#automaton X { f: u32 #hidden #hidden; }")
-            .expect_err("duplicate #hidden");
+        let err =
+            parse_str("#automaton X { f: u32 #hidden #hidden; }").expect_err("duplicate #hidden");
         assert!(matches!(
             err,
-            ParseError::DuplicateClause { clause: "#hidden", .. }
+            ParseError::DuplicateClause {
+                clause: "#hidden",
+                ..
+            }
         ));
     }
 
@@ -6091,10 +6203,8 @@ mod tests {
 
     #[test]
     fn transition_with_no_destination() {
-        let p = parse_str(
-            "#automaton Counter { #transition tick { Counter.value += 1; } }",
-        )
-        .unwrap();
+        let p =
+            parse_str("#automaton Counter { #transition tick { Counter.value += 1; } }").unwrap();
         let t = &auto(&p, 0).transitions[0];
         assert_eq!(t.name, "tick");
         assert!(t.destination.is_none());
@@ -6180,8 +6290,7 @@ mod tests {
     #[test]
     fn unknown_member_is_clear_error() {
         // `@trait` lexes fine but is not a valid `#automaton` member.
-        let err = parse_str("#automaton X { @trait Foo {} }")
-            .expect_err("invalid member sigil");
+        let err = parse_str("#automaton X { @trait Foo {} }").expect_err("invalid member sigil");
         // The dispatcher's catch-all fires; check we got a useful diagnostic
         // pointing at the right thing.
         match err {
@@ -6215,9 +6324,15 @@ mod tests {
         assert_eq!(a.name, "Usart1");
         assert!(a.address.is_some());
         assert!(a.basis.is_some());
-        assert!(a.states.is_none(), "register block with no #states is monoid");
+        assert!(
+            a.states.is_none(),
+            "register block with no #states is monoid"
+        );
         assert_eq!(a.fields.len(), 3);
-        assert!(a.transitions.is_empty(), "no transitions on a register block");
+        assert!(
+            a.transitions.is_empty(),
+            "no transitions on a register block"
+        );
 
         let f1 = &a.fields[0];
         assert_eq!(f1.name, "status");
@@ -6253,17 +6368,24 @@ mod tests {
         let a = auto(&p, 0);
         assert!(a.address.is_none());
         assert!(a.basis.is_some());
-        let state_names: Vec<_> = a.states.as_ref().unwrap()
-            .iter().map(|s| s.name.as_str()).collect();
+        let state_names: Vec<_> = a
+            .states
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
         assert_eq!(state_names, vec!["Idle", "Counting", "Halted"]);
         assert_eq!(a.fields.len(), 2);
         assert_eq!(a.transitions.len(), 3);
 
-        let trans_names: Vec<_> =
-            a.transitions.iter().map(|t| t.name.as_str()).collect();
+        let trans_names: Vec<_> = a.transitions.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(trans_names, vec!["start", "tick", "halt"]);
         assert_eq!(a.transitions[0].destination.as_deref(), Some("Counting"));
-        assert!(a.transitions[1].destination.is_none(), "tick stays in Counting");
+        assert!(
+            a.transitions[1].destination.is_none(),
+            "tick stays in Counting"
+        );
         assert_eq!(a.transitions[2].destination.as_deref(), Some("Halted"));
 
         // The `start` transition body has one statement: Counter.value = 0;
@@ -6348,7 +6470,10 @@ mod tests {
                 assert_eq!(decl.name, "bump");
                 assert_eq!(decl.body.stmts.len(), 3);
                 assert!(matches!(decl.body.stmts[0].kind, StmtKind::Let { .. }));
-                assert!(matches!(decl.body.stmts[1].kind, StmtKind::MutateShort { .. }));
+                assert!(matches!(
+                    decl.body.stmts[1].kind,
+                    StmtKind::MutateShort { .. }
+                ));
                 assert!(matches!(decl.body.stmts[2].kind, StmtKind::Return(None)));
             }
             other => panic!("expected #effect bump at index 3, got {:?}", other),
@@ -6360,7 +6485,10 @@ mod tests {
                 assert_eq!(decl.name, "USART1_IRQHandler");
                 assert_eq!(decl.body.stmts.len(), 2);
                 assert!(matches!(decl.body.stmts[0].kind, StmtKind::ProcCall { .. }));
-                assert!(matches!(decl.body.stmts[1].kind, StmtKind::MutateShort { .. }));
+                assert!(matches!(
+                    decl.body.stmts[1].kind,
+                    StmtKind::MutateShort { .. }
+                ));
             }
             other => panic!("expected #interrupt at index 5, got {:?}", other),
         }
@@ -6450,10 +6578,8 @@ mod tests {
 
     #[test]
     fn effect_no_trait_list_keeps_empty() {
-        let p = parse_str(
-            "#automaton C { x: u32; } #effect bump() #mutates: [C] { }",
-        )
-        .expect("no $ clause");
+        let p = parse_str("#automaton C { x: u32; } #effect bump() #mutates: [C] { }")
+            .expect("no $ clause");
         match &p.items[1] {
             Item::Effect(EffectDecl { trait_list, .. }) => assert!(trait_list.is_empty()),
             other => panic!("expected Effect, got {:?}", other),
@@ -6470,7 +6596,11 @@ mod tests {
         )
         .expect("parse #cannot_mutate then $");
         match &p.items[2] {
-            Item::Effect(EffectDecl { cannot_mutate, trait_list, .. }) => {
+            Item::Effect(EffectDecl {
+                cannot_mutate,
+                trait_list,
+                ..
+            }) => {
                 assert_eq!(cannot_mutate, &vec!["B".to_owned()]);
                 assert_eq!(trait_list.len(), 1);
                 assert_eq!(trait_list[0].name, "PureState");
@@ -6549,10 +6679,8 @@ mod tests {
 
     #[test]
     fn transition_no_trait_list_keeps_empty() {
-        let p = parse_str(
-            "#automaton C { x: u32; #transition tick { } }",
-        )
-        .expect("transition without $");
+        let p = parse_str("#automaton C { x: u32; #transition tick { } }")
+            .expect("transition without $");
         match &p.items[0] {
             Item::Automaton(AutomatonDecl { transitions, .. }) => {
                 assert!(transitions[0].trait_list.is_empty());
@@ -6616,8 +6744,7 @@ mod tests {
 
     #[test]
     fn ordinary_fn_partial_defaults_false() {
-        let p = parse_str("@fn pure_helper(x: u32) -> u32 { return x; }")
-            .expect("parse plain @fn");
+        let p = parse_str("@fn pure_helper(x: u32) -> u32 { return x; }").expect("parse plain @fn");
         match &p.items[0] {
             Item::Fn(FnDecl { partial, .. }) => assert!(!*partial),
             other => panic!("expected Fn, got {:?}", other),
@@ -6640,10 +6767,9 @@ mod tests {
     #[test]
     fn partial_fn_with_trait_list_works() {
         // Combination: @partial @fn with $ [...] suffix.
-        let p = parse_str(
-            "@partial @fn maybe_parse(s: &[u8]) -> u32 $ [Readable] { return 0u32; }",
-        )
-        .expect("parse @partial @fn with $ list");
+        let p =
+            parse_str("@partial @fn maybe_parse(s: &[u8]) -> u32 $ [Readable] { return 0u32; }")
+                .expect("parse @partial @fn with $ list");
         match &p.items[0] {
             Item::Fn(FnDecl {
                 partial,
@@ -6662,10 +6788,8 @@ mod tests {
 
     #[test]
     fn snapshot_expression_in_let_rhs() {
-        let p = parse_str(
-            "@fn read_head() -> u32 { let h := @snapshot Uart.rx_head; return h; }",
-        )
-        .expect("parse @snapshot in let RHS");
+        let p = parse_str("@fn read_head() -> u32 { let h := @snapshot Uart.rx_head; return h; }")
+            .expect("parse @snapshot in let RHS");
         // Verify the body has a let-statement whose value is a Snapshot.
         match &p.items[0] {
             Item::Fn(FnDecl { body, .. }) => {
@@ -6726,16 +6850,23 @@ mod tests {
         let err = parse_str("@fn f() { let _x := @snapshot Counter; }").expect_err("missing dot");
         assert!(matches!(
             err,
-            ParseError::Expected { expected: "`.` between automaton name and field in `@snapshot`", .. }
+            ParseError::Expected {
+                expected: "`.` between automaton name and field in `@snapshot`",
+                ..
+            }
         ));
     }
 
     #[test]
     fn snapshot_missing_field_is_error() {
-        let err = parse_str("@fn f() { let _x := @snapshot Counter.; }").expect_err("missing field");
+        let err =
+            parse_str("@fn f() { let _x := @snapshot Counter.; }").expect_err("missing field");
         assert!(matches!(
             err,
-            ParseError::Expected { expected: "field name after `.` in `@snapshot`", .. }
+            ParseError::Expected {
+                expected: "field name after `.` in `@snapshot`",
+                ..
+            }
         ));
     }
 
@@ -6800,7 +6931,11 @@ mod tests {
         // `if cond { … }` — no else branch.
         let stmt = parse_stmt_str("if true { let _x: u32 = 1u32; }");
         match &stmt.kind {
-            StmtKind::If { cond, then_block, else_block } => {
+            StmtKind::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
                 assert!(matches!(cond.kind, ExprKind::BoolLit(true)));
                 assert_eq!(then_block.stmts.len(), 1);
                 assert!(else_block.is_none());
@@ -6825,9 +6960,7 @@ mod tests {
     fn if_else_if_chain_nests() {
         // `if a { } else if b { } else { }` — the inner else-if
         // is a synthetic else block containing one If statement.
-        let stmt = parse_stmt_str(
-            "if true { } else if false { } else { let _x: u32 = 1u32; }",
-        );
+        let stmt = parse_stmt_str("if true { } else if false { } else { let _x: u32 = 1u32; }");
         match &stmt.kind {
             StmtKind::If { else_block, .. } => {
                 let outer_else = else_block.as_ref().expect("outer else");
@@ -6920,7 +7053,10 @@ mod tests {
         match &stmt.kind {
             StmtKind::Sigma { body, .. } => {
                 assert_eq!(body.stmts.len(), 1);
-                assert!(matches!(body.stmts[0].kind, StmtKind::Break { label: None }));
+                assert!(matches!(
+                    body.stmts[0].kind,
+                    StmtKind::Break { label: None }
+                ));
             }
             other => panic!("expected Sigma, got {:?}", other),
         }
@@ -7044,8 +7180,7 @@ mod tests {
         // `#staged` is reserved for `#automaton` only — anything
         // else (a fn, a trait, etc.) is a parse error citing
         // Decision #12.
-        let err = parse_str("#staged @fn t() { return; }")
-            .expect_err("expected parse error");
+        let err = parse_str("#staged @fn t() { return; }").expect_err("expected parse error");
         let msg = format!("{err}");
         assert!(
             msg.contains("#automaton") || msg.contains("Decision #12"),
@@ -7079,8 +7214,7 @@ mod tests {
     #[test]
     fn flush_without_semicolon_errors() {
         // `#flush Name` — missing `;`.
-        let err = parse_str("@fn t() { #flush Counter }")
-            .expect_err("expected parse error");
+        let err = parse_str("@fn t() { #flush Counter }").expect_err("expected parse error");
         let msg = format!("{err}");
         assert!(
             msg.contains("`;`") || msg.contains("Semi"),
@@ -7133,8 +7267,7 @@ mod tests {
         // `#audit #audit #automaton …` — repeating a modifier is
         // a parse error (semantically meaningless and almost
         // certainly a typo).
-        let err =
-            parse_str("#audit #audit #automaton C { v: u32; }").expect_err("duplicate audit");
+        let err = parse_str("#audit #audit #automaton C { v: u32; }").expect_err("duplicate audit");
         let msg = format!("{err}");
         assert!(
             msg.contains("duplicate"),
@@ -7177,8 +7310,7 @@ mod tests {
         // Regression check: `#staged #automaton` without an
         // `#address` clause is the normal slice-18 form and
         // must keep parsing.
-        let p =
-            parse_str("#staged #automaton Pose { x: u32; }").expect("staged non-RB parses");
+        let p = parse_str("#staged #automaton Pose { x: u32; }").expect("staged non-RB parses");
         let a = auto(&p, 0);
         assert!(a.staged);
         assert!(a.address.is_none());
@@ -7204,8 +7336,7 @@ mod tests {
     fn audit_without_automaton_errors() {
         // `#audit @fn …` — `#audit` modifier is reserved for
         // `#automaton` only.
-        let err = parse_str("#audit @fn t() { return; }")
-            .expect_err("expected parse error");
+        let err = parse_str("#audit @fn t() { return; }").expect_err("expected parse error");
         let msg = format!("{err}");
         assert!(
             msg.contains("#automaton"),
@@ -7264,10 +7395,8 @@ mod tests {
         // `#flush Counter;` lives inside a `#effect` body. Smoke
         // test: the surrounding effect parses, the flush is the
         // sole statement (plus the trailing return).
-        let p = parse_str(
-            "#effect commit() #mutates: [Counter] { #flush Counter; return; }",
-        )
-        .unwrap();
+        let p =
+            parse_str("#effect commit() #mutates: [Counter] { #flush Counter; return; }").unwrap();
         match &p.items[0] {
             Item::Effect(decl) => {
                 assert_eq!(decl.body.stmts.len(), 2);
@@ -7287,13 +7416,22 @@ mod tests {
         // `sigma i in 0..n { … }` — half-open range source.
         let stmt = parse_stmt_str("sigma i in 0u32..10u32 { }");
         match &stmt.kind {
-            StmtKind::Sigma { var, source, body, label, .. } => {
+            StmtKind::Sigma {
+                var,
+                source,
+                body,
+                label,
+                ..
+            } => {
                 assert_eq!(var, "i");
                 assert_eq!(body.stmts.len(), 0);
                 assert!(label.is_none(), "default sigma must be unlabelled");
                 assert!(matches!(
                     source.kind,
-                    ExprKind::Range { inclusive: false, .. }
+                    ExprKind::Range {
+                        inclusive: false,
+                        ..
+                    }
                 ));
             }
             other => panic!("expected Sigma, got {:?}", other),
@@ -7308,7 +7446,10 @@ mod tests {
             StmtKind::Sigma { source, .. } => {
                 assert!(matches!(
                     source.kind,
-                    ExprKind::Range { inclusive: true, .. }
+                    ExprKind::Range {
+                        inclusive: true,
+                        ..
+                    }
                 ));
             }
             other => panic!("expected Sigma, got {:?}", other),
@@ -7318,9 +7459,7 @@ mod tests {
     #[test]
     fn sigma_loop_with_body_statements() {
         // Body statements are parsed as a normal block.
-        let stmt = parse_stmt_str(
-            "sigma i in 0u32..4u32 { let _x: u32 = i; return; }",
-        );
+        let stmt = parse_stmt_str("sigma i in 0u32..4u32 { let _x: u32 = i; return; }");
         match &stmt.kind {
             StmtKind::Sigma { body, .. } => {
                 assert_eq!(body.stmts.len(), 2);

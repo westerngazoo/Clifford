@@ -134,9 +134,7 @@ impl Item {
     #[must_use]
     pub fn layer(&self) -> Layer {
         match self {
-            Self::Fn(_) | Self::Type(_) | Self::Trait(_) | Self::Sequential(_) => {
-                Layer::Functional
-            }
+            Self::Fn(_) | Self::Type(_) | Self::Trait(_) | Self::Sequential(_) => Layer::Functional,
             Self::Automaton(_)
             | Self::Effect(_)
             | Self::Interrupt(_)
