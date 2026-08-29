@@ -1,12 +1,20 @@
 # Clifford — `cliffordc`
 
-> A general-purpose systems language whose unifying claim is **statically-proven
-> concurrency safety via Geometric Algebra**. C-direct imperative layer,
-> Haskell-clean functional layer, separated by sigils. Embedded firmware is the
-> canonical first target; the language is not embedded-only.
+> A general-purpose systems language in the **effect-system /
+> separation-logic** tradition, with a distinctive sigil partition
+> (C-direct imperative `#`, Haskell-clean functional `@`) and
+> automaton-as-state-owner overlay. Embedded firmware is the canonical
+> first target; the language is not embedded-only.
 
-**Status:** Pre-implementation. Spec at `docs/CLIFFORD_SPEC.md` v0.5.0-draft.
-Design decisions locked in `docs/DECISIONS.md` (#1–#19).
+**Status:** A working compiler. `cliffordc` compiles every example in
+`examples/` to LLVM IR (1,100+ tests green); `crc32.cl` links against a
+plain C host and passes the CRC-32/ISO-HDLC vectors end to end. Codegen
+gaps are typed `E0810` diagnostics, never silent miscompiles. Spec at
+`docs/CLIFFORD_SPEC.md`; decisions in `docs/DECISIONS.md`; **current
+direction in `docs/foundations.md`** — the 2026-05 post-review pivot,
+which re-grounds the concurrency story in SRP + ownership qualifiers
+and retires the earlier GA framing as decorative (decisions #21/#26/#27
+moved to `docs/research/`).
 
 ## What this is
 
@@ -54,11 +62,12 @@ Clifford's three layers, each with its own discipline, meeting at a shared GA pr
   layouts. Accessed via narrow unsafe primitives (`#unchecked_load`,
   `#volatile_store`, `#unchecked_offset`, …) — each its own grep target.
 
-The GA orthogonality engine is the *theorem* that makes the three commit
-together: every concurrent computation pair must wedge to a non-zero blade of
-full grade, which is exactly the well-formedness condition for the product
-category `C_A × C_B`. See `docs/CLIFFORD_SPEC.md` Appendix B for the formal
-statement.
+What makes the three commit together is an **effect-set disjointness
+check** (`crates/ortho`, v0.1 shipped: field-basis granularity, catching
+write-write races between concurrent `#effect`s and `#interrupt`s). It
+was historically formulated as a wedge-product condition; per
+`docs/foundations.md`, the honest name is the disjointness check and the
+GA formulation is retired from the v1.0 surface.
 
 ## Build
 
@@ -70,7 +79,12 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt -- --check
 ```
 
-The `cliffordc` binary will live in `crates/cli` once Phase 5 is complete.
+The `cliffordc` binary lives in `crates/cli`:
+
+```sh
+cargo run -p clifford-cli -- compile examples/crc32.cl
+clang examples/crc32.ll examples/crc32_host.c -o crc32 && ./crc32
+```
 
 ## Repository layout
 
