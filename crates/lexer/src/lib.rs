@@ -605,9 +605,7 @@ impl<'src> Lexer<'src> {
                     loop {
                         match (self.peek(0), self.peek(1)) {
                             (None, _) => {
-                                return Err(LexError::UnterminatedBlockComment {
-                                    at: opened_at,
-                                });
+                                return Err(LexError::UnterminatedBlockComment { at: opened_at });
                             }
                             (Some(b'/'), Some(b'*')) => {
                                 self.pos += 2;
@@ -920,7 +918,10 @@ impl<'src> Lexer<'src> {
         self.pos += 1; // opening `'`
         let ch = match self.peek(0) {
             None | Some(b'\n') => {
-                return Err(LexError::UnterminatedCharLiteral { kind: "char", at: start });
+                return Err(LexError::UnterminatedCharLiteral {
+                    kind: "char",
+                    at: start,
+                });
             }
             Some(b'\\') => {
                 self.pos += 1;
@@ -951,7 +952,10 @@ impl<'src> Lexer<'src> {
         self.pos += 2; // `b'`
         let value: u8 = match self.peek(0) {
             None | Some(b'\n') => {
-                return Err(LexError::UnterminatedCharLiteral { kind: "byte", at: start });
+                return Err(LexError::UnterminatedCharLiteral {
+                    kind: "byte",
+                    at: start,
+                });
             }
             Some(b'\\') => {
                 self.pos += 1;
@@ -1013,8 +1017,8 @@ impl<'src> Lexer<'src> {
     /// Source is required to be valid UTF-8 (we receive a `&str` at the
     /// public boundary, which guarantees this), so this never fails.
     fn decode_one_utf8_char(&self, at: usize) -> (char, usize) {
-        let s = std::str::from_utf8(&self.src[at..])
-            .expect("source is valid UTF-8 by construction");
+        let s =
+            std::str::from_utf8(&self.src[at..]).expect("source is valid UTF-8 by construction");
         let ch = s.chars().next().expect("at least one char available");
         (ch, ch.len_utf8())
     }
@@ -1042,8 +1046,12 @@ impl<'src> Lexer<'src> {
             b'0' => '\0',
             b'x' => {
                 // Two hex digits.
-                let h1 = self.peek(0).ok_or(LexError::InvalidEscape { ch: 'x', at })?;
-                let h2 = self.peek(1).ok_or(LexError::InvalidEscape { ch: 'x', at })?;
+                let h1 = self
+                    .peek(0)
+                    .ok_or(LexError::InvalidEscape { ch: 'x', at })?;
+                let h2 = self
+                    .peek(1)
+                    .ok_or(LexError::InvalidEscape { ch: 'x', at })?;
                 if !h1.is_ascii_hexdigit() || !h2.is_ascii_hexdigit() {
                     return Err(LexError::InvalidEscape { ch: 'x', at });
                 }

@@ -546,10 +546,7 @@ fn can_concur(a: &ConcurrencyNode, b: &ConcurrencyNode) -> bool {
     use ConcurrencyNode::*;
     match (a, b) {
         // Two foreground-thread callables cannot run concurrently.
-        (Fn(_), Fn(_))
-        | (Effect(_), Effect(_))
-        | (Fn(_), Effect(_))
-        | (Effect(_), Fn(_)) => false,
+        (Fn(_), Fn(_)) | (Effect(_), Effect(_)) | (Fn(_), Effect(_)) | (Effect(_), Fn(_)) => false,
         // Anything involving an interrupt is potentially concurrent.
         _ => true,
     }
@@ -715,10 +712,7 @@ fn collect_atomic_callable_names(program: &Program) -> HashSet<String> {
 /// is single-hop only — we don't iteratively close the
 /// "inherited atomic" property across chains because the
 /// strict one-statement rule already implies a single hop.
-fn body_inherits_atomic_from_proc_call(
-    body: &Block,
-    atomic_callables: &HashSet<String>,
-) -> bool {
+fn body_inherits_atomic_from_proc_call(body: &Block, atomic_callables: &HashSet<String>) -> bool {
     // Filter out a trailing `return;` (no value) — common in
     // hand-written firmware and semantically a no-op after the
     // delegated call.
@@ -780,7 +774,9 @@ fn priorities_indicate_no_preemption(a: &PriorityLevel, b: &PriorityLevel) -> bo
             // priority. We don't parse to integer because the
             // numeric range is target-specific.
             let canon = |s: &str| -> String {
-                s.chars().filter(|c| !c.is_whitespace() && *c != '_').collect()
+                s.chars()
+                    .filter(|c| !c.is_whitespace() && *c != '_')
+                    .collect()
             };
             canon(s1) == canon(s2)
         }
@@ -859,10 +855,7 @@ pub fn outer_product(a: u64, b: u64) -> Option<u64> {
 ///   (the `u64` blade width).
 /// - `OrthogonalityViolation` for every pair of concurrent callables
 ///   whose behaviour blades share at least one basis vector.
-pub fn verify(
-    program: &Program,
-    profiles: &MutationProfiles,
-) -> Result<(), Vec<OrthoError>> {
+pub fn verify(program: &Program, profiles: &MutationProfiles) -> Result<(), Vec<OrthoError>> {
     let basis = match BasisAssignment::build(program) {
         Ok(b) => b,
         Err(e) => return Err(vec![e]),
@@ -1093,8 +1086,7 @@ mod tests {
 
     fn build_profiles(program: &Program) -> MutationProfiles {
         let resolution = clifford_resolve::resolve(program).expect("resolve");
-        clifford_effect::extract_mutation_profiles(program, &resolution)
-            .expect("mutation profiles")
+        clifford_effect::extract_mutation_profiles(program, &resolution).expect("mutation profiles")
     }
 
     #[test]
@@ -1329,7 +1321,10 @@ mod tests {
                 shared_display,
                 ..
             } => {
-                assert!(shared_fields.is_empty(), "no field overlap; got {shared_fields:?}");
+                assert!(
+                    shared_fields.is_empty(),
+                    "no field overlap; got {shared_fields:?}"
+                );
                 assert_eq!(shared_traits, &vec!["Shared".to_owned()]);
                 assert!(
                     shared_display.contains("`Shared`"),
@@ -1865,7 +1860,10 @@ mod tests {
         match &errs[0] {
             OrthoError::OrthogonalityViolation { shared_fields, .. } => {
                 let names: Vec<&str> = shared_fields.iter().map(|f| f.field.as_str()).collect();
-                assert!(names.contains(&"v"), "expected `v` in shared; got {names:?}");
+                assert!(
+                    names.contains(&"v"),
+                    "expected `v` in shared; got {names:?}"
+                );
             }
             _ => panic!("expected OrthogonalityViolation"),
         }
@@ -2496,14 +2494,15 @@ mod tests {
         ";
         let program = parse_program(src);
         let profiles = build_profiles(&program);
-        let errs = verify(&program, &profiles).expect_err(
-            "expected race: flush writes every field, IRQ writes S.v",
-        );
-        let saw = errs.iter().any(|e| matches!(
-            e,
-            OrthoError::OrthogonalityViolation { shared_fields, .. }
-                if shared_fields.iter().any(|f| f.field == "v")
-        ));
+        let errs = verify(&program, &profiles)
+            .expect_err("expected race: flush writes every field, IRQ writes S.v");
+        let saw = errs.iter().any(|e| {
+            matches!(
+                e,
+                OrthoError::OrthogonalityViolation { shared_fields, .. }
+                    if shared_fields.iter().any(|f| f.field == "v")
+            )
+        });
         assert!(
             saw,
             "expected E0520 race on S.v from flush vs IRQ; got {errs:?}"
@@ -2522,19 +2521,17 @@ mod tests {
         ";
         let program = parse_program(src);
         let profiles = build_profiles(&program);
-        let errs = verify(&program, &profiles).expect_err(
-            "expected race: both flushes write every field of S",
-        );
+        let errs = verify(&program, &profiles)
+            .expect_err("expected race: both flushes write every field of S");
         // At least one violation; shared_fields names a field of S.
-        let saw = errs.iter().any(|e| matches!(
-            e,
-            OrthoError::OrthogonalityViolation { shared_fields, .. }
-                if !shared_fields.is_empty()
-        ));
-        assert!(
-            saw,
-            "expected E0520 from flush-vs-flush; got {errs:?}"
-        );
+        let saw = errs.iter().any(|e| {
+            matches!(
+                e,
+                OrthoError::OrthogonalityViolation { shared_fields, .. }
+                    if !shared_fields.is_empty()
+            )
+        });
+        assert!(saw, "expected E0520 from flush-vs-flush; got {errs:?}");
     }
 
     #[test]
@@ -2550,7 +2547,6 @@ mod tests {
         ";
         let program = parse_program(src);
         let profiles = build_profiles(&program);
-        verify(&program, &profiles)
-            .expect("flush of S and write of T are orthogonal");
+        verify(&program, &profiles).expect("flush of S and write of T are orthogonal");
     }
 }

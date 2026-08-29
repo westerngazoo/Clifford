@@ -714,9 +714,9 @@ impl<'a> Emitter<'a> {
     /// 64-bit targets (the high bits are zero on 32-bit and LLVM
     /// truncates to the target pointer width internally).
     fn emit_staged_intrinsics_if_needed(&mut self, program: &Program) {
-        let any_staged = program.items.iter().any(|item| {
-            matches!(item, Item::Automaton(decl) if decl.staged && decl.address.is_none())
-        });
+        let any_staged = program.items.iter().any(
+            |item| matches!(item, Item::Automaton(decl) if decl.staged && decl.address.is_none()),
+        );
         if !any_staged {
             return;
         }
@@ -772,11 +772,12 @@ impl<'a> Emitter<'a> {
     /// automaton is not `#staged` (resolver-side E0412 should
     /// have caught this; same defence-in-depth posture).
     fn emit_flush(&mut self, automaton: &str) -> Result<(), CodegenError> {
-        let info = self.automatons.get(automaton).ok_or_else(|| {
-            CodegenError::UnresolvedName {
+        let info = self
+            .automatons
+            .get(automaton)
+            .ok_or_else(|| CodegenError::UnresolvedName {
                 name: automaton.to_owned(),
-            }
-        })?;
+            })?;
         if !info.is_staged {
             return Err(CodegenError::NotYetImplemented {
                 what: "`#flush` on a non-staged automaton (resolver should have caught this; please file a bug)",
@@ -987,8 +988,7 @@ impl<'a> Emitter<'a> {
 
             let ret_ty = self.lower_return_type(method.return_type.as_ref());
 
-            let mut sig_parts: Vec<String> =
-                Vec::with_capacity(method.params.len());
+            let mut sig_parts: Vec<String> = Vec::with_capacity(method.params.len());
             for p in &method.params {
                 match self.lower_param(p) {
                     Ok(s) => sig_parts.push(s),
@@ -997,8 +997,7 @@ impl<'a> Emitter<'a> {
                         return;
                     }
                 }
-                let p_ir_ty =
-                    self.lower_type(&p.ty).unwrap_or_else(|_| "i32".to_owned());
+                let p_ir_ty = self.lower_type(&p.ty).unwrap_or_else(|_| "i32".to_owned());
                 self.locals.push(LocalBinding {
                     name: p.name.clone(),
                     value: format!("%{}", p.name),
@@ -1007,11 +1006,7 @@ impl<'a> Emitter<'a> {
                 });
             }
 
-            let fn_name = format!(
-                "{auto}_{m}",
-                auto = decl.automaton_name,
-                m = method.name,
-            );
+            let fn_name = format!("{auto}_{m}", auto = decl.automaton_name, m = method.name,);
             writeln!(
                 &mut self.out,
                 "define {ret_ty} @{fn_name}({params}) {{",
@@ -1377,11 +1372,7 @@ impl<'a> Emitter<'a> {
             )
             .ok();
             // Stage 2: store the destination tag.
-            writeln!(
-                &mut self.out,
-                "  store i32 {tag}, i32* {tag_ptr}",
-            )
-            .ok();
+            writeln!(&mut self.out, "  store i32 {tag}, i32* {tag_ptr}",).ok();
         }
         if let Some(ordering) = self.pending_exit_fence {
             writeln!(&mut self.out, "  fence {ordering}").ok();
@@ -1415,7 +1406,12 @@ impl<'a> Emitter<'a> {
                 writeln!(&mut self.out, "  ret void").ok();
                 self.current_block_terminated = true;
             }
-            StmtKind::Let { name, ty, value, mutable } => {
+            StmtKind::Let {
+                name,
+                ty,
+                value,
+                mutable,
+            } => {
                 let ir_ty = match ty {
                     Some(annotated) => self.lower_type(annotated).unwrap_or_else(|e| {
                         self.errors.push(e);
@@ -1432,16 +1428,8 @@ impl<'a> Emitter<'a> {
                             // through the alloca pointer; subsequent
                             // assigns store through it.
                             let ptr = self.fresh_value();
-                            writeln!(
-                                &mut self.out,
-                                "  {ptr} = alloca {ir_ty}",
-                            )
-                            .ok();
-                            writeln!(
-                                &mut self.out,
-                                "  store {ir_ty} {v}, {ir_ty}* {ptr}",
-                            )
-                            .ok();
+                            writeln!(&mut self.out, "  {ptr} = alloca {ir_ty}",).ok();
+                            writeln!(&mut self.out, "  store {ir_ty} {v}, {ir_ty}* {ptr}",).ok();
                             self.locals.push(LocalBinding {
                                 name: name.clone(),
                                 value: ptr,
@@ -1538,14 +1526,16 @@ impl<'a> Emitter<'a> {
             // bounded-iteration loop. Lowers to a counted-loop CFG
             // (header + body + exit blocks) per spec §8.4. v0.1
             // scope: range sources only.
-            StmtKind::Sigma { label, index_var, var, source, body } => {
-                if let Err(e) = self.emit_sigma(
-                    label.as_deref(),
-                    index_var.as_deref(),
-                    var,
-                    source,
-                    body,
-                ) {
+            StmtKind::Sigma {
+                label,
+                index_var,
+                var,
+                source,
+                body,
+            } => {
+                if let Err(e) =
+                    self.emit_sigma(label.as_deref(), index_var.as_deref(), var, source, body)
+                {
                     self.errors.push(e);
                 }
             }
@@ -1557,8 +1547,7 @@ impl<'a> Emitter<'a> {
             // to its `exit` (break) or `continue` (continue)
             // label, marking the current block terminated.
             StmtKind::Break { label } => {
-                if let Some((_, _, exit_label)) =
-                    self.find_sigma_loop_for_target(label.as_deref())
+                if let Some((_, _, exit_label)) = self.find_sigma_loop_for_target(label.as_deref())
                 {
                     writeln!(&mut self.out, "  br label %{exit_label}").ok();
                     self.current_block_terminated = true;
@@ -1645,11 +1634,12 @@ impl<'a> Emitter<'a> {
         // needs `&mut self`). For each assign, capture
         // (location, ir_ty).
         let (is_register_block, struct_name, field_data) = {
-            let info = self.automatons.get(automaton).ok_or_else(|| {
-                CodegenError::UnresolvedName {
-                    name: automaton.to_owned(),
-                }
-            })?;
+            let info =
+                self.automatons
+                    .get(automaton)
+                    .ok_or_else(|| CodegenError::UnresolvedName {
+                        name: automaton.to_owned(),
+                    })?;
             let struct_name = format!("%struct.{automaton}");
             let mut entries: Vec<(FieldLocation, String)> = Vec::with_capacity(assigns.len());
             for fa in assigns {
@@ -1718,11 +1708,10 @@ impl<'a> Emitter<'a> {
         value: &str,
         is_register_block: bool,
     ) -> Result<(), CodegenError> {
-        let element_ir_ty = array_element_ir_type(field_ir_ty).ok_or(
-            CodegenError::NotYetImplemented {
+        let element_ir_ty =
+            array_element_ir_type(field_ir_ty).ok_or(CodegenError::NotYetImplemented {
                 what: "indexed field assignment on non-array field",
-            },
-        )?;
+            })?;
         let index_val = self.emit_expr(index_expr)?;
         let index_ir_ty = self.expr_ir_type(index_expr);
 
@@ -1759,7 +1748,11 @@ impl<'a> Emitter<'a> {
         .ok();
 
         // Stage 3: store.
-        let store_keyword = if is_register_block { "store volatile" } else { "store" };
+        let store_keyword = if is_register_block {
+            "store volatile"
+        } else {
+            "store"
+        };
         if is_register_block {
             // Slice 23 (Decision #18): mark register-block
             // indexed-field volatile stores. The `kind`
@@ -1778,11 +1771,7 @@ impl<'a> Emitter<'a> {
                 )
                 .ok();
                 let size = ir_type_byte_size(&element_ir_ty).unwrap_or(0);
-                self.emit_audit_validate_call_with_args(
-                    "volatile_store",
-                    &i8_ptr,
-                    size,
-                );
+                self.emit_audit_validate_call_with_args("volatile_store", &i8_ptr, size);
             }
         }
         writeln!(
@@ -1830,26 +1819,21 @@ impl<'a> Emitter<'a> {
             }
             FieldLocation::RegisterBlock { absolute_address } => {
                 let _ = is_register_block; // tag for diagnostic-future use
-                // Slice 23 (Decision #18): if `automaton` is
-                // `#audit`-marked, emit a wrap-site marker for
-                // this peripheral. The marker names the specific
-                // automaton being touched, which is more precise
-                // than the callable-level `current_audited_owner`
-                // when an effect lists multiple audited automata.
+                                           // Slice 23 (Decision #18): if `automaton` is
+                                           // `#audit`-marked, emit a wrap-site marker for
+                                           // this peripheral. The marker names the specific
+                                           // automaton being touched, which is more precise
+                                           // than the callable-level `current_audited_owner`
+                                           // when an effect lists multiple audited automata.
                 self.emit_audit_marker_for_automaton(automaton, "volatile_store");
                 // Slice 43: real ptr+size args for the
                 // validate_store call. The MMIO address is
                 // already known as a constant; build the i8*
                 // expression inline.
                 if self.audit_marker_active_for(automaton) {
-                    let i8_ptr =
-                        format!("inttoptr (i64 {absolute_address} to i8*)");
+                    let i8_ptr = format!("inttoptr (i64 {absolute_address} to i8*)");
                     let size = ir_type_byte_size(ir_ty).unwrap_or(0);
-                    self.emit_audit_validate_call_with_args(
-                        "volatile_store",
-                        &i8_ptr,
-                        size,
-                    );
+                    self.emit_audit_validate_call_with_args("volatile_store", &i8_ptr, size);
                 }
                 writeln!(
                     &mut self.out,
@@ -1891,14 +1875,9 @@ impl<'a> Emitter<'a> {
                 self.emit_audit_marker_for_automaton(automaton, "volatile_load");
                 // Slice 43: real ptr+size args.
                 if self.audit_marker_active_for(automaton) {
-                    let i8_ptr =
-                        format!("inttoptr (i64 {absolute_address} to i8*)");
+                    let i8_ptr = format!("inttoptr (i64 {absolute_address} to i8*)");
                     let size = ir_type_byte_size(ir_ty).unwrap_or(0);
-                    self.emit_audit_validate_call_with_args(
-                        "volatile_load",
-                        &i8_ptr,
-                        size,
-                    );
+                    self.emit_audit_validate_call_with_args("volatile_load", &i8_ptr, size);
                 }
                 let val = self.fresh_value();
                 writeln!(
@@ -1921,11 +1900,12 @@ impl<'a> Emitter<'a> {
         value: &Expr,
     ) -> Result<(), CodegenError> {
         let (struct_name, loc, ir_ty, is_register_block) = {
-            let info = self.automatons.get(automaton).ok_or_else(|| {
-                CodegenError::UnresolvedName {
-                    name: automaton.to_owned(),
-                }
-            })?;
+            let info =
+                self.automatons
+                    .get(automaton)
+                    .ok_or_else(|| CodegenError::UnresolvedName {
+                        name: automaton.to_owned(),
+                    })?;
             let (idx, ir_ty, offset) = info
                 .fields
                 .iter()
@@ -2091,11 +2071,7 @@ impl<'a> Emitter<'a> {
                         Some((value, _ir_ty, LocalStorage::Ssa)) => Ok(value),
                         Some((ptr, ir_ty, LocalStorage::Stack)) => {
                             let val = self.fresh_value();
-                            writeln!(
-                                &mut self.out,
-                                "  {val} = load {ir_ty}, {ir_ty}* {ptr}",
-                            )
-                            .ok();
+                            writeln!(&mut self.out, "  {val} = load {ir_ty}, {ir_ty}* {ptr}",).ok();
                             Ok(val)
                         }
                         None => Err(CodegenError::UnresolvedName {
@@ -2131,17 +2107,13 @@ impl<'a> Emitter<'a> {
             // v0.2-ζ MVP supports primitive fields only. Compound
             // (struct / array) snapshots would tear at the load
             // level; surface NotYetImplemented for those.
-            ExprKind::Snapshot { automaton, field } => {
-                self.emit_snapshot(automaton, field)
-            }
+            ExprKind::Snapshot { automaton, field } => self.emit_snapshot(automaton, field),
             // Slice 24 (Decision #12): `@shadow Auto.field`
             // reads from `@<Auto>.shadow` (the pending shadow
             // global) instead of `@<Auto>.state`. Same
             // single-word constraint as `@snapshot` — the load
             // must be atomic at the IR level.
-            ExprKind::Shadow { automaton, field } => {
-                self.emit_shadow(automaton, field)
-            }
+            ExprKind::Shadow { automaton, field } => self.emit_shadow(automaton, field),
             // Slice 5: indexed read on an automaton-array field.
             // `Counter.buf[3]` parses as
             // `Index { obj: FieldAccess(Path([Counter]), "buf"), index: 3 }`.
@@ -2221,15 +2193,18 @@ impl<'a> Emitter<'a> {
     fn emit_index_expr(&mut self, obj: &Expr, index: &Expr) -> Result<String, CodegenError> {
         // Obj must be `FieldAccess { Path([Auto] | [Self]), field }`.
         let (auto_name, field) = match &obj.kind {
-            ExprKind::FieldAccess { obj: inner_obj, field } => {
+            ExprKind::FieldAccess {
+                obj: inner_obj,
+                field,
+            } => {
                 let auto_name = match &inner_obj.kind {
                     ExprKind::Path(segs) if segs.len() == 1 => {
                         if segs[0] == "Self" {
-                            self.enclosing_owner.clone().ok_or(
-                                CodegenError::NotYetImplemented {
+                            self.enclosing_owner
+                                .clone()
+                                .ok_or(CodegenError::NotYetImplemented {
                                     what: "Self.field[i] outside a #transition body",
-                                },
-                            )?
+                                })?
                         } else {
                             segs[0].clone()
                         }
@@ -2252,9 +2227,12 @@ impl<'a> Emitter<'a> {
         // Resolve the field's location and IR type, then split the
         // array IR type into `[N x T]` and `T`.
         let (field_ir_ty, field_loc, is_register_block) = {
-            let info = self.automatons.get(&auto_name).ok_or_else(|| {
-                CodegenError::UnresolvedName { name: auto_name.clone() }
-            })?;
+            let info =
+                self.automatons
+                    .get(&auto_name)
+                    .ok_or_else(|| CodegenError::UnresolvedName {
+                        name: auto_name.clone(),
+                    })?;
             let (idx, ir_ty, offset) = info
                 .fields
                 .iter()
@@ -2284,8 +2262,8 @@ impl<'a> Emitter<'a> {
             (ir_ty, loc, info.is_register_block)
         };
 
-        let element_ir_ty = array_element_ir_type(&field_ir_ty)
-            .ok_or(CodegenError::NotYetImplemented {
+        let element_ir_ty =
+            array_element_ir_type(&field_ir_ty).ok_or(CodegenError::NotYetImplemented {
                 what: "indexed read on non-array field",
             })?;
 
@@ -2307,9 +2285,7 @@ impl<'a> Emitter<'a> {
             FieldLocation::RegisterBlock { absolute_address } => {
                 // Skip the GEP for register-block fields — the
                 // `inttoptr` literal IS the field pointer.
-                format!(
-                    "inttoptr (i64 {absolute_address} to {field_ir_ty}*)"
-                )
+                format!("inttoptr (i64 {absolute_address} to {field_ir_ty}*)")
             }
         };
 
@@ -2325,7 +2301,11 @@ impl<'a> Emitter<'a> {
 
         // Stage 3: load.
         let val = self.fresh_value();
-        let load_keyword = if is_register_block { "load volatile" } else { "load" };
+        let load_keyword = if is_register_block {
+            "load volatile"
+        } else {
+            "load"
+        };
         writeln!(
             &mut self.out,
             "  {val} = {load_keyword} {element_ir_ty}, {element_ir_ty}* {elem_ptr}",
@@ -2345,11 +2325,7 @@ impl<'a> Emitter<'a> {
     ///
     /// The aggregate IR type comes from `expr_ir_type` (i.e. from the
     /// typing record when present, else a syntactic fallback).
-    fn emit_tuple_expr(
-        &mut self,
-        expr: &Expr,
-        elems: &[Expr],
-    ) -> Result<String, CodegenError> {
+    fn emit_tuple_expr(&mut self, expr: &Expr, elems: &[Expr]) -> Result<String, CodegenError> {
         let agg_ty = self.expr_ir_type(expr);
         self.emit_aggregate_insertvalue_chain(&agg_ty, elems)
     }
@@ -2358,11 +2334,7 @@ impl<'a> Emitter<'a> {
     /// chain on `undef` of the array's `[N x T]` IR type. Same shape
     /// as [`Self::emit_tuple_expr`] — the LLVM `insertvalue`
     /// instruction is uniform across struct and array aggregates.
-    fn emit_array_expr(
-        &mut self,
-        expr: &Expr,
-        elems: &[Expr],
-    ) -> Result<String, CodegenError> {
+    fn emit_array_expr(&mut self, expr: &Expr, elems: &[Expr]) -> Result<String, CodegenError> {
         if elems.is_empty() {
             // `[]` of zero length isn't useful in v0.1; the type
             // checker rarely produces a usable element type for it.
@@ -2461,11 +2433,7 @@ impl<'a> Emitter<'a> {
     /// Float casts (`fptrunc` / `fpext` / `fptoui` / `sitofp` etc.)
     /// and pointer ↔ int casts are out of scope for v0.1 firmware
     /// and surface as `NotYetImplemented`.
-    fn emit_cast_expr(
-        &mut self,
-        value: &Expr,
-        ty: &TypeExpr,
-    ) -> Result<String, CodegenError> {
+    fn emit_cast_expr(&mut self, value: &Expr, ty: &TypeExpr) -> Result<String, CodegenError> {
         let src_ir_ty = self.expr_ir_type(value);
         let dst_ir_ty = self.lower_type(ty)?;
         let src_value = self.emit_expr(value)?;
@@ -2576,12 +2544,7 @@ impl<'a> Emitter<'a> {
     /// doesn't define a hook for them — only the load/store
     /// validation methods. The slice-21+ markers for those
     /// primitives remain in the IR as documentation.
-    fn emit_audit_validate_call_with_args(
-        &mut self,
-        kind: &str,
-        ptr_i8: &str,
-        size_bytes: u64,
-    ) {
+    fn emit_audit_validate_call_with_args(&mut self, kind: &str, ptr_i8: &str, size_bytes: u64) {
         let method = match kind {
             "unchecked_load" | "volatile_load" => "validate_load",
             "unchecked_store" | "volatile_store" => "validate_store",
@@ -2754,15 +2717,17 @@ impl<'a> Emitter<'a> {
     ) -> Result<String, CodegenError> {
         let elem_ir_ty = self.lower_type(ty)?;
         let ptr_value = self.emit_expr(ptr)?;
-        let kind = if is_volatile { "volatile_load" } else { "unchecked_load" };
+        let kind = if is_volatile {
+            "volatile_load"
+        } else {
+            "unchecked_load"
+        };
         self.emit_audit_marker_if_needed(kind);
         // Slice 43: bitcast the typed pointer to i8* so we can
         // pass it to validate_load. The bitcast is free at
         // runtime (LLVM-15+ opaque pointers) and gives the
         // Sanitizer the byte-level address it expects.
-        if self.audit_context_active()
-            && matches!(kind, "unchecked_load" | "volatile_load")
-        {
+        if self.audit_context_active() && matches!(kind, "unchecked_load" | "volatile_load") {
             let i8_ptr = self.fresh_value();
             writeln!(
                 &mut self.out,
@@ -2798,14 +2763,16 @@ impl<'a> Emitter<'a> {
         let elem_ir_ty = self.lower_type(ty)?;
         let ptr_value = self.emit_expr(ptr)?;
         let val_ssa = self.emit_expr(value)?;
-        let kind = if is_volatile { "volatile_store" } else { "unchecked_store" };
+        let kind = if is_volatile {
+            "volatile_store"
+        } else {
+            "unchecked_store"
+        };
         self.emit_audit_marker_if_needed(kind);
         // Slice 43: real ptr+size args. Same shape as the
         // load path — bitcast the typed pointer to i8* and
         // compute the element byte size.
-        if self.audit_context_active()
-            && matches!(kind, "unchecked_store" | "volatile_store")
-        {
+        if self.audit_context_active() && matches!(kind, "unchecked_store" | "volatile_store") {
             let i8_ptr = self.fresh_value();
             writeln!(
                 &mut self.out,
@@ -2815,7 +2782,11 @@ impl<'a> Emitter<'a> {
             let size = ir_type_byte_size(&elem_ir_ty).unwrap_or(0);
             self.emit_audit_validate_call_with_args(kind, &i8_ptr, size);
         }
-        let keyword = if is_volatile { "store volatile" } else { "store" };
+        let keyword = if is_volatile {
+            "store volatile"
+        } else {
+            "store"
+        };
         writeln!(
             &mut self.out,
             "  {keyword} {elem_ir_ty} {val_ssa}, {elem_ir_ty}* {ptr_value}",
@@ -3076,11 +3047,7 @@ impl<'a> Emitter<'a> {
     ///   <emit value> -> %v
     ///   store <ir_ty> %v, <ir_ty>* %ptr
     /// ```
-    fn emit_local_assign(
-        &mut self,
-        name: &str,
-        value: &Expr,
-    ) -> Result<(), CodegenError> {
+    fn emit_local_assign(&mut self, name: &str, value: &Expr) -> Result<(), CodegenError> {
         let lookup = self.lookup_local_with_storage(name);
         let (ptr, ir_ty) = match lookup {
             Some((ptr, ir_ty, LocalStorage::Stack)) => (ptr, ir_ty),
@@ -3101,11 +3068,7 @@ impl<'a> Emitter<'a> {
             }
         };
         let v = self.emit_expr(value)?;
-        writeln!(
-            &mut self.out,
-            "  store {ir_ty} {v}, {ir_ty}* {ptr}",
-        )
-        .ok();
+        writeln!(&mut self.out, "  store {ir_ty} {v}, {ir_ty}* {ptr}",).ok();
         Ok(())
     }
 
@@ -3389,11 +3352,11 @@ impl<'a> Emitter<'a> {
         let auto_name: String = match &obj.kind {
             ExprKind::Path(segs) if segs.len() == 1 => {
                 if segs[0] == "Self" {
-                    self.enclosing_owner.clone().ok_or(
-                        CodegenError::NotYetImplemented {
+                    self.enclosing_owner
+                        .clone()
+                        .ok_or(CodegenError::NotYetImplemented {
                             what: "sigma x in &Self.field outside a #transition body",
-                        },
-                    )?
+                        })?
                 } else {
                     segs[0].clone()
                 }
@@ -3407,25 +3370,37 @@ impl<'a> Emitter<'a> {
 
         // Look up the field's IR type and (LLVM) struct index.
         let (field_ir_ty, field_idx, is_register_block) = {
-            let info = self.automatons.get(&auto_name).ok_or_else(|| {
-                CodegenError::UnresolvedName { name: auto_name.clone() }
-            })?;
+            let info =
+                self.automatons
+                    .get(&auto_name)
+                    .ok_or_else(|| CodegenError::UnresolvedName {
+                        name: auto_name.clone(),
+                    })?;
             let (raw_idx, ir_ty, _offset) = info
                 .fields
                 .iter()
                 .enumerate()
                 .find_map(|(i, (n, t, off))| {
-                    if n == field { Some((i, t.clone(), *off)) } else { None }
+                    if n == field {
+                        Some((i, t.clone(), *off))
+                    } else {
+                        None
+                    }
                 })
                 .ok_or_else(|| CodegenError::UnresolvedName {
                     name: format!("{auto_name}.{field}"),
                 })?;
-            (ir_ty, info.llvm_field_index(raw_idx), info.is_register_block)
+            (
+                ir_ty,
+                info.llvm_field_index(raw_idx),
+                info.is_register_block,
+            )
         };
 
         if is_register_block {
             return Err(CodegenError::NotYetImplemented {
-                what: "sigma over a register-block array field (per-iteration volatile load deferred)",
+                what:
+                    "sigma over a register-block array field (per-iteration volatile load deferred)",
             });
         }
 
@@ -3467,11 +3442,7 @@ impl<'a> Emitter<'a> {
             "  {i_name} = phi i32 [ 0, %{pred_block} ], [ {i_next_name}, %{continue_label} ]",
         )
         .ok();
-        writeln!(
-            &mut self.out,
-            "  {cond_name} = icmp ult i32 {i_name}, {n}",
-        )
-        .ok();
+        writeln!(&mut self.out, "  {cond_name} = icmp ult i32 {i_name}, {n}",).ok();
         writeln!(
             &mut self.out,
             "  br i1 {cond_name}, label %{body_label}, label %{exit_label}",
@@ -3539,11 +3510,7 @@ impl<'a> Emitter<'a> {
         writeln!(&mut self.out, "{continue_label}:").ok();
         self.current_block = continue_label.clone();
         self.current_block_terminated = false;
-        writeln!(
-            &mut self.out,
-            "  {i_next_name} = add nuw i32 {i_name}, 1",
-        )
-        .ok();
+        writeln!(&mut self.out, "  {i_next_name} = add nuw i32 {i_name}, 1",).ok();
         writeln!(&mut self.out, "  br label %{header_label}").ok();
 
         // Exit.
@@ -3566,11 +3533,12 @@ impl<'a> Emitter<'a> {
     /// %tag     = load i32, i32* %tag_ptr
     /// ```
     fn emit_state_read(&mut self, automaton: &str) -> Result<String, CodegenError> {
-        let info = self.automatons.get(automaton).ok_or_else(|| {
-            CodegenError::UnresolvedName {
+        let info = self
+            .automatons
+            .get(automaton)
+            .ok_or_else(|| CodegenError::UnresolvedName {
                 name: automaton.to_owned(),
-            }
-        })?;
+            })?;
         if info.is_register_block {
             // A register-block multi-state combo would need a
             // user-specified MMIO offset for the tag; the spec
@@ -3595,11 +3563,7 @@ impl<'a> Emitter<'a> {
         )
         .ok();
         let tag_val = self.fresh_value();
-        writeln!(
-            &mut self.out,
-            "  {tag_val} = load i32, i32* {tag_ptr}",
-        )
-        .ok();
+        writeln!(&mut self.out, "  {tag_val} = load i32, i32* {tag_ptr}",).ok();
         Ok(tag_val)
     }
 
@@ -3609,11 +3573,7 @@ impl<'a> Emitter<'a> {
     /// %ptr = getelementptr %struct.<Auto>, %struct.<Auto>* @<Auto>.state, i32 0, i32 <idx>
     /// %val = load <ir_ty>, <ir_ty>* %ptr
     /// ```
-    fn emit_field_access(
-        &mut self,
-        obj: &Expr,
-        field: &str,
-    ) -> Result<String, CodegenError> {
+    fn emit_field_access(&mut self, obj: &Expr, field: &str) -> Result<String, CodegenError> {
         // Determine the owning automaton name.
         let auto_name = match &obj.kind {
             ExprKind::Path(segs) if segs.len() == 1 => {
@@ -3656,11 +3616,12 @@ impl<'a> Emitter<'a> {
         // load at `inttoptr (i64 base+offset to T*)`; non-register-
         // block reads use the slice-3 GEP+load shape.
         let (is_register_block, abs_addr_or_idx, ir_ty) = {
-            let info = self.automatons.get(auto_name).ok_or_else(|| {
-                CodegenError::UnresolvedName {
-                    name: auto_name.to_owned(),
-                }
-            })?;
+            let info =
+                self.automatons
+                    .get(auto_name)
+                    .ok_or_else(|| CodegenError::UnresolvedName {
+                        name: auto_name.to_owned(),
+                    })?;
             let (idx, ir_ty, offset) = info
                 .fields
                 .iter()
@@ -3699,14 +3660,9 @@ impl<'a> Emitter<'a> {
             self.emit_audit_marker_for_automaton(auto_name, "volatile_load");
             // Slice 43: real ptr+size args.
             if self.audit_marker_active_for(auto_name) {
-                let i8_ptr =
-                    format!("inttoptr (i64 {abs_addr_or_idx} to i8*)");
+                let i8_ptr = format!("inttoptr (i64 {abs_addr_or_idx} to i8*)");
                 let size = ir_type_byte_size(&ir_ty).unwrap_or(0);
-                self.emit_audit_validate_call_with_args(
-                    "volatile_load",
-                    &i8_ptr,
-                    size,
-                );
+                self.emit_audit_validate_call_with_args("volatile_load", &i8_ptr, size);
             }
             let val = self.fresh_value();
             writeln!(
@@ -3760,11 +3716,7 @@ impl<'a> Emitter<'a> {
     /// excludes snapshots from `actual_reads`, so the v0.2-β
     /// graded check doesn't pair the snapshot site against any
     /// concurrent write.
-    fn emit_snapshot(
-        &mut self,
-        automaton: &str,
-        field: &str,
-    ) -> Result<String, CodegenError> {
+    fn emit_snapshot(&mut self, automaton: &str, field: &str) -> Result<String, CodegenError> {
         // Resolve `Self` to the enclosing automaton if we're
         // inside a transition (the transition resolver upstream
         // accepts `@snapshot Self.field` per spec).
@@ -3786,13 +3738,15 @@ impl<'a> Emitter<'a> {
             .automatons
             .get(&auto_name)
             .and_then(|info| {
-                info.fields.iter().find_map(|(n, t, _)| {
-                    if n == field {
-                        Some(t.clone())
-                    } else {
-                        None
-                    }
-                })
+                info.fields.iter().find_map(
+                    |(n, t, _)| {
+                        if n == field {
+                            Some(t.clone())
+                        } else {
+                            None
+                        }
+                    },
+                )
             })
             .ok_or_else(|| CodegenError::UnresolvedName {
                 name: format!("{auto_name}.{field}"),
@@ -3824,11 +3778,7 @@ impl<'a> Emitter<'a> {
     /// `false`, we emit a defensive `NotYetImplemented` (the
     /// resolver should have rejected this; the codegen error is
     /// a defence-in-depth).
-    fn emit_shadow(
-        &mut self,
-        automaton: &str,
-        field: &str,
-    ) -> Result<String, CodegenError> {
+    fn emit_shadow(&mut self, automaton: &str, field: &str) -> Result<String, CodegenError> {
         // Resolve `Self` like `emit_snapshot` does.
         let auto_name: String = if automaton == "Self" {
             self.enclosing_owner
@@ -3843,11 +3793,12 @@ impl<'a> Emitter<'a> {
         // Look up the field's IR type and check the staged
         // invariant.
         let (ir_ty, idx, is_staged) = {
-            let info = self.automatons.get(&auto_name).ok_or_else(|| {
-                CodegenError::UnresolvedName {
-                    name: auto_name.clone(),
-                }
-            })?;
+            let info =
+                self.automatons
+                    .get(&auto_name)
+                    .ok_or_else(|| CodegenError::UnresolvedName {
+                        name: auto_name.clone(),
+                    })?;
             let (raw_idx, ty) = info
                 .fields
                 .iter()
@@ -4003,11 +3954,7 @@ impl<'a> Emitter<'a> {
         };
         if let Some(cmp) = cmp_op {
             let dst = self.fresh_value();
-            writeln!(
-                &mut self.out,
-                "  {dst} = icmp {cmp} {ir_ty} {l}, {r}",
-            )
-            .ok();
+            writeln!(&mut self.out, "  {dst} = icmp {cmp} {ir_ty} {l}, {r}",).ok();
             return Ok(dst);
         }
 
@@ -4181,10 +4128,13 @@ impl<'a> Emitter<'a> {
     }
 
     fn lookup_local_ir_type(&self, name: &str) -> Option<String> {
-        self.locals
-            .iter()
-            .rev()
-            .find_map(|b| if b.name == name { Some(b.ir_type.clone()) } else { None })
+        self.locals.iter().rev().find_map(|b| {
+            if b.name == name {
+                Some(b.ir_type.clone())
+            } else {
+                None
+            }
+        })
     }
 
     /// Slice 12: look up a local and return its `(value, ir_type,
@@ -4192,10 +4142,7 @@ impl<'a> Emitter<'a> {
     /// dispatch on whether the binding is SSA-direct or stack-
     /// allocated. Returns owned `String`s so callers don't need to
     /// borrow `self` while emitting subsequent IR.
-    fn lookup_local_with_storage(
-        &self,
-        name: &str,
-    ) -> Option<(String, String, LocalStorage)> {
+    fn lookup_local_with_storage(&self, name: &str) -> Option<(String, String, LocalStorage)> {
         self.locals.iter().rev().find_map(|b| {
             if b.name == name {
                 Some((b.value.clone(), b.ir_type.clone(), b.storage))
@@ -4405,9 +4352,15 @@ fn emit_atomic_marker_if_any(out: &mut String, atomic: Option<&clifford_ast::Ato
 
 fn parse_address_literal(s: &str) -> Option<u64> {
     let trimmed: String = s.chars().filter(|c| *c != '_').collect();
-    if let Some(body) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+    if let Some(body) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
         u64::from_str_radix(body, 16).ok()
-    } else if let Some(body) = trimmed.strip_prefix("0b").or_else(|| trimmed.strip_prefix("0B")) {
+    } else if let Some(body) = trimmed
+        .strip_prefix("0b")
+        .or_else(|| trimmed.strip_prefix("0B"))
+    {
         u64::from_str_radix(body, 2).ok()
     } else {
         trimmed.parse::<u64>().ok()
@@ -4614,7 +4567,9 @@ fn is_integer_ir_type(ir_ty: &str) -> bool {
 /// digits / hex / binary body). Returns `""` for an unsuffixed
 /// literal; otherwise something like `"u32"` or `"isize"`.
 fn literal_suffix(literal: &str) -> &str {
-    let trimmed_len = literal.trim_end_matches(|c: char| c.is_ascii_alphabetic()).len();
+    let trimmed_len = literal
+        .trim_end_matches(|c: char| c.is_ascii_alphabetic())
+        .len();
     &literal[trimmed_len..]
 }
 
@@ -4899,7 +4854,10 @@ mod tests {
     #[test]
     fn empty_program_emits_module_header() {
         let ir = lower_str("").expect("empty program lowers");
-        assert!(ir.contains("ModuleID = 'test'"), "missing ModuleID; got:\n{ir}");
+        assert!(
+            ir.contains("ModuleID = 'test'"),
+            "missing ModuleID; got:\n{ir}"
+        );
         assert!(
             ir.contains("source_filename = \"test\""),
             "missing source_filename; got:\n{ir}"
@@ -4947,7 +4905,10 @@ mod tests {
             ir.contains("define i32 @id(i32 %x) {"),
             "expected `define i32 @id(i32 %x)`; got:\n{ir}"
         );
-        assert!(ir.contains("ret i32 %x"), "expected `ret i32 %x`; got:\n{ir}");
+        assert!(
+            ir.contains("ret i32 %x"),
+            "expected `ret i32 %x`; got:\n{ir}"
+        );
     }
 
     #[test]
@@ -4970,20 +4931,22 @@ mod tests {
 
     #[test]
     fn fn_with_simple_arithmetic() {
-        let ir = lower_str("@fn add(a: u32, b: u32) -> u32 { return a + b; }")
-            .expect("lower add");
+        let ir = lower_str("@fn add(a: u32, b: u32) -> u32 { return a + b; }").expect("lower add");
         // The binary expression yields a fresh SSA temp via `add i32 %a, %b`.
         assert!(
             ir.contains("add i32 %a, %b"),
             "expected `add i32 %a, %b`; got:\n{ir}"
         );
-        assert!(ir.contains("ret i32 %tmp."), "expected ret of SSA temp; got:\n{ir}");
+        assert!(
+            ir.contains("ret i32 %tmp."),
+            "expected ret of SSA temp; got:\n{ir}"
+        );
     }
 
     #[test]
     fn fn_with_multiple_arithmetic_ops() {
-        let ir = lower_str("@fn calc(a: u32, b: u32) -> u32 { return a * b - a; }")
-            .expect("lower calc");
+        let ir =
+            lower_str("@fn calc(a: u32, b: u32) -> u32 { return a * b - a; }").expect("lower calc");
         // Both `mul` and `sub` should appear.
         assert!(ir.contains("mul i32"), "expected mul; got:\n{ir}");
         assert!(ir.contains("sub i32"), "expected sub; got:\n{ir}");
@@ -4996,7 +4959,10 @@ mod tests {
             @fn caller(n: u32) -> u32 { return double(n); }\n\
         ";
         let ir = lower_str(src).expect("lower call");
-        assert!(ir.contains("define i32 @double"), "missing double; got:\n{ir}");
+        assert!(
+            ir.contains("define i32 @double"),
+            "missing double; got:\n{ir}"
+        );
         assert!(
             ir.contains("call i32 @double(i32 %n)"),
             "expected call site; got:\n{ir}"
@@ -5108,8 +5074,7 @@ mod tests {
     #[test]
     fn hex_literal_lowers_to_decimal() {
         // 0xFF should appear as 255 in the IR text.
-        let ir =
-            lower_str("@fn h() -> u32 { return 0xFFu32; }").expect("lower hex");
+        let ir = lower_str("@fn h() -> u32 { return 0xFFu32; }").expect("lower hex");
         assert!(ir.contains("ret i32 255"), "expected hex→255; got:\n{ir}");
     }
 
@@ -5135,8 +5100,7 @@ mod tests {
         // any unintentional change to the emitter surfaces as a
         // diff. (Snapshot-style; if the emitter's whitespace / labels
         // change deliberately, update the expected text.)
-        let ir = lower_str("@fn add(a: u32, b: u32) -> u32 { return a + b; }")
-            .expect("lower add");
+        let ir = lower_str("@fn add(a: u32, b: u32) -> u32 { return a + b; }").expect("lower add");
         let expected = concat!(
             "; ModuleID = 'test'\n",
             "source_filename = \"test\"\n",
@@ -5188,16 +5152,16 @@ mod tests {
     #[test]
     fn s2_signed_div_uses_sdiv() {
         // i32 div should use `sdiv`, not `udiv` (the slice-1 default).
-        let ir = lower_str("@fn d(a: i32, b: i32) -> i32 { return a / b; }")
-            .expect("lower signed div");
+        let ir =
+            lower_str("@fn d(a: i32, b: i32) -> i32 { return a / b; }").expect("lower signed div");
         assert!(ir.contains("sdiv i32"), "expected sdiv; got:\n{ir}");
         assert!(!ir.contains("udiv i32"), "should not have udiv; got:\n{ir}");
     }
 
     #[test]
     fn s2_signed_rem_uses_srem() {
-        let ir = lower_str("@fn r(a: i32, b: i32) -> i32 { return a % b; }")
-            .expect("lower signed rem");
+        let ir =
+            lower_str("@fn r(a: i32, b: i32) -> i32 { return a % b; }").expect("lower signed rem");
         assert!(ir.contains("srem i32"), "expected srem; got:\n{ir}");
     }
 
@@ -5219,7 +5183,10 @@ mod tests {
     #[test]
     fn s2_unary_not_bool() {
         let ir = lower_str("@fn no(b: bool) -> bool { return !b; }").expect("lower not");
-        assert!(ir.contains("xor i1 %b, true"), "expected xor i1; got:\n{ir}");
+        assert!(
+            ir.contains("xor i1 %b, true"),
+            "expected xor i1; got:\n{ir}"
+        );
     }
 
     #[test]
@@ -5231,8 +5198,7 @@ mod tests {
     #[test]
     fn s2_ref_type_in_signature() {
         // `&T` lowers as `T*`. Slice 2 supports this in the signature.
-        let ir = lower_str("@fn r(p: &u32) -> u32 { return 0u32; }")
-            .expect("lower ref signature");
+        let ir = lower_str("@fn r(p: &u32) -> u32 { return 0u32; }").expect("lower ref signature");
         assert!(
             ir.contains("define i32 @r(i32* %p)"),
             "expected i32* param; got:\n{ir}"
@@ -5243,8 +5209,8 @@ mod tests {
     fn s2_ref_mut_type_in_signature() {
         // `&mut T` also lowers as `T*` (mutability-as-attribute is
         // a future slice; the IR-type form is the same).
-        let ir = lower_str("@fn r(p: &mut u32) -> u32 { return 0u32; }")
-            .expect("lower &mut signature");
+        let ir =
+            lower_str("@fn r(p: &mut u32) -> u32 { return 0u32; }").expect("lower &mut signature");
         assert!(
             ir.contains("define i32 @r(i32* %p)"),
             "expected i32* (mut as attr later); got:\n{ir}"
@@ -5253,8 +5219,7 @@ mod tests {
 
     #[test]
     fn s2_array_type_in_signature() {
-        let ir = lower_str("@fn a(buf: [u8; 64]) { return; }")
-            .expect("lower array signature");
+        let ir = lower_str("@fn a(buf: [u8; 64]) { return; }").expect("lower array signature");
         assert!(
             ir.contains("define void @a([64 x i8] %buf)"),
             "expected [64 x i8] param; got:\n{ir}"
@@ -5263,8 +5228,7 @@ mod tests {
 
     #[test]
     fn s2_tuple_type_in_signature() {
-        let ir = lower_str("@fn t(p: (u32, bool)) { return; }")
-            .expect("lower tuple signature");
+        let ir = lower_str("@fn t(p: (u32, bool)) { return; }").expect("lower tuple signature");
         assert!(
             ir.contains("define void @t({i32, i1} %p)"),
             "expected {{i32, i1}} param; got:\n{ir}"
@@ -5274,8 +5238,7 @@ mod tests {
     #[test]
     fn s2_deref_loads_through_ref() {
         // `*p` for `p: &u32` lowers to `load i32, i32* %p`.
-        let ir = lower_str("@fn d(p: &u32) -> u32 { return *p; }")
-            .expect("lower deref");
+        let ir = lower_str("@fn d(p: &u32) -> u32 { return *p; }").expect("lower deref");
         assert!(
             ir.contains("load i32, i32* %p"),
             "expected typed load; got:\n{ir}"
@@ -5320,8 +5283,8 @@ mod tests {
     #[test]
     fn s2_signed_division_with_signed_param() {
         // The lhs is i64; div should be sdiv.
-        let ir = lower_str("@fn d(a: i64, b: i64) -> i64 { return a / b; }")
-            .expect("lower i64 div");
+        let ir =
+            lower_str("@fn d(a: i64, b: i64) -> i64 { return a / b; }").expect("lower i64 div");
         assert!(ir.contains("sdiv i64"), "expected sdiv i64; got:\n{ir}");
     }
 
@@ -5404,7 +5367,9 @@ mod tests {
         ";
         let ir = lower_str(src).expect("lower mutate-short");
         assert!(
-            ir.contains("getelementptr %struct.Counter, %struct.Counter* @Counter.state, i32 0, i32 0"),
+            ir.contains(
+                "getelementptr %struct.Counter, %struct.Counter* @Counter.state, i32 0, i32 0"
+            ),
             "expected GEP at field 0; got:\n{ir}"
         );
         assert!(
@@ -5429,10 +5394,7 @@ mod tests {
             ir.matches("load i32, i32* ").count() >= 1,
             "expected load before op; got:\n{ir}"
         );
-        assert!(
-            ir.contains("add i32"),
-            "expected add for +=; got:\n{ir}"
-        );
+        assert!(ir.contains("add i32"), "expected add for +=; got:\n{ir}");
         assert!(
             ir.contains("store i32"),
             "expected store after op; got:\n{ir}"
@@ -5876,7 +5838,9 @@ mod tests {
         let ir = lower_str(src).expect("lower indexed read");
         // Stage 1: GEP into struct to grab the field pointer.
         assert!(
-            ir.contains("getelementptr %struct.Counter, %struct.Counter* @Counter.state, i32 0, i32 0"),
+            ir.contains(
+                "getelementptr %struct.Counter, %struct.Counter* @Counter.state, i32 0, i32 0"
+            ),
             "expected struct-field GEP; got:\n{ir}"
         );
         // Stage 2: GEP into the array using the index.
@@ -5934,7 +5898,9 @@ mod tests {
         ";
         let ir = lower_str(src).expect("lower indexed write");
         assert!(
-            ir.contains("getelementptr %struct.Counter, %struct.Counter* @Counter.state, i32 0, i32 0"),
+            ir.contains(
+                "getelementptr %struct.Counter, %struct.Counter* @Counter.state, i32 0, i32 0"
+            ),
             "expected struct-field GEP for write; got:\n{ir}"
         );
         assert!(
@@ -5996,7 +5962,9 @@ mod tests {
             "expected mangled transition fn; got:\n{ir}"
         );
         assert!(
-            ir.contains("getelementptr %struct.Counter, %struct.Counter* @Counter.state, i32 0, i32 0"),
+            ir.contains(
+                "getelementptr %struct.Counter, %struct.Counter* @Counter.state, i32 0, i32 0"
+            ),
             "expected struct-field GEP for buf; got:\n{ir}"
         );
         assert!(
@@ -6196,11 +6164,13 @@ mod tests {
             }\n\
         ";
         let errors = lower_str(src).expect_err("expected NotYetImplemented");
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            CodegenError::NotYetImplemented { what }
-                if *what == "array-repeat count that isn't a const integer literal"
-        ));
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                CodegenError::NotYetImplemented { what }
+                    if *what == "array-repeat count that isn't a const integer literal"
+            )
+        });
         assert!(
             saw,
             "expected NotYetImplemented(array-repeat count); got {errors:?}"
@@ -6342,10 +6312,7 @@ mod tests {
         let src = "@fn c() -> u16 { return (5u8 as u32) as u16; }";
         let ir = lower_str(src).expect("lower chained cast");
         assert!(ir.contains("zext i8 5 to i32"), "expected zext; got:\n{ir}");
-        assert!(
-            ir.contains(" to i16"),
-            "expected trunc to i16; got:\n{ir}"
-        );
+        assert!(ir.contains(" to i16"), "expected trunc to i16; got:\n{ir}");
         assert_eq!(
             ir.matches("trunc").count(),
             1,
@@ -6484,7 +6451,8 @@ mod tests {
     #[test]
     fn s8_unchecked_cast_pointer_to_int_emits_ptrtoint() {
         // `&u32 -> u64` via #unchecked_cast: ptrtoint i32* to i64.
-        let src = "@fn c(p: &u32) -> u64 { return #unchecked_cast<&u32, u64>(\"addr capture\", p); }";
+        let src =
+            "@fn c(p: &u32) -> u64 { return #unchecked_cast<&u32, u64>(\"addr capture\", p); }";
         let ir = lower_str(src).expect("lower ptrtoint");
         assert!(
             ir.contains("ptrtoint i32* %p to i64"),
@@ -6608,7 +6576,9 @@ mod tests {
         ";
         let ir = lower_str(src).expect("lower @state read");
         assert!(
-            ir.contains("getelementptr %struct.Counter, %struct.Counter* @Counter.state, i32 0, i32 0"),
+            ir.contains(
+                "getelementptr %struct.Counter, %struct.Counter* @Counter.state, i32 0, i32 0"
+            ),
             "expected GEP at idx 0 (state tag); got:\n{ir}"
         );
         assert!(
@@ -6633,7 +6603,9 @@ mod tests {
         let ir = lower_str(src).expect("lower bump");
         // Read of count goes through idx 1, NOT idx 0.
         assert!(
-            ir.contains("getelementptr %struct.Counter, %struct.Counter* @Counter.state, i32 0, i32 1"),
+            ir.contains(
+                "getelementptr %struct.Counter, %struct.Counter* @Counter.state, i32 0, i32 1"
+            ),
             "expected GEP at idx 1 (user field after tag); got:\n{ir}"
         );
         // Crucially, NO GEP at idx 0 should appear for a field op
@@ -6662,7 +6634,9 @@ mod tests {
         let ir = lower_str(src).expect("lower transition with dest");
         // Tag pointer GEP at idx 0:
         assert!(
-            ir.contains("getelementptr %struct.Counter, %struct.Counter* @Counter.state, i32 0, i32 0"),
+            ir.contains(
+                "getelementptr %struct.Counter, %struct.Counter* @Counter.state, i32 0, i32 0"
+            ),
             "expected tag GEP at idx 0; got:\n{ir}"
         );
         // Tag store i32 1 (Counting):
@@ -6743,11 +6717,13 @@ mod tests {
             #effect r() -> u32 #mutates: [C] { return C@state; }\n\
         ";
         let errors = lower_str(src).expect_err("expected E0810");
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            CodegenError::NotYetImplemented { what }
-                if *what == "Auto@state on a monoid automaton (no `#states` clause)"
-        ));
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                CodegenError::NotYetImplemented { what }
+                    if *what == "Auto@state on a monoid automaton (no `#states` clause)"
+            )
+        });
         assert!(
             saw,
             "expected NotYetImplemented(monoid @state); got {errors:?}"
@@ -6767,11 +6743,13 @@ mod tests {
             #effect r() -> u32 #mutates: [Mmio] { return Mmio@state; }\n\
         ";
         let errors = lower_str(src).expect_err("expected E0810");
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            CodegenError::NotYetImplemented { what }
-                if *what == "Auto@state on a register-block automaton"
-        ));
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                CodegenError::NotYetImplemented { what }
+                    if *what == "Auto@state on a register-block automaton"
+            )
+        });
         assert!(
             saw,
             "expected NotYetImplemented(register-block @state); got {errors:?}"
@@ -6803,10 +6781,7 @@ mod tests {
             "define void @bump()",
             "define i32 @peek()",
         ] {
-            assert!(
-                ir.contains(needle),
-                "missing `{needle}` in IR; got:\n{ir}"
-            );
+            assert!(ir.contains(needle), "missing `{needle}` in IR; got:\n{ir}");
         }
     }
 
@@ -6925,8 +6900,14 @@ mod tests {
             ir.contains("br i1 1, label %if.then.0, label %if.exit.0"),
             "expected br i1 to then or exit; got:\n{ir}"
         );
-        assert!(ir.contains("\nif.then.0:\n"), "missing then label; got:\n{ir}");
-        assert!(ir.contains("\nif.exit.0:\n"), "missing exit label; got:\n{ir}");
+        assert!(
+            ir.contains("\nif.then.0:\n"),
+            "missing then label; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("\nif.exit.0:\n"),
+            "missing exit label; got:\n{ir}"
+        );
         // No else label should be emitted.
         assert!(
             !ir.contains("if.else.0:"),
@@ -6950,11 +6931,7 @@ mod tests {
             ir.contains("br i1 1, label %if.then.0, label %if.else.0"),
             "expected br to then/else; got:\n{ir}"
         );
-        for label in [
-            "\nif.then.0:\n",
-            "\nif.else.0:\n",
-            "\nif.exit.0:\n",
-        ] {
+        for label in ["\nif.then.0:\n", "\nif.else.0:\n", "\nif.exit.0:\n"] {
             assert!(ir.contains(label), "missing {}; got:\n{ir}", label.trim());
         }
         // Both then and else branch to exit (two `br label %exit`).
@@ -7055,11 +7032,7 @@ mod tests {
             "\nif.then.1:\n",
             "\nif.else.1:\n",
         ] {
-            assert!(
-                ir.contains(label),
-                "missing {}; got:\n{ir}",
-                label.trim()
-            );
+            assert!(ir.contains(label), "missing {}; got:\n{ir}", label.trim());
         }
     }
 
@@ -7308,10 +7281,7 @@ mod tests {
                 let s = format!("{e}");
                 s.contains("E0410") && s.contains("immutable")
             });
-            assert!(
-                saw_e0410,
-                "expected E0410 with 'immutable'; got {errs:?}"
-            );
+            assert!(saw_e0410, "expected E0410 with 'immutable'; got {errs:?}");
         }
     }
 
@@ -7378,10 +7348,7 @@ mod tests {
                 let s = format!("{e}");
                 s.contains("E0402") && s.contains("undefined")
             });
-            assert!(
-                saw_undef,
-                "expected E0402 undefined; got {errs:?}"
-            );
+            assert!(saw_undef, "expected E0402 undefined; got {errs:?}");
         }
     }
 
@@ -7662,10 +7629,22 @@ mod tests {
         let src = "@fn loop_test() { sigma i in 0u32..4u32 { } return; }";
         let ir = lower_str(src).expect("lower sigma half-open");
         // Four labels, each at column 0.
-        assert!(ir.contains("\nsigma.header.0:\n"), "missing header label; got:\n{ir}");
-        assert!(ir.contains("\nsigma.body.0:\n"), "missing body label; got:\n{ir}");
-        assert!(ir.contains("\nsigma.continue.0:\n"), "missing continue label; got:\n{ir}");
-        assert!(ir.contains("\nsigma.exit.0:\n"), "missing exit label; got:\n{ir}");
+        assert!(
+            ir.contains("\nsigma.header.0:\n"),
+            "missing header label; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("\nsigma.body.0:\n"),
+            "missing body label; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("\nsigma.continue.0:\n"),
+            "missing continue label; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("\nsigma.exit.0:\n"),
+            "missing exit label; got:\n{ir}"
+        );
         // Branch into the header from entry.
         assert!(
             ir.contains("br label %sigma.header.0"),
@@ -7674,7 +7653,9 @@ mod tests {
         // Phi: body-incoming label is `continue`, not `body`,
         // because the increment lives in the continue block now.
         assert!(
-            ir.contains("%sigma.i.0 = phi i32 [ 0, %entry ], [ %sigma.i_next.0, %sigma.continue.0 ]"),
+            ir.contains(
+                "%sigma.i.0 = phi i32 [ 0, %entry ], [ %sigma.i_next.0, %sigma.continue.0 ]"
+            ),
             "missing phi (slice-17 shape with continue label); got:\n{ir}"
         );
         // Unsigned half-open compare.
@@ -7968,7 +7949,9 @@ mod tests {
         // The IR should contain a GEP + load on Counter.value
         // (LLVM idx 0 for monoid Counter).
         assert!(
-            ir.contains("getelementptr %struct.Counter, %struct.Counter* @Counter.state, i32 0, i32 0"),
+            ir.contains(
+                "getelementptr %struct.Counter, %struct.Counter* @Counter.state, i32 0, i32 0"
+            ),
             "expected struct-field GEP for snapshot; got:\n{ir}"
         );
         assert!(
@@ -8004,7 +7987,9 @@ mod tests {
         ";
         let ir = lower_str(src).expect("lower @snapshot Self");
         assert!(
-            ir.contains("getelementptr %struct.Counter, %struct.Counter* @Counter.state, i32 0, i32 0"),
+            ir.contains(
+                "getelementptr %struct.Counter, %struct.Counter* @Counter.state, i32 0, i32 0"
+            ),
             "expected GEP via Counter (Self resolution); got:\n{ir}"
         );
     }
@@ -8022,11 +8007,13 @@ mod tests {
             }\n\
         ";
         let errors = lower_str(src).expect_err("expected NotYetImplemented for compound snapshot");
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            CodegenError::NotYetImplemented { what }
-                if what.contains("non-primitive")
-        ));
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                CodegenError::NotYetImplemented { what }
+                    if what.contains("non-primitive")
+            )
+        });
         assert!(
             saw,
             "expected NotYetImplemented(non-primitive); got {errors:?}"
@@ -8106,9 +8093,7 @@ mod tests {
             "expected cpsie i exit asm; got:\n{ir}"
         );
         // The unmask appears before the ret.
-        let unmask_pos = ir
-            .find("cpsie i")
-            .expect("cpsie should appear");
+        let unmask_pos = ir.find("cpsie i").expect("cpsie should appear");
         let ret_pos = ir.find("ret void").expect("ret void should appear");
         assert!(
             unmask_pos < ret_pos,
@@ -8210,11 +8195,13 @@ mod tests {
             #effect e() #mutates: [C] #atomic: multicore_critical; { return; }\n\
         ";
         let errors = lower_str(src).expect_err("expected NotYetImplemented for multicore");
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            CodegenError::NotYetImplemented { what }
-                if what.contains("multicore_critical")
-        ));
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                CodegenError::NotYetImplemented { what }
+                    if what.contains("multicore_critical")
+            )
+        });
         assert!(
             saw,
             "expected NotYetImplemented(multicore_critical); got {errors:?}"
@@ -8231,15 +8218,14 @@ mod tests {
             #effect e() #mutates: [C] #atomic: my_custom_lock; { return; }\n\
         ";
         let errors = lower_str(src).expect_err("expected NotYetImplemented for custom");
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            CodegenError::NotYetImplemented { what }
-                if what.contains("custom")
-        ));
-        assert!(
-            saw,
-            "expected NotYetImplemented(custom); got {errors:?}"
-        );
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                CodegenError::NotYetImplemented { what }
+                    if what.contains("custom")
+            )
+        });
+        assert!(saw, "expected NotYetImplemented(custom); got {errors:?}");
     }
 
     // ─── Decision #22 codegen: memory-ordering fences ────────────────────
@@ -8460,10 +8446,7 @@ mod tests {
             "call void @bump()",
             "call void @reset()",
         ] {
-            assert!(
-                ir.contains(needle),
-                "missing `{needle}` in IR; got:\n{ir}"
-            );
+            assert!(ir.contains(needle), "missing `{needle}` in IR; got:\n{ir}");
         }
     }
 
@@ -9057,11 +9040,13 @@ mod tests {
             #effect bad() #mutates: [Buf] { sigma x in &Buf.total { Buf.total += x; } return; }\n\
         ";
         let errs = lower_str(src).expect_err("expected E0810");
-        let saw = errs.iter().any(|e| matches!(
-            e,
-            CodegenError::NotYetImplemented { what }
-                if what.contains("static-size array") || what.contains("`[T; N]`")
-        ));
+        let saw = errs.iter().any(|e| {
+            matches!(
+                e,
+                CodegenError::NotYetImplemented { what }
+                    if what.contains("static-size array") || what.contains("`[T; N]`")
+            )
+        });
         assert!(saw, "expected NYI citing static-size array; got {errs:?}");
     }
 
@@ -9385,7 +9370,8 @@ mod tests {
         let ir = lower_str(src).expect("lower audit branch+trap");
         // The conditional branch on the validate result.
         assert!(
-            ir.contains("br i1 %tmp.") && ir.contains("label %audit.ok.")
+            ir.contains("br i1 %tmp.")
+                && ir.contains("label %audit.ok.")
                 && ir.contains("label %audit.viol."),
             "expected conditional branch on validate result; got:\n{ir}"
         );

@@ -201,7 +201,9 @@ pub enum ResolveError {
     /// depth counter that increments when entering a `Sigma`
     /// body and decrements on exit. `break;` / `continue;`
     /// outside any loop fires this diagnostic.
-    #[error("E0411: `{keyword}` outside a loop body at byte {at} (only valid inside a `sigma` loop)")]
+    #[error(
+        "E0411: `{keyword}` outside a loop body at byte {at} (only valid inside a `sigma` loop)"
+    )]
     KeywordOutsideLoop {
         /// `"break"` or `"continue"`.
         keyword: &'static str,
@@ -1100,19 +1102,12 @@ impl<'a> Walker<'a> {
     ///   Note: a labelled `break` in a callable with no open
     ///   sigma loops raises E0415, not E0411 — the label is
     ///   the more specific signal of intent.
-    fn check_loop_keyword(
-        &mut self,
-        keyword: &'static str,
-        label: Option<&str>,
-        at: usize,
-    ) {
+    fn check_loop_keyword(&mut self, keyword: &'static str, label: Option<&str>, at: usize) {
         match label {
             None => {
                 if self.loop_depth == 0 {
-                    self.errors.push(ResolveError::KeywordOutsideLoop {
-                        keyword,
-                        at,
-                    });
+                    self.errors
+                        .push(ResolveError::KeywordOutsideLoop { keyword, at });
                 }
             }
             Some(name) => {
@@ -1316,7 +1311,13 @@ impl<'a> Walker<'a> {
             // open a new scope, declare the loop var inside it, and
             // walk the body. The var is invisible after the loop
             // ends.
-            StmtKind::Sigma { label, index_var, var, source, body } => {
+            StmtKind::Sigma {
+                label,
+                index_var,
+                var,
+                source,
+                body,
+            } => {
                 self.walk_expr(source);
                 // Slice 31: reject duplicate loop labels. An
                 // inner `sigma 'L …` whose label is already
@@ -1350,9 +1351,10 @@ impl<'a> Walker<'a> {
                 // var IS the value).
                 if let Some(idx) = index_var {
                     if matches!(source.kind, ExprKind::Range { .. }) {
-                        self.errors.push(ResolveError::TupleSigmaPatternOnRangeSource {
-                            at: stmt.span.start,
-                        });
+                        self.errors
+                            .push(ResolveError::TupleSigmaPatternOnRangeSource {
+                                at: stmt.span.start,
+                            });
                     }
                     self.declare(LocalBinding {
                         name: idx.clone(),
@@ -1449,10 +1451,7 @@ impl<'a> Walker<'a> {
                 let lookup = self.lookup_local(name);
                 match lookup {
                     Some(b) => {
-                        let mutable = matches!(
-                            b.kind,
-                            LocalKind::Let { mutable: true, .. }
-                        );
+                        let mutable = matches!(b.kind, LocalKind::Let { mutable: true, .. });
                         if !mutable {
                             let kind_str = match b.kind {
                                 LocalKind::Let { mutable: false, .. } => {
@@ -1464,9 +1463,7 @@ impl<'a> Walker<'a> {
                                 LocalKind::Param { .. } => {
                                     "a function parameter (parameters are immutable)"
                                 }
-                                LocalKind::Sigma => {
-                                    "a `sigma` loop variable (always immutable)"
-                                }
+                                LocalKind::Sigma => "a `sigma` loop variable (always immutable)",
                                 LocalKind::Let { mutable: true, .. } => {
                                     unreachable!()
                                 }
@@ -3198,21 +3195,29 @@ mod tests {
             @fn read_value() -> u32 { let v := @snapshot Counter.value; return v; }\
         ";
         let res = resolve_str(src);
-        assert!(res.is_ok(), "expected @snapshot Counter.value to resolve, got {res:?}");
+        assert!(
+            res.is_ok(),
+            "expected @snapshot Counter.value to resolve, got {res:?}"
+        );
     }
 
     #[test]
     fn snapshot_unknown_automaton_is_e0403() {
         let src = "@fn f() { let _v := @snapshot DoesNotExist.field; return; }";
         let errors = resolve_str(src).expect_err("expected NotAnAutomaton");
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            ResolveError::NotAnAutomaton { name, .. } if name == "DoesNotExist"
-        ) || matches!(
-            e,
-            ResolveError::UndefinedName { name, .. } if name == "DoesNotExist"
-        ));
-        assert!(saw, "expected NotAnAutomaton/UndefinedName for unknown automaton; got {errors:?}");
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                ResolveError::NotAnAutomaton { name, .. } if name == "DoesNotExist"
+            ) || matches!(
+                e,
+                ResolveError::UndefinedName { name, .. } if name == "DoesNotExist"
+            )
+        });
+        assert!(
+            saw,
+            "expected NotAnAutomaton/UndefinedName for unknown automaton; got {errors:?}"
+        );
     }
 
     #[test]
@@ -3222,12 +3227,17 @@ mod tests {
             @fn f() { let _v := @snapshot Counter.bogus; return; }\
         ";
         let errors = resolve_str(src).expect_err("expected UnknownField");
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            ResolveError::UnknownField { automaton, field, .. }
-                if automaton == "Counter" && field == "bogus"
-        ));
-        assert!(saw, "expected E0405 UnknownField for `Counter.bogus`; got {errors:?}");
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                ResolveError::UnknownField { automaton, field, .. }
+                    if automaton == "Counter" && field == "bogus"
+            )
+        });
+        assert!(
+            saw,
+            "expected E0405 UnknownField for `Counter.bogus`; got {errors:?}"
+        );
     }
 
     // ─── Slice 27: labelled break/continue (E0415 UnknownLoopLabel) ──────
@@ -3273,11 +3283,13 @@ mod tests {
             }\n\
         ";
         let errors = resolve_str(src).expect_err("expected E0415");
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            ResolveError::UnknownLoopLabel { keyword: "break", label, .. }
-                if label == "inner"
-        ));
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                ResolveError::UnknownLoopLabel { keyword: "break", label, .. }
+                    if label == "inner"
+            )
+        });
         assert!(saw, "expected E0415 for `break 'inner`; got {errors:?}");
     }
 
@@ -3288,10 +3300,12 @@ mod tests {
         // specific signal of intent), not E0411.
         let src = "@fn t() { break 'gone; }";
         let errors = resolve_str(src).expect_err("expected E0415");
-        let saw_e0415 = errors.iter().any(|e| matches!(
-            e,
-            ResolveError::UnknownLoopLabel { label, .. } if label == "gone"
-        ));
+        let saw_e0415 = errors.iter().any(|e| {
+            matches!(
+                e,
+                ResolveError::UnknownLoopLabel { label, .. } if label == "gone"
+            )
+        });
         assert!(saw_e0415, "expected E0415; got {errors:?}");
     }
 
@@ -3311,9 +3325,9 @@ mod tests {
             }\n\
         ";
         let errors = resolve_str(src).expect_err("expected E0416");
-        let saw = errors
-            .iter()
-            .any(|e| matches!(e, ResolveError::DuplicateLoopLabel { label, .. } if label == "outer"));
+        let saw = errors.iter().any(
+            |e| matches!(e, ResolveError::DuplicateLoopLabel { label, .. } if label == "outer"),
+        );
         assert!(saw, "expected E0416 for duplicate `'outer`; got {errors:?}");
     }
 
@@ -3369,11 +3383,13 @@ mod tests {
             @fn read_v() -> u32 $ [Readable] { return @shadow P.v; }\
         ";
         let errors = resolve_str(src).expect_err("expected ShadowOnNonStaged");
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            ResolveError::ShadowOnNonStaged { automaton, field, .. }
-                if automaton == "P" && field == "v"
-        ));
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                ResolveError::ShadowOnNonStaged { automaton, field, .. }
+                    if automaton == "P" && field == "v"
+            )
+        });
         assert!(saw, "expected E0414 for `@shadow P.v`; got {errors:?}");
     }
 
@@ -3384,15 +3400,19 @@ mod tests {
         // `NotAnAutomaton`; we don't duplicate that as E0414.
         let src = "@fn r() -> u32 $ [Readable] { return @shadow Bogus.v; }";
         let errors = resolve_str(src).expect_err("expected an error");
-        let saw_not_auto = errors.iter().any(|e| matches!(
-            e,
-            ResolveError::NotAnAutomaton { name, .. } if name == "Bogus"
-        ));
-        let saw_e0414 = errors.iter().any(|e| matches!(
-            e,
-            ResolveError::ShadowOnNonStaged { .. }
-        ));
-        assert!(saw_not_auto, "expected NotAnAutomaton for `Bogus`; got {errors:?}");
+        let saw_not_auto = errors.iter().any(|e| {
+            matches!(
+                e,
+                ResolveError::NotAnAutomaton { name, .. } if name == "Bogus"
+            )
+        });
+        let saw_e0414 = errors
+            .iter()
+            .any(|e| matches!(e, ResolveError::ShadowOnNonStaged { .. }));
+        assert!(
+            saw_not_auto,
+            "expected NotAnAutomaton for `Bogus`; got {errors:?}"
+        );
         assert!(
             !saw_e0414,
             "must not double-report E0414 alongside NotAnAutomaton; got {errors:?}"
@@ -3410,11 +3430,13 @@ mod tests {
             @fn observe() -> u32 { let _v := @snapshot Uart.parity_errors; return _v; }\
         ";
         let errors = resolve_str(src).expect_err("expected HiddenFieldNotAccessible");
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            ResolveError::HiddenFieldNotAccessible { automaton, field, .. }
-                if automaton == "Uart" && field == "parity_errors"
-        ));
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                ResolveError::HiddenFieldNotAccessible { automaton, field, .. }
+                    if automaton == "Uart" && field == "parity_errors"
+            )
+        });
         assert!(
             saw,
             "expected E0407 for @snapshot of hidden field from @fn; got {errors:?}"
@@ -3447,11 +3469,16 @@ mod tests {
             #effect commit() #mutates: [P] { #flush P; return; }\
         ";
         let errors = resolve_str(src).expect_err("expected FlushOnNonStaged");
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            ResolveError::FlushOnNonStaged { automaton, .. } if automaton == "P"
-        ));
-        assert!(saw, "expected E0412 FlushOnNonStaged for `P`; got {errors:?}");
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                ResolveError::FlushOnNonStaged { automaton, .. } if automaton == "P"
+            )
+        });
+        assert!(
+            saw,
+            "expected E0412 FlushOnNonStaged for `P`; got {errors:?}"
+        );
     }
 
     #[test]
@@ -3464,11 +3491,13 @@ mod tests {
             #effect commit() #mutates: [Real] { #flush Bogus; return; }\
         ";
         let errors = resolve_str(src).expect_err("expected FlushOfUnknownAutomaton");
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            ResolveError::FlushOfUnknownAutomaton { automaton, .. }
-                if automaton == "Bogus"
-        ));
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                ResolveError::FlushOfUnknownAutomaton { automaton, .. }
+                    if automaton == "Bogus"
+            )
+        });
         assert!(
             saw,
             "expected E0413 FlushOfUnknownAutomaton for `Bogus`; got {errors:?}"
@@ -3485,10 +3514,12 @@ mod tests {
             #effect commit() #mutates: [] { #flush H; return; }\
         ";
         let errors = resolve_str(src).expect_err("expected FlushOfUnknownAutomaton");
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            ResolveError::FlushOfUnknownAutomaton { automaton, .. } if automaton == "H"
-        ));
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                ResolveError::FlushOfUnknownAutomaton { automaton, .. } if automaton == "H"
+            )
+        });
         assert!(
             saw,
             "expected E0413 (not E0412) when name is an @fn; got {errors:?}"

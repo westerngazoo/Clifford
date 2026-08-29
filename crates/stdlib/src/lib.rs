@@ -83,8 +83,7 @@ pub const AUDIT_CL_SOURCE: &str = include_str!("../cl/audit.cl");
 /// accepts only `{ }`. Method-body support lands in
 /// slice 39; this constant becomes the actual default
 /// (no-op / always-`true`) impl at that point.
-pub const AUDIT_SHADOW_SANITIZER_CL_SOURCE: &str =
-    include_str!("../cl/audit_shadow_sanitizer.cl");
+pub const AUDIT_SHADOW_SANITIZER_CL_SOURCE: &str = include_str!("../cl/audit_shadow_sanitizer.cl");
 
 /// Slice 38: the canonical full `clifford::audit` module
 /// source — interface + default impl concatenated. Future
@@ -93,9 +92,8 @@ pub const AUDIT_SHADOW_SANITIZER_CL_SOURCE: &str =
 /// `#impl PointerAuditor for ShadowSanitizer` registration
 /// has the interface in scope.
 pub fn audit_module_source() -> String {
-    let mut s = String::with_capacity(
-        AUDIT_CL_SOURCE.len() + AUDIT_SHADOW_SANITIZER_CL_SOURCE.len() + 2,
-    );
+    let mut s =
+        String::with_capacity(AUDIT_CL_SOURCE.len() + AUDIT_SHADOW_SANITIZER_CL_SOURCE.len() + 2);
     s.push_str(AUDIT_CL_SOURCE);
     s.push('\n');
     s.push_str(AUDIT_SHADOW_SANITIZER_CL_SOURCE);
@@ -155,13 +153,11 @@ mod tests {
     #[test]
     fn audit_shadow_sanitizer_source_registers_impl() {
         assert!(
-            AUDIT_SHADOW_SANITIZER_CL_SOURCE
-                .contains("#automaton ShadowSanitizer"),
+            AUDIT_SHADOW_SANITIZER_CL_SOURCE.contains("#automaton ShadowSanitizer"),
             "expected ShadowSanitizer automaton",
         );
         assert!(
-            AUDIT_SHADOW_SANITIZER_CL_SOURCE
-                .contains("#impl PointerAuditor for ShadowSanitizer"),
+            AUDIT_SHADOW_SANITIZER_CL_SOURCE.contains("#impl PointerAuditor for ShadowSanitizer"),
             "expected #impl PointerAuditor for ShadowSanitizer registration",
         );
     }

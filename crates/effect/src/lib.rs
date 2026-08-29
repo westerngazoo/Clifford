@@ -139,7 +139,9 @@ pub enum EffectError {
 
     /// An effect or interrupt mutates an automaton not listed in its
     /// `#mutates: [...]` clause (transitively through `#> proc()` calls).
-    #[error("E0410: effect `{callable}` mutates undeclared automaton `{automaton}` (at byte {at})")]
+    #[error(
+        "E0410: effect `{callable}` mutates undeclared automaton `{automaton}` (at byte {at})"
+    )]
     EffectMutatesUndeclaredAutomaton {
         /// The effect / interrupt name.
         callable: String,
@@ -378,10 +380,7 @@ fn build_category(
 /// preserves source order; duplicates are reported but only the first
 /// occurrence appears in the returned list (matching the resolver's
 /// "first-wins" convention).
-fn build_states(
-    decl: &AutomatonDecl,
-    errors: &mut Vec<EffectError>,
-) -> (Vec<StateInfo>, bool) {
+fn build_states(decl: &AutomatonDecl, errors: &mut Vec<EffectError>) -> (Vec<StateInfo>, bool) {
     match &decl.states {
         None => (
             vec![StateInfo {
@@ -722,14 +721,12 @@ fn collect_direct_profiles(
         match item {
             Item::Effect(decl) => {
                 let id = CallableId::Effect(decl.name.clone());
-                let profile =
-                    walk_body_for_direct(&decl.body, resolution, &automaton_fields);
+                let profile = walk_body_for_direct(&decl.body, resolution, &automaton_fields);
                 map.insert(id, profile);
             }
             Item::Interrupt(decl) => {
                 let id = CallableId::Interrupt(decl.name.clone());
-                let profile =
-                    walk_body_for_direct(&decl.body, resolution, &automaton_fields);
+                let profile = walk_body_for_direct(&decl.body, resolution, &automaton_fields);
                 map.insert(id, profile);
             }
             Item::Automaton(decl) => {
@@ -738,12 +735,8 @@ fn collect_direct_profiles(
                         automaton: decl.name.clone(),
                         name: trans.name.clone(),
                     };
-                    let profile = walk_transition_for_direct(
-                        decl,
-                        trans,
-                        resolution,
-                        &automaton_fields,
-                    );
+                    let profile =
+                        walk_transition_for_direct(decl, trans, resolution, &automaton_fields);
                     map.insert(id, profile);
                 }
             }
@@ -791,7 +784,13 @@ fn walk_body_for_direct(
     // pass `None` for the enclosing owner. Any `Self.field`
     // appearing here is invalid (resolver already emitted an error),
     // and we silently skip it during read collection.
-    walk_stmts(&body.stmts, resolution, None, automaton_fields, &mut profile);
+    walk_stmts(
+        &body.stmts,
+        resolution,
+        None,
+        automaton_fields,
+        &mut profile,
+    );
     profile
 }
 
@@ -825,7 +824,13 @@ fn walk_stmts(
     for stmt in stmts {
         match &stmt.kind {
             StmtKind::Mutate { automaton, assigns } => {
-                for FieldAssign { field, index, value, .. } in assigns {
+                for FieldAssign {
+                    field,
+                    index,
+                    value,
+                    ..
+                } in assigns
+                {
                     out.writes.insert(FieldRef {
                         automaton: automaton.clone(),
                         field: field.clone(),
@@ -863,9 +868,7 @@ fn walk_stmts(
             StmtKind::ProcCall { name, args } => {
                 // The resolver tagged the call site with a Proc binding
                 // carrying CallContext. Resolve to the right CallableId.
-                if let Some(BindingRef::Proc { name: pn, ctx, .. }) =
-                    resolution.lookup(stmt.span)
-                {
+                if let Some(BindingRef::Proc { name: pn, ctx, .. }) = resolution.lookup(stmt.span) {
                     let id = match ctx {
                         CallContext::Identity => CallableId::Effect(pn.clone()),
                         CallContext::Transition => {
@@ -1216,12 +1219,8 @@ fn transitively_close(
                 };
                 for resolved in resolved_callees {
                     if let Some(callee_profile) = profiles.get(&resolved) {
-                        let caller_writes = profiles
-                            .get(caller_id)
-                            .map(|p| &p.actual_writes);
-                        let caller_reads = profiles
-                            .get(caller_id)
-                            .map(|p| &p.actual_reads);
+                        let caller_writes = profiles.get(caller_id).map(|p| &p.actual_writes);
+                        let caller_reads = profiles.get(caller_id).map(|p| &p.actual_reads);
                         for fr in &callee_profile.actual_writes {
                             if !caller_writes.is_some_and(|w| w.contains(fr)) {
                                 write_additions.insert(fr.clone());
@@ -1267,12 +1266,10 @@ fn validate_declared_mutates(
     errors: &mut Vec<EffectError>,
 ) {
     let declared_set: HashSet<&str> = declared_mutates.iter().map(String::as_str).collect();
-    let excluded_set: HashSet<&str> =
-        declared_cannot_mutate.iter().map(String::as_str).collect();
+    let excluded_set: HashSet<&str> = declared_cannot_mutate.iter().map(String::as_str).collect();
 
     // E0410: every actually-mutated automaton must be in declared_mutates.
-    let mut sorted_actual: Vec<&str> =
-        profile.actual_automata.iter().map(String::as_str).collect();
+    let mut sorted_actual: Vec<&str> = profile.actual_automata.iter().map(String::as_str).collect();
     sorted_actual.sort_unstable();
     for auto in sorted_actual {
         if !declared_set.contains(auto) {
@@ -1518,9 +1515,7 @@ fn find_cycles(graph: &ProcCallGraph) -> Vec<Vec<CallableId>> {
                 match color.get(callee).copied().unwrap_or(0) {
                     1 => {
                         // Gray: cycle detected. Extract from path.
-                        if let Some(start_idx) =
-                            path.iter().position(|n| n == callee)
-                        {
+                        if let Some(start_idx) = path.iter().position(|n| n == callee) {
                             let cycle: Vec<CallableId> = path[start_idx..].to_vec();
                             let canonical = canonicalise_cycle(&cycle);
                             if seen_canonical.insert(canonical.clone()) {
@@ -1542,7 +1537,14 @@ fn find_cycles(graph: &ProcCallGraph) -> Vec<Vec<CallableId>> {
 
     for (_, node) in sorted {
         if color.get(node).copied().unwrap_or(0) == 0 {
-            dfs(node, graph, &mut color, &mut path, &mut cycles, &mut seen_canonical);
+            dfs(
+                node,
+                graph,
+                &mut color,
+                &mut path,
+                &mut cycles,
+                &mut seen_canonical,
+            );
         }
     }
 
@@ -1921,10 +1923,9 @@ mod tests {
 
     #[test]
     fn item_index_reflects_program_position() {
-        let cats = extract_str(
-            "@fn helper() { } #automaton Sm { #states: [A]; } #automaton Tm { }",
-        )
-        .unwrap();
+        let cats =
+            extract_str("@fn helper() { } #automaton Sm { #states: [A]; } #automaton Tm { }")
+                .unwrap();
         // helper at 0; Sm at 1; Tm at 2.
         assert_eq!(cats.lookup("Sm").unwrap().item_index, 1);
         assert_eq!(cats.lookup("Tm").unwrap().item_index, 2);
@@ -1989,7 +1990,9 @@ mod tests {
         .unwrap();
         let id = CallableId::Effect("bump".to_owned());
         let profile = p.lookup(&id).expect("bump profile");
-        assert!(profile.actual_writes.contains(&make_field("Counter", "value")));
+        assert!(profile
+            .actual_writes
+            .contains(&make_field("Counter", "value")));
         assert!(profile.actual_automata.contains("Counter"));
     }
 
@@ -2006,8 +2009,12 @@ mod tests {
         .unwrap();
         let id = CallableId::Effect("set_both".to_owned());
         let profile = p.lookup(&id).expect("set_both profile");
-        assert!(profile.actual_writes.contains(&make_field("Counter", "value")));
-        assert!(profile.actual_writes.contains(&make_field("Counter", "flags")));
+        assert!(profile
+            .actual_writes
+            .contains(&make_field("Counter", "value")));
+        assert!(profile
+            .actual_writes
+            .contains(&make_field("Counter", "flags")));
     }
 
     // ── Interrupts use the same machinery ────────────────────────────────
@@ -2023,7 +2030,9 @@ mod tests {
         .unwrap();
         let id = CallableId::Interrupt("UART_RX".to_owned());
         let profile = p.lookup(&id).expect("UART_RX profile");
-        assert!(profile.actual_writes.contains(&make_field("Counter", "value")));
+        assert!(profile
+            .actual_writes
+            .contains(&make_field("Counter", "value")));
     }
 
     // ── Transitions ──────────────────────────────────────────────────────
@@ -2041,7 +2050,9 @@ mod tests {
             name: "tick".to_owned(),
         };
         let profile = p.lookup(&id).expect("tick profile");
-        assert!(profile.actual_writes.contains(&make_field("Counter", "value")));
+        assert!(profile
+            .actual_writes
+            .contains(&make_field("Counter", "value")));
     }
 
     // ── Transitive proc-call closure ─────────────────────────────────────
@@ -2326,13 +2337,13 @@ mod tests {
 
     #[test]
     fn self_loop_is_e0422() {
-        let errors = graph_str(
-            "#effect recursive() #mutates: [] { #> recursive(); }",
-        )
-        .unwrap_err();
+        let errors = graph_str("#effect recursive() #mutates: [] { #> recursive(); }").unwrap_err();
         assert_eq!(errors.len(), 1);
         match &errors[0] {
-            EffectError::ProcCallCycle { cycle, cycle_display } => {
+            EffectError::ProcCallCycle {
+                cycle,
+                cycle_display,
+            } => {
                 assert_eq!(cycle.len(), 1);
                 assert!(cycle[0].contains("recursive"));
                 assert!(cycle_display.contains("recursive"));
@@ -2354,8 +2365,7 @@ mod tests {
         match &errors[0] {
             EffectError::ProcCallCycle { cycle, .. } => {
                 assert_eq!(cycle.len(), 2);
-                let names: HashSet<&str> =
-                    cycle.iter().map(|s| s.as_str()).collect();
+                let names: HashSet<&str> = cycle.iter().map(|s| s.as_str()).collect();
                 assert!(names.iter().any(|n| n.contains('a')));
                 assert!(names.iter().any(|n| n.contains('b')));
             }
@@ -2375,7 +2385,10 @@ mod tests {
         .unwrap_err();
         assert_eq!(errors.len(), 1);
         match &errors[0] {
-            EffectError::ProcCallCycle { cycle, cycle_display } => {
+            EffectError::ProcCallCycle {
+                cycle,
+                cycle_display,
+            } => {
                 assert_eq!(cycle.len(), 3);
                 // Display contains all three with arrows.
                 assert!(cycle_display.contains('→'));

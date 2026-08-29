@@ -418,11 +418,7 @@ fn check_totality(program: &Program, errors: &mut Vec<CheckError>) {
             // declaration span as `decl_at_first` so editors land at
             // a stable offset.
             let names: Vec<String> = members.iter().map(|d| d.name.clone()).collect();
-            let decl_at_first = members
-                .iter()
-                .map(|d| d.span.start)
-                .min()
-                .unwrap_or(0);
+            let decl_at_first = members.iter().map(|d| d.span.start).min().unwrap_or(0);
             errors.push(CheckError::MutualRecursionViolation {
                 fn_names: names,
                 decl_at_first,
@@ -1309,7 +1305,10 @@ mod tests {
         .unwrap_err();
         assert!(errors.iter().any(|e| matches!(
             e,
-            CheckError::ImperativeInFunctional { construct: "#mutate", .. }
+            CheckError::ImperativeInFunctional {
+                construct: "#mutate",
+                ..
+            }
         )));
     }
 
@@ -1322,7 +1321,10 @@ mod tests {
         .unwrap_err();
         assert!(errors.iter().any(|e| matches!(
             e,
-            CheckError::ImperativeInFunctional { construct: "Auto.field <op>= …", .. }
+            CheckError::ImperativeInFunctional {
+                construct: "Auto.field <op>= …",
+                ..
+            }
         )));
     }
 
@@ -1335,31 +1337,35 @@ mod tests {
         .unwrap_err();
         assert!(errors.iter().any(|e| matches!(
             e,
-            CheckError::ImperativeInFunctional { construct: "#> proc()", .. }
+            CheckError::ImperativeInFunctional {
+                construct: "#> proc()",
+                ..
+            }
         )));
     }
 
     #[test]
     fn unchecked_store_in_fn_is_e0101() {
-        let errors = check_str(
-            "@fn cheat(p: u32) { #unchecked_store<u32>(p, 0u32); }",
-        )
-        .unwrap_err();
+        let errors =
+            check_str("@fn cheat(p: u32) { #unchecked_store<u32>(p, 0u32); }").unwrap_err();
         assert!(errors.iter().any(|e| matches!(
             e,
-            CheckError::ImperativeInFunctional { construct: "#unchecked_store", .. }
+            CheckError::ImperativeInFunctional {
+                construct: "#unchecked_store",
+                ..
+            }
         )));
     }
 
     #[test]
     fn volatile_store_in_fn_is_e0101() {
-        let errors = check_str(
-            "@fn cheat(p: u32) { #volatile_store<u8>(p, 0u8); }",
-        )
-        .unwrap_err();
+        let errors = check_str("@fn cheat(p: u32) { #volatile_store<u8>(p, 0u8); }").unwrap_err();
         assert!(errors.iter().any(|e| matches!(
             e,
-            CheckError::ImperativeInFunctional { construct: "#volatile_store", .. }
+            CheckError::ImperativeInFunctional {
+                construct: "#volatile_store",
+                ..
+            }
         )));
     }
 
@@ -1367,25 +1373,27 @@ mod tests {
 
     #[test]
     fn unchecked_load_in_fn_is_e0101() {
-        let errors = check_str(
-            "@fn cheat(p: u32) -> u8 { return #unchecked_load<u8>(p); }",
-        )
-        .unwrap_err();
+        let errors =
+            check_str("@fn cheat(p: u32) -> u8 { return #unchecked_load<u8>(p); }").unwrap_err();
         assert!(errors.iter().any(|e| matches!(
             e,
-            CheckError::ImperativeInFunctional { construct: "#unchecked_load", .. }
+            CheckError::ImperativeInFunctional {
+                construct: "#unchecked_load",
+                ..
+            }
         )));
     }
 
     #[test]
     fn volatile_load_in_fn_is_e0101() {
-        let errors = check_str(
-            "@fn cheat(p: u32) -> u8 { return #volatile_load<u8>(p); }",
-        )
-        .unwrap_err();
+        let errors =
+            check_str("@fn cheat(p: u32) -> u8 { return #volatile_load<u8>(p); }").unwrap_err();
         assert!(errors.iter().any(|e| matches!(
             e,
-            CheckError::ImperativeInFunctional { construct: "#volatile_load", .. }
+            CheckError::ImperativeInFunctional {
+                construct: "#volatile_load",
+                ..
+            }
         )));
     }
 
@@ -1397,7 +1405,10 @@ mod tests {
         .unwrap_err();
         assert!(errors.iter().any(|e| matches!(
             e,
-            CheckError::ImperativeInFunctional { construct: "#unchecked_cast", .. }
+            CheckError::ImperativeInFunctional {
+                construct: "#unchecked_cast",
+                ..
+            }
         )));
     }
 
@@ -1409,7 +1420,10 @@ mod tests {
         .unwrap_err();
         assert!(errors.iter().any(|e| matches!(
             e,
-            CheckError::ImperativeInFunctional { construct: "#unchecked_offset", .. }
+            CheckError::ImperativeInFunctional {
+                construct: "#unchecked_offset",
+                ..
+            }
         )));
     }
 
@@ -1422,7 +1436,10 @@ mod tests {
         .unwrap_err();
         assert!(errors.iter().any(|e| matches!(
             e,
-            CheckError::ImperativeInFunctional { construct: "Auto@state", .. }
+            CheckError::ImperativeInFunctional {
+                construct: "Auto@state",
+                ..
+            }
         )));
     }
 
@@ -1435,7 +1452,10 @@ mod tests {
         .unwrap_err();
         assert!(errors.iter().any(|e| matches!(
             e,
-            CheckError::ImperativeInFunctional { construct: "automaton-field read", .. }
+            CheckError::ImperativeInFunctional {
+                construct: "automaton-field read",
+                ..
+            }
         )));
     }
 
@@ -1448,7 +1468,10 @@ mod tests {
         .unwrap_err();
         assert!(errors.iter().any(|e| matches!(
             e,
-            CheckError::ImperativeInFunctional { construct: "bare automaton reference", .. }
+            CheckError::ImperativeInFunctional {
+                construct: "bare automaton reference",
+                ..
+            }
         )));
     }
 
@@ -1480,7 +1503,10 @@ mod tests {
         .unwrap_err();
         assert!(errors.iter().any(|e| matches!(
             e,
-            CheckError::CrossBoundaryCall { callee_kind: "#interrupt", .. }
+            CheckError::CrossBoundaryCall {
+                callee_kind: "#interrupt",
+                ..
+            }
         )));
     }
 
@@ -1507,16 +1533,28 @@ mod tests {
         .unwrap_err();
         // We expect at least the MutateShort, the cross-boundary call, and
         // the field read all reported.
-        assert!(errors.len() >= 3, "got {} errors: {:?}", errors.len(), errors);
-        assert!(errors
-            .iter()
-            .any(|e| matches!(e, CheckError::ImperativeInFunctional { construct: "Auto.field <op>= …", .. })));
+        assert!(
+            errors.len() >= 3,
+            "got {} errors: {:?}",
+            errors.len(),
+            errors
+        );
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            CheckError::ImperativeInFunctional {
+                construct: "Auto.field <op>= …",
+                ..
+            }
+        )));
         assert!(errors
             .iter()
             .any(|e| matches!(e, CheckError::CrossBoundaryCall { .. })));
         assert!(errors.iter().any(|e| matches!(
             e,
-            CheckError::ImperativeInFunctional { construct: "automaton-field read", .. }
+            CheckError::ImperativeInFunctional {
+                construct: "automaton-field read",
+                ..
+            }
         )));
     }
 
@@ -1526,13 +1564,15 @@ mod tests {
     fn nested_unchecked_load_in_arithmetic_is_e0101() {
         // `#unchecked_load<u32>(p) + 1u32` inside `@fn` — the load is a
         // `#`-construct even though it's nested in an arithmetic expression.
-        let errors = check_str(
-            "@fn cheat(p: u32) -> u32 { return #unchecked_load<u32>(p) + 1u32; }",
-        )
-        .unwrap_err();
+        let errors =
+            check_str("@fn cheat(p: u32) -> u32 { return #unchecked_load<u32>(p) + 1u32; }")
+                .unwrap_err();
         assert!(errors.iter().any(|e| matches!(
             e,
-            CheckError::ImperativeInFunctional { construct: "#unchecked_load", .. }
+            CheckError::ImperativeInFunctional {
+                construct: "#unchecked_load",
+                ..
+            }
         )));
     }
 
@@ -1610,11 +1650,13 @@ mod tests {
              #effect rogue() #mutates: [A] { B.y = 1u32; }",
         )
         .unwrap_err();
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            CheckError::WriteToUndeclaredAutomaton { automaton, enclosing, .. }
-                if automaton == "B" && enclosing == "#effect rogue"
-        ));
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                CheckError::WriteToUndeclaredAutomaton { automaton, enclosing, .. }
+                    if automaton == "B" && enclosing == "#effect rogue"
+            )
+        });
         assert!(saw, "expected E0302 with automaton=B; got {errors:?}");
     }
 
@@ -1627,10 +1669,12 @@ mod tests {
              #effect pure() #mutates: [] { A.x = 1u32; }",
         )
         .unwrap_err();
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            CheckError::WriteToUndeclaredAutomaton { automaton, .. } if automaton == "A"
-        ));
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                CheckError::WriteToUndeclaredAutomaton { automaton, .. } if automaton == "A"
+            )
+        });
         assert!(saw, "expected E0302 from #mutates: []; got {errors:?}");
     }
 
@@ -1644,11 +1688,16 @@ mod tests {
              #effect rogue() #mutates: [A] { #mutate B { y = 1u32 }; }",
         )
         .unwrap_err();
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            CheckError::WriteToUndeclaredAutomaton { automaton, .. } if automaton == "B"
-        ));
-        assert!(saw, "expected E0302 for canonical #mutate B; got {errors:?}");
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                CheckError::WriteToUndeclaredAutomaton { automaton, .. } if automaton == "B"
+            )
+        });
+        assert!(
+            saw,
+            "expected E0302 for canonical #mutate B; got {errors:?}"
+        );
     }
 
     // ── #effect: cannot_mutate prohibition (E0306) ───────────────────────
@@ -1663,11 +1712,13 @@ mod tests {
              #effect bad() #mutates: [A] #cannot_mutate: [A] { A.x = 1u32; }",
         )
         .unwrap_err();
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            CheckError::WriteToCannotMutate { automaton, enclosing, .. }
-                if automaton == "A" && enclosing == "#effect bad"
-        ));
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                CheckError::WriteToCannotMutate { automaton, enclosing, .. }
+                    if automaton == "A" && enclosing == "#effect bad"
+            )
+        });
         assert!(saw, "expected E0306 with automaton=A; got {errors:?}");
     }
 
@@ -1696,15 +1747,22 @@ mod tests {
              #effect bad() #mutates: [A] #cannot_mutate: [B] { B.y = 1u32; }",
         )
         .unwrap_err();
-        let saw_e0306 = errors.iter().any(|e| matches!(
-            e,
-            CheckError::WriteToCannotMutate { automaton, .. } if automaton == "B"
-        ));
-        let saw_e0302 = errors.iter().any(|e| matches!(
-            e,
-            CheckError::WriteToUndeclaredAutomaton { automaton, .. } if automaton == "B"
-        ));
-        assert!(saw_e0306, "expected E0306 when target is in cannot_mutate; got {errors:?}");
+        let saw_e0306 = errors.iter().any(|e| {
+            matches!(
+                e,
+                CheckError::WriteToCannotMutate { automaton, .. } if automaton == "B"
+            )
+        });
+        let saw_e0302 = errors.iter().any(|e| {
+            matches!(
+                e,
+                CheckError::WriteToUndeclaredAutomaton { automaton, .. } if automaton == "B"
+            )
+        });
+        assert!(
+            saw_e0306,
+            "expected E0306 when target is in cannot_mutate; got {errors:?}"
+        );
         assert!(!saw_e0302, "should NOT also emit E0302; got {errors:?}");
     }
 
@@ -1729,11 +1787,13 @@ mod tests {
              #interrupt SysTick() #mutates: [A] #priority: HIGH { B.y = 1u32; }",
         )
         .unwrap_err();
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            CheckError::WriteToUndeclaredAutomaton { automaton, enclosing, .. }
-                if automaton == "B" && enclosing == "#interrupt SysTick"
-        ));
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                CheckError::WriteToUndeclaredAutomaton { automaton, enclosing, .. }
+                    if automaton == "B" && enclosing == "#interrupt SysTick"
+            )
+        });
         assert!(saw, "expected E0302 from #interrupt; got {errors:?}");
     }
 
@@ -1762,13 +1822,18 @@ mod tests {
               #automaton Logger { last: u32; }",
         )
         .unwrap_err();
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            CheckError::WriteToUndeclaredAutomaton { automaton, enclosing, .. }
-                if automaton == "Logger"
-                && enclosing == "#transition tick in #automaton Counter"
-        ));
-        assert!(saw, "expected E0302 from cross-auto transition; got {errors:?}");
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                CheckError::WriteToUndeclaredAutomaton { automaton, enclosing, .. }
+                    if automaton == "Logger"
+                    && enclosing == "#transition tick in #automaton Counter"
+            )
+        });
+        assert!(
+            saw,
+            "expected E0302 from cross-auto transition; got {errors:?}"
+        );
     }
 
     // ── Multiple errors collected ────────────────────────────────────────
@@ -1787,15 +1852,22 @@ mod tests {
              }",
         )
         .unwrap_err();
-        let saw_b = errors.iter().any(|e| matches!(
-            e,
-            CheckError::WriteToUndeclaredAutomaton { automaton, .. } if automaton == "B"
-        ));
-        let saw_c = errors.iter().any(|e| matches!(
-            e,
-            CheckError::WriteToCannotMutate { automaton, .. } if automaton == "C"
-        ));
-        assert!(saw_b && saw_c, "expected both E0302/B and E0306/C; got {errors:?}");
+        let saw_b = errors.iter().any(|e| {
+            matches!(
+                e,
+                CheckError::WriteToUndeclaredAutomaton { automaton, .. } if automaton == "B"
+            )
+        });
+        let saw_c = errors.iter().any(|e| {
+            matches!(
+                e,
+                CheckError::WriteToCannotMutate { automaton, .. } if automaton == "C"
+            )
+        });
+        assert!(
+            saw_b && saw_c,
+            "expected both E0302/B and E0306/C; got {errors:?}"
+        );
     }
 
     // ── @fn boundary still enforced (no Slice-1 regression) ──────────────
@@ -1812,15 +1884,19 @@ mod tests {
              #effect rogue() #mutates: [Counter] { Other.z = 1u32; }",
         )
         .unwrap_err();
-        let saw_e0101 = errors.iter().any(|e| matches!(
-            e,
-            CheckError::ImperativeInFunctional { .. }
-        ));
-        let saw_e0302 = errors.iter().any(|e| matches!(
-            e,
-            CheckError::WriteToUndeclaredAutomaton { automaton, .. } if automaton == "Other"
-        ));
-        assert!(saw_e0101 && saw_e0302, "expected both E0101 and E0302; got {errors:?}");
+        let saw_e0101 = errors
+            .iter()
+            .any(|e| matches!(e, CheckError::ImperativeInFunctional { .. }));
+        let saw_e0302 = errors.iter().any(|e| {
+            matches!(
+                e,
+                CheckError::WriteToUndeclaredAutomaton { automaton, .. } if automaton == "Other"
+            )
+        });
+        assert!(
+            saw_e0101 && saw_e0302,
+            "expected both E0101 and E0302; got {errors:?}"
+        );
     }
 
     // ─── Slice 3 (Decision #23 / ADR 0003): totality check (E0540) ───────
@@ -1841,9 +1917,9 @@ mod tests {
         // fact(n); }` recurses on itself with no @partial marker.
         let src = "@fn fact(n: u32) -> u32 { return fact(n); }";
         let errors = check_str(src).expect_err("expected E0540");
-        let saw = errors.iter().any(|e| {
-            matches!(e, CheckError::TotalityViolation { fn_name, .. } if fn_name == "fact")
-        });
+        let saw = errors.iter().any(
+            |e| matches!(e, CheckError::TotalityViolation { fn_name, .. } if fn_name == "fact"),
+        );
         assert!(
             saw,
             "expected E0540 TotalityViolation for `fact`; got {errors:?}"
@@ -1854,10 +1930,7 @@ mod tests {
     fn direct_recursive_partial_fn_is_silent() {
         // Same shape, but `@partial` opts out of the totality check.
         let src = "@partial @fn fact(n: u32) -> u32 { return fact(n); }";
-        assert!(
-            check_str(src).is_ok(),
-            "@partial should suppress E0540"
-        );
+        assert!(check_str(src).is_ok(), "@partial should suppress E0540");
     }
 
     #[test]
@@ -1918,7 +1991,10 @@ mod tests {
             @fn g(x: u32) -> u32 { return x; }\n\
             @fn f(n: u32) -> u32 { return g(n); }\n\
         ";
-        assert!(check_str(src).is_ok(), "non-self call should not trigger E0540");
+        assert!(
+            check_str(src).is_ok(),
+            "non-self call should not trigger E0540"
+        );
     }
 
     #[test]
@@ -1931,9 +2007,14 @@ mod tests {
         let errors = check_str(src).expect_err("expected E0540");
         let count = errors
             .iter()
-            .filter(|e| matches!(e, CheckError::TotalityViolation { fn_name, .. } if fn_name == "f"))
+            .filter(
+                |e| matches!(e, CheckError::TotalityViolation { fn_name, .. } if fn_name == "f"),
+            )
             .count();
-        assert_eq!(count, 1, "expected exactly one E0540; got {count}: {errors:?}");
+        assert_eq!(
+            count, 1,
+            "expected exactly one E0540; got {count}: {errors:?}"
+        );
     }
 
     #[test]
@@ -1945,7 +2026,12 @@ mod tests {
         let src = "@fn fact(n: u32) -> u32 { return fact(n); }";
         let errors = check_str(src).expect_err("expected E0540");
         for e in &errors {
-            if let CheckError::TotalityViolation { fn_name, call_at, decl_at } = e {
+            if let CheckError::TotalityViolation {
+                fn_name,
+                call_at,
+                decl_at,
+            } = e
+            {
                 assert_eq!(fn_name, "fact");
                 assert!(*decl_at < *call_at, "decl_at must precede call_at");
                 assert!(*call_at < src.len(), "call_at must be within source");
@@ -1984,10 +2070,7 @@ mod tests {
             matches!(e, CheckError::MutualRecursionViolation { fn_names, .. }
                 if fn_names == &vec!["even".to_owned(), "odd".to_owned()])
         });
-        assert!(
-            saw,
-            "expected E0543 with cycle [even, odd]; got {errors:?}"
-        );
+        assert!(saw, "expected E0543 with cycle [even, odd]; got {errors:?}");
     }
 
     #[test]
@@ -2000,9 +2083,9 @@ mod tests {
             @fn f(n: u32) -> u32 { let _v: u32 = Counter.value; return f(n); }\n\
         ";
         let errors = check_str(src).expect_err("expected E0101 + E0540");
-        let saw_total = errors.iter().any(|e| {
-            matches!(e, CheckError::TotalityViolation { fn_name, .. } if fn_name == "f")
-        });
+        let saw_total = errors
+            .iter()
+            .any(|e| matches!(e, CheckError::TotalityViolation { fn_name, .. } if fn_name == "f"));
         let saw_boundary = errors
             .iter()
             .any(|e| matches!(e, CheckError::ImperativeInFunctional { .. }));
@@ -2024,13 +2107,18 @@ mod tests {
             }\
         ";
         let errors = check_str(src).expect_err("expected E0553");
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            CheckError::SnapshotInImperative { automaton, field, transition_name, owner, .. }
-                if automaton == "Self" && field == "value"
-                    && transition_name == "tick" && owner == "Counter"
-        ));
-        assert!(saw, "expected E0553 with Self/value/tick/Counter; got {errors:?}");
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                CheckError::SnapshotInImperative { automaton, field, transition_name, owner, .. }
+                    if automaton == "Self" && field == "value"
+                        && transition_name == "tick" && owner == "Counter"
+            )
+        });
+        assert!(
+            saw,
+            "expected E0553 with Self/value/tick/Counter; got {errors:?}"
+        );
     }
 
     #[test]
@@ -2043,11 +2131,16 @@ mod tests {
             }\
         ";
         let errors = check_str(src).expect_err("expected E0553");
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            CheckError::SnapshotInImperative { automaton, .. } if automaton == "Counter"
-        ));
-        assert!(saw, "expected E0553 for owner-name snapshot; got {errors:?}");
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                CheckError::SnapshotInImperative { automaton, .. } if automaton == "Counter"
+            )
+        });
+        assert!(
+            saw,
+            "expected E0553 for owner-name snapshot; got {errors:?}"
+        );
     }
 
     #[test]
@@ -2085,7 +2178,10 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, CheckError::SnapshotInImperative { .. }))
             .count();
-        assert_eq!(count, 2, "expected exactly two E0553s; got {count}: {errors:?}");
+        assert_eq!(
+            count, 2,
+            "expected exactly two E0553s; got {count}: {errors:?}"
+        );
     }
 
     #[test]
@@ -2099,10 +2195,12 @@ mod tests {
             #effect helper(x: u32) #mutates: [] { }\
         ";
         let errors = check_str(src).expect_err("expected E0553");
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            CheckError::SnapshotInImperative { automaton, .. } if automaton == "Self"
-        ));
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                CheckError::SnapshotInImperative { automaton, .. } if automaton == "Self"
+            )
+        });
         assert!(saw, "expected E0553 in proc-call arg; got {errors:?}");
     }
 
@@ -2115,10 +2213,12 @@ mod tests {
             }\
         ";
         let errors = check_str(src).expect_err("expected E0553");
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            CheckError::SnapshotInImperative { automaton, .. } if automaton == "Self"
-        ));
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                CheckError::SnapshotInImperative { automaton, .. } if automaton == "Self"
+            )
+        });
         assert!(saw, "expected E0553 in mutate-short RHS; got {errors:?}");
     }
 
@@ -2183,11 +2283,13 @@ mod tests {
             @fn c(n: u32) -> u32 { return a(n); }\n\
         ";
         let errors = check_str(src).expect_err("expected E0543");
-        let saw = errors.iter().any(|e| matches!(
-            e,
-            CheckError::MutualRecursionViolation { fn_names, .. }
-                if fn_names == &vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]
-        ));
+        let saw = errors.iter().any(|e| {
+            matches!(
+                e,
+                CheckError::MutualRecursionViolation { fn_names, .. }
+                    if fn_names == &vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]
+            )
+        });
         assert!(saw, "expected E0543 [a, b, c]; got {errors:?}");
     }
 
@@ -2214,10 +2316,9 @@ mod tests {
             @fn odd(n: u32) -> bool { return even(n); }\n\
         ";
         let errors = check_str(src).expect_err("expected E0543 (subset partial)");
-        assert!(errors.iter().any(|e| matches!(
-            e,
-            CheckError::MutualRecursionViolation { .. }
-        )));
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, CheckError::MutualRecursionViolation { .. })));
     }
 
     #[test]
@@ -2233,7 +2334,10 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, CheckError::MutualRecursionViolation { .. }))
             .count();
-        assert_eq!(count, 1, "expected exactly one E0543; got {count}: {errors:?}");
+        assert_eq!(
+            count, 1,
+            "expected exactly one E0543; got {count}: {errors:?}"
+        );
     }
 
     #[test]
@@ -2278,9 +2382,9 @@ mod tests {
         // shapes for distinct cycle topologies.
         let src = "@fn loop_me(n: u32) -> u32 { return loop_me(n); }";
         let errors = check_str(src).expect_err("expected E0540");
-        let saw_e0540 = errors
-            .iter()
-            .any(|e| matches!(e, CheckError::TotalityViolation { fn_name, .. } if fn_name == "loop_me"));
+        let saw_e0540 = errors.iter().any(
+            |e| matches!(e, CheckError::TotalityViolation { fn_name, .. } if fn_name == "loop_me"),
+        );
         let saw_e0543 = errors
             .iter()
             .any(|e| matches!(e, CheckError::MutualRecursionViolation { .. }));
@@ -2296,11 +2400,18 @@ mod tests {
         ";
         let errors = check_str(src).expect_err("expected E0543");
         for e in &errors {
-            if let CheckError::MutualRecursionViolation { fn_names, decl_at_first } = e {
+            if let CheckError::MutualRecursionViolation {
+                fn_names,
+                decl_at_first,
+            } = e
+            {
                 assert_eq!(fn_names, &vec!["even".to_owned(), "odd".to_owned()]);
                 // `even` is declared first (byte 0), so decl_at_first
                 // should be 0.
-                assert_eq!(*decl_at_first, 0, "expected lex-smallest member's decl byte");
+                assert_eq!(
+                    *decl_at_first, 0,
+                    "expected lex-smallest member's decl byte"
+                );
                 return;
             }
         }
@@ -2317,9 +2428,6 @@ mod tests {
         // pure-side only; cross-layer call detection is the boundary
         // checker's job (Slice 1).
         let src = "@fn helper(n: u32) -> u32 { return n; }";
-        assert!(
-            check_str(src).is_ok(),
-            "isolated `@fn` should be silent"
-        );
+        assert!(check_str(src).is_ok(), "isolated `@fn` should be silent");
     }
 }
